@@ -1599,3 +1599,48 @@ html.theme-synapse :is(.field input, .file-row input, .select):focus {
 html.theme-synapse .check input {
   accent-color: var(--accent);
 }
+
+/* ---- BBS: box-drawing corner glyphs framing panels (double-line ANSI) ---- */
+html.theme-bbs :is(.modal, .pop, .ctx-menu) {
+  position: relative;
+  overflow: visible;
+}
+html.theme-bbs :is(.modal, .pop, .ctx-menu)::before,
+html.theme-bbs :is(.modal, .pop, .ctx-menu)::after,
+html.theme-bbs .modal__head::after,
+html.theme-bbs .modal__foot::before {
+  position: absolute;
+  font-family: var(--font-mono);
+  font-size: 24px;
+  line-height: 1;
+  color: var(--accent);
+  text-shadow: 0 0 6px var(--glow-tint);
+  pointer-events: none;
+  z-index: 1;
+}
+html.theme-bbs :is(.modal, .pop, .ctx-menu)::before {
+  content: "╔";
+  top: -9px;
+  left: -3px;
+}
+html.theme-bbs :is(.modal, .pop, .ctx-menu)::after {
+  content: "╝";
+  bottom: -9px;
+  right: -3px;
+}
+html.theme-bbs .modal__head {
+  position: relative;
+}
+html.theme-bbs .modal__head::after {
+  content: "╗";
+  top: -9px;
+  right: -3px;
+}
+html.theme-bbs .modal__foot {
+  position: relative;
+}
+html.theme-bbs .modal__foot::before {
+  content: "╚";
+  bottom: -9px;
+  left: -3px;
+}
