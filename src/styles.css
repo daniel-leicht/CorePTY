@@ -42,6 +42,7 @@
   --tabbar-h: 42px;
   --sidebar-w: 268px;
   --status-h: 26px;
+  --titlebar-h: 40px; /* custom window chrome, frameless themes only */
 }
 
 * {
@@ -2574,6 +2575,10 @@ html.frameless .win-titlebar {
   display: flex;
   height: 100%;
 }
+/* decorative lead segment before the buttons — themed chrome opts in */
+.win-controls__cap {
+  display: none;
+}
 .win-btn {
   width: 46px;
   height: 100%;
@@ -2612,7 +2617,14 @@ html.frameless .win-resizers {
 .wr-sw { bottom: 0; left: 0; width: 9px; height: 9px; cursor: nesw-resize; }
 .wr-se { bottom: 0; right: 0; width: 9px; height: 9px; cursor: nwse-resize; }
 
-/* ---- Starbase LCARS title bar: the orange elbow corner ---- */
+/* ---- Starbase LCARS title bar: the top frame bar ----
+   One bar, two ends. Left: the orange elbow caps the sidebar column (small
+   outer corner, 26px inner sweep down toward the content). Right: the window
+   controls ARE the bar's right end — full-height color segments cut apart by
+   3px black joints, opened by an orange cap whose bottom-left sweep mirrors
+   the elbow, and closed by a red half-pill that rounds the top-right corner.
+   The cluster sits on the same 8px right margin as the tab-add button and the
+   status sweep's pill end, so all three rounded right ends stack on one line. */
 html.theme-starbase .win-titlebar {
   height: 44px;
   background: #000;
@@ -2622,7 +2634,7 @@ html.theme-starbase .win-titlebar {
 }
 html.theme-starbase .win-titlebar__label {
   flex: 0 0 auto;
-  min-width: 190px;
+  min-width: var(--sidebar-w); /* the elbow caps the sidebar rail below */
   height: 100%;
   display: flex;
   align-items: center;
@@ -2638,34 +2650,53 @@ html.theme-starbase .win-titlebar__label {
   border-bottom-right-radius: 26px;
 }
 html.theme-starbase .win-controls {
-  gap: 6px;
-  align-items: center;
-  padding-right: 12px;
   margin-left: auto;
+  margin-right: 8px; /* the shared right margin (tab-add, status sweep) */
+  gap: 3px; /* black joints between bar segments */
+}
+html.theme-starbase .win-controls__cap {
+  display: block;
+  flex: none;
+  width: 36px;
+  height: 100%;
+  background: var(--accent);
+  border-bottom-left-radius: 26px; /* the elbow's sweep, mirrored */
 }
 html.theme-starbase .win-btn {
-  width: 38px;
-  height: 22px;
-  border-radius: 999px;
+  width: 46px;
+  height: 100%;
+  border-radius: 2px; /* square bar-segment cut, like the sidebar rail blocks */
   color: #180c02;
 }
-html.theme-starbase .win-btn[data-win="min"] { background: var(--warn); }
-html.theme-starbase .win-btn[data-win="max"] { background: var(--accent-2); }
-html.theme-starbase .win-btn[data-win="close"] { background: var(--danger); }
-html.theme-starbase .win-btn:hover { filter: brightness(1.15); }
-html.theme-starbase .win-btn--close:hover { color: #180c02; }
+html.theme-starbase .win-btn[data-win="min"] {
+  background: var(--warn);
+}
+html.theme-starbase .win-btn[data-win="max"] {
+  background: var(--accent-2);
+}
+html.theme-starbase .win-btn[data-win="close"] {
+  width: 58px;
+  padding-right: 8px; /* keep the glyph centered in the flat part */
+  background: var(--danger);
+  border-radius: 2px 999px 999px 2px; /* pill end = the top-right corner */
+}
+html.theme-starbase .win-btn:hover {
+  filter: brightness(1.15);
+}
+html.theme-starbase .win-btn:active {
+  filter: brightness(0.9);
+}
+html.theme-starbase .win-btn--close:hover {
+  color: #180c02;
+}
 html.theme-starbase .win-btn .icon {
-  width: 13px;
-  height: 13px;
+  width: 14px;
+  height: 14px;
 }
 
-/* The title-bar elbow is the app mark now — drop the duplicate sidebar brand and
-   widen the elbow to cap the sidebar rail. */
+/* The title-bar elbow is the app mark now — drop the duplicate sidebar brand. */
 html.theme-starbase .brand {
   display: none;
-}
-html.theme-starbase .win-titlebar__label {
-  min-width: var(--sidebar-w);
 }
 html.theme-starbase .side-scroll {
   padding-top: 10px;

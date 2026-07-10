@@ -92,6 +92,7 @@ export class App {
         <div class="win-titlebar" data-tauri-drag-region>
           <span class="win-titlebar__label" data-tauri-drag-region>CorePTY</span>
           <div class="win-controls">
+            <span class="win-controls__cap" data-tauri-drag-region aria-hidden="true"></span>
             <button class="win-btn" data-win="min" title="Minimize">${icon("winMin")}</button>
             <button class="win-btn" data-win="max" title="Maximize">${icon("winMax")}</button>
             <button class="win-btn win-btn--close" data-win="close" title="Close">${icon("close")}</button>
