@@ -2535,3 +2535,126 @@ html.theme-starbase .side-footer__ver {
   color: var(--lcars-blue);
   letter-spacing: 0.12em;
 }
+
+/* ============================================================================
+   Custom window chrome — shown only for `frameless` themes (LCARS). Other
+   themes keep the native OS window frame.
+   ========================================================================== */
+.win {
+  height: 100%;
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+}
+.win > .app {
+  flex: 1;
+  min-height: 0;
+  height: auto;
+}
+.win-titlebar,
+.win-resizers {
+  display: none;
+}
+html.frameless .win-titlebar {
+  display: flex;
+  align-items: center;
+  height: var(--titlebar-h);
+  flex: none;
+  background: var(--bg-2);
+  border-bottom: 1px solid var(--line);
+  user-select: none;
+}
+.win-titlebar__label {
+  flex: 1;
+  padding: 0 14px;
+  font-size: 12.5px;
+  color: var(--text-2);
+}
+.win-controls {
+  display: flex;
+  height: 100%;
+}
+.win-btn {
+  width: 46px;
+  height: 100%;
+  display: grid;
+  place-items: center;
+  color: var(--text-2);
+  transition: background 0.12s var(--ease), color 0.12s var(--ease), filter 0.12s var(--ease);
+}
+.win-btn:hover {
+  background: var(--bg-4);
+  color: var(--text-0);
+}
+.win-btn--close:hover {
+  background: var(--danger);
+  color: #fff;
+}
+.win-btn .icon {
+  width: 15px;
+  height: 15px;
+}
+
+/* resize handles — a frameless window has no OS resize border */
+html.frameless .win-resizers {
+  display: block;
+}
+.wr {
+  position: fixed;
+  z-index: 9500;
+}
+.wr-n { top: 0; left: 8px; right: 8px; height: 5px; cursor: ns-resize; }
+.wr-s { bottom: 0; left: 8px; right: 8px; height: 5px; cursor: ns-resize; }
+.wr-e { top: 8px; bottom: 8px; right: 0; width: 5px; cursor: ew-resize; }
+.wr-w { top: 8px; bottom: 8px; left: 0; width: 5px; cursor: ew-resize; }
+.wr-nw { top: 0; left: 0; width: 9px; height: 9px; cursor: nwse-resize; }
+.wr-ne { top: 0; right: 0; width: 9px; height: 9px; cursor: nesw-resize; }
+.wr-sw { bottom: 0; left: 0; width: 9px; height: 9px; cursor: nesw-resize; }
+.wr-se { bottom: 0; right: 0; width: 9px; height: 9px; cursor: nwse-resize; }
+
+/* ---- Starbase LCARS title bar: the orange elbow corner ---- */
+html.theme-starbase .win-titlebar {
+  height: 44px;
+  background: #000;
+  border-bottom: none;
+  gap: 8px;
+  padding: 0;
+}
+html.theme-starbase .win-titlebar__label {
+  flex: 0 0 auto;
+  min-width: 190px;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  padding: 0 30px 0 18px;
+  background: var(--accent);
+  color: #180c02;
+  font-family: var(--font-ui);
+  font-weight: 700;
+  font-size: 15px;
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+  border-top-left-radius: 6px;
+  border-bottom-right-radius: 26px;
+}
+html.theme-starbase .win-controls {
+  gap: 6px;
+  align-items: center;
+  padding-right: 12px;
+  margin-left: auto;
+}
+html.theme-starbase .win-btn {
+  width: 38px;
+  height: 22px;
+  border-radius: 999px;
+  color: #180c02;
+}
+html.theme-starbase .win-btn[data-win="min"] { background: var(--warn); }
+html.theme-starbase .win-btn[data-win="max"] { background: var(--accent-2); }
+html.theme-starbase .win-btn[data-win="close"] { background: var(--danger); }
+html.theme-starbase .win-btn:hover { filter: brightness(1.15); }
+html.theme-starbase .win-btn--close:hover { color: #180c02; }
+html.theme-starbase .win-btn .icon {
+  width: 13px;
+  height: 13px;
+}

@@ -19,7 +19,9 @@ import { ConnectionsTree } from "./connections";
 import { contextMenu } from "./menu";
 import { SettingsDialog } from "./settings-dialog";
 import { current as settings, loadSettings } from "./settings";
+import { activeTheme } from "./themes";
 import { escapeHtml, uuid } from "./util";
+import { winClose, winMinimize, winSetDecorations, winStartResize, winToggleMaximize } from "./window";
 
 interface ShellDef {
   shell: LocalShell;
@@ -66,6 +68,7 @@ export class App {
   async mount(): Promise<void> {
     await loadSettings();
     this.render();
+    this.syncWindowFrame();
     this.tree = new ConnectionsTree(this.connectionsEl, {
       onConnect: (s) => void this.connectSaved(s),
       onEdit: (s) => void this.openDialog(s),
@@ -85,7 +88,16 @@ export class App {
 
   private render(): void {
     this.root.innerHTML = `
-      <div class="app">
+      <div class="win">
+        <div class="win-titlebar" data-tauri-drag-region>
+          <span class="win-titlebar__label" data-tauri-drag-region>CorePTY</span>
+          <div class="win-controls">
+            <button class="win-btn" data-win="min" title="Minimize">${icon("winMin")}</button>
+            <button class="win-btn" data-win="max" title="Maximize">${icon("winMax")}</button>
+            <button class="win-btn win-btn--close" data-win="close" title="Close">${icon("close")}</button>
+          </div>
+        </div>
+        <div class="app">
         <aside class="sidebar">
           <div class="brand">
             <span class="brand__mark">${icon("terminal", "brand__icon")}</span>
@@ -146,6 +158,17 @@ export class App {
         </main>
 
         <div class="toasts" id="toasts"></div>
+        </div>
+        <div class="win-resizers">
+          <div class="wr wr-n" data-dir="North"></div>
+          <div class="wr wr-e" data-dir="East"></div>
+          <div class="wr wr-s" data-dir="South"></div>
+          <div class="wr wr-w" data-dir="West"></div>
+          <div class="wr wr-nw" data-dir="NorthWest"></div>
+          <div class="wr wr-ne" data-dir="NorthEast"></div>
+          <div class="wr wr-se" data-dir="SouthEast"></div>
+          <div class="wr wr-sw" data-dir="SouthWest"></div>
+        </div>
       </div>
     `;
 
@@ -191,6 +214,7 @@ export class App {
 
     this.setupStageInteractions();
     this.setupSearch();
+    this.wireWindowChrome();
   }
 
   // ---- saved connections --------------------------------------------------
@@ -599,8 +623,34 @@ export class App {
   // ---- settings -----------------------------------------------------------
 
   private applySettingsToAll(): void {
+    this.syncWindowFrame();
     for (const t of this.tabs) t.applySettings();
     requestAnimationFrame(() => this.active?.fit());
+  }
+
+  // ---- window chrome (frameless per theme) --------------------------------
+
+  /** Match the native window frame to the active theme (LCARS is frameless). */
+  private syncWindowFrame(): void {
+    void winSetDecorations(!activeTheme().frameless);
+  }
+
+  private wireWindowChrome(): void {
+    this.root.querySelectorAll<HTMLButtonElement>(".win-btn[data-win]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const act = btn.dataset.win;
+        if (act === "min") void winMinimize();
+        else if (act === "max") void winToggleMaximize();
+        else if (act === "close") void winClose();
+      });
+    });
+    this.root.querySelectorAll<HTMLElement>(".wr[data-dir]").forEach((h) => {
+      h.addEventListener("mousedown", (e) => {
+        if (e.button !== 0) return;
+        e.preventDefault();
+        void winStartResize(h.dataset.dir!);
+      });
+    });
   }
 
   // ---- search overlay -----------------------------------------------------

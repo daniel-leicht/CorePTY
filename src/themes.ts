@@ -44,6 +44,8 @@ export interface Theme {
   effects?: ThemeEffects;
   gridColor?: string;
   glowColor?: string;
+  /** Remove the native window frame and use a themed custom title bar. */
+  frameless?: boolean;
 }
 
 export const DEFAULT_UI_FONT = '"Segoe UI", system-ui, -apple-system, "Inter", sans-serif';
@@ -215,6 +217,7 @@ export const THEMES: Theme[] = [
       radius: 18,
     },
     fontUi: '"Antonio", "Oswald", "Arial Narrow", system-ui, sans-serif',
+    frameless: true,
     terminal: {
       background: "#000000", foreground: "#ff9966", cursor: "#ffcc00", cursorAccent: "#000000",
       selectionBackground: "#5a3a1a", selectionForeground: "#ffe8d6",
@@ -290,6 +293,7 @@ export function applyTheme(id: string): Theme {
   root.classList.toggle("fx-flicker", !!t.effects?.flicker);
   root.classList.toggle("fx-grid", !!t.effects?.grid);
   root.classList.toggle("fx-glow", !!t.effects?.glow);
+  root.classList.toggle("frameless", !!t.frameless);
 
   active = t;
   return t;

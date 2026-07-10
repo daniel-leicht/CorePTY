@@ -32,8 +32,10 @@ SSH with passwords or private keys.
   *esper-theme* collection — **BBS** (VT323 CRT with scanlines, phosphor glow, and
   box-drawing panel corners), **Synapse** (synthwave neon on a violet void, cyber-grid
   + scanlines), and **Starbase** (an LCARS starship console — orange-on-black, condensed
-  all-caps Antonio, pill-shaped controls). Each restyles the whole app — UI palette,
-  terminal ANSI colors, fonts (self-hosted, offline), effects, and component treatments.
+  all-caps Antonio, pill-shaped controls — and its own **frameless window**: the native
+  Windows title bar is replaced by a rounded orange LCARS elbow corner with pill window
+  controls). Each restyles the whole app — UI palette, terminal ANSI colors, fonts
+  (self-hosted, offline), effects, and component treatments.
 - **Settings** — live-applied font size/family, cursor style/blink, scrollback, default
   shell, bell, copy-on-select, and right-click behavior, persisted to `settings.json`.
 - **Slick dark UI** — session sidebar with quick-launch, tabbed terminals with live
