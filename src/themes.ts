@@ -186,6 +186,7 @@ export const THEMES: Theme[] = [
     },
     fontUi: '"Space Grotesk", "Segoe UI", system-ui, sans-serif',
     fontMono: '"JetBrains Mono", "Space Mono", ui-monospace, "Cascadia Mono", monospace',
+    cursor: "underline",
     effects: { scanlines: true, flicker: true, grid: true, glow: true },
     gridColor: "rgba(0, 251, 251, 0.05)",
     glowColor: "rgba(255, 0, 255, 0.45)",
