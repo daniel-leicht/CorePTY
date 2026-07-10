@@ -27,9 +27,13 @@ SSH with passwords or private keys.
   drag-and-drop to reorganize, inline rename, context menus, and per-folder counts.
 - **Reconnect** — when a session drops or exits, an in-terminal overlay offers a
   one-click reconnect (reusing the same tab); `Ctrl+Shift+R` reconnects the active tab.
-- **Settings** — live-applied appearance (accent color presets + custom, font
-  family/size, cursor style/blink) and terminal options (scrollback, default shell,
-  bell, copy-on-select, right-click behavior), persisted to `settings.json`.
+- **Themes** — seven built-in themes, switched live from Settings: CorePTY Dark /
+  Light, Dracula, Nord, Solarized Dark, and two retro themes ported from the
+  *esper-theme* collection — **BBS** (VT323 CRT with scanlines + phosphor glow) and
+  **Synapse** (synthwave neon on a violet void, cyber-grid + scanlines). Each sets the
+  full UI palette, terminal ANSI colors, fonts, and CRT effects.
+- **Settings** — live-applied font size/family, cursor style/blink, scrollback, default
+  shell, bell, copy-on-select, and right-click behavior, persisted to `settings.json`.
 - **Slick dark UI** — session sidebar with quick-launch, tabbed terminals with live
   connection status, a native connection dialog (with a real file picker for keys),
   buffer search, auto-copy-on-select, right-click paste, and toasts.
@@ -71,7 +75,8 @@ CorePTY/
 │   ├── connections.ts      #   folder/subfolder connections tree
 │   ├── dialog.ts           #   SSH/Telnet connection dialog
 │   ├── settings.ts         #   settings schema, persistence, live apply
-│   ├── settings-dialog.ts  #   settings modal
+│   ├── settings-dialog.ts  #   settings modal + theme picker
+│   ├── themes.ts           #   theme definitions (palette, ANSI, fonts, effects)
 │   ├── spec.ts             #   per-tab launch spec (for reconnect)
 │   ├── ipc.ts              #   typed Tauri command / event bridge
 │   ├── menu.ts             #   floating context-menu primitive
@@ -112,6 +117,12 @@ npm run tauri build    # produce a release bundle / installer
 Not yet implemented (natural next steps on the same core): SFTP/SCP file browser, split
 panes, serial connections, port-forwarding/tunnels, session logging, an interactive
 host-key prompt, broadcast-to-all-tabs, and manual drag-to-reorder within a folder.
+
+## License
+
+CorePTY is free software, licensed under the **GNU General Public License v3.0 or
+later** (`GPL-3.0-or-later`). Copyright © 2026 Daniel Leicht. See [LICENSE](LICENSE)
+for the full text.
 
 ---
 

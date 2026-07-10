@@ -4,6 +4,7 @@
   "version": "0.1.0",
   "type": "module",
   "description": "CorePTY — a modern multi-terminal client (local shells, SSH, Telnet)",
+  "license": "GPL-3.0-or-later",
   "scripts": {
     "dev": "vite",
     "build": "vite build",

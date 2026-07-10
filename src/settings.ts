@@ -1,11 +1,13 @@
-// User settings: schema, persistence (settings.json in config dir), and live
-// application to the CSS accent + xterm.js terminal options.
-import type { ITerminalOptions, ITheme } from "@xterm/xterm";
+// User settings: schema, persistence (settings.json in config dir), and the
+// terminal option derivation. Appearance (colors/fonts/effects) comes from the
+// selected theme; see themes.ts.
+import type { ITerminalOptions } from "@xterm/xterm";
 import { api, type LocalShell } from "./ipc";
+import { activeTheme, applyTheme, DEFAULT_MONO_FONT, THEMES } from "./themes";
 
 export interface Settings {
-  accent: string;
-  accent2: string;
+  theme: string;
+  /** Terminal font override; blank = use the theme's mono font. */
   fontFamily: string;
   fontSize: number;
   lineHeight: number;
@@ -19,10 +21,8 @@ export interface Settings {
 }
 
 export const DEFAULTS: Settings = {
-  accent: "#7c5cff",
-  accent2: "#22d3ee",
-  fontFamily:
-    '"Cascadia Code", "Cascadia Mono", "JetBrains Mono", "Consolas", ui-monospace, monospace',
+  theme: "corepty-dark",
+  fontFamily: "",
   fontSize: 13.5,
   lineHeight: 1.2,
   cursorStyle: "bar",
@@ -37,49 +37,10 @@ export const DEFAULTS: Settings = {
 /** Live settings object. Mutated in place so importers see updates. */
 export const current: Settings = { ...DEFAULTS };
 
-export const ACCENT_PRESETS: Array<{ name: string; accent: string; accent2: string }> = [
-  { name: "Indigo", accent: "#7c5cff", accent2: "#22d3ee" },
-  { name: "Emerald", accent: "#10b981", accent2: "#84cc16" },
-  { name: "Sunset", accent: "#fb7185", accent2: "#f59e0b" },
-  { name: "Ocean", accent: "#3b82f6", accent2: "#06b6d4" },
-  { name: "Violet", accent: "#a855f7", accent2: "#ec4899" },
-  { name: "Amber", accent: "#f59e0b", accent2: "#eab308" },
-];
-
-const BASE_THEME: ITheme = {
-  background: "#0e0f13",
-  foreground: "#cdd2df",
-  cursorAccent: "#0e0f13",
-  selectionForeground: "#f2f4fa",
-  black: "#12141c",
-  red: "#ff6b6b",
-  green: "#5ef2a0",
-  yellow: "#ffd166",
-  blue: "#5aa2ff",
-  magenta: "#c792ff",
-  cyan: "#22d3ee",
-  white: "#cdd2df",
-  brightBlack: "#5a6274",
-  brightRed: "#ff8b8b",
-  brightGreen: "#8ef7bd",
-  brightYellow: "#ffe08a",
-  brightBlue: "#89c2ff",
-  brightMagenta: "#dcb4ff",
-  brightCyan: "#7ee8f7",
-  brightWhite: "#f2f4fa",
-};
-
-export function termTheme(): ITheme {
-  return {
-    ...BASE_THEME,
-    cursor: current.accent,
-    selectionBackground: hexA(current.accent, 0.34),
-  };
-}
-
 export function termOptions(): ITerminalOptions {
+  const t = activeTheme();
   return {
-    fontFamily: current.fontFamily,
+    fontFamily: current.fontFamily.trim() || t.fontMono || DEFAULT_MONO_FONT,
     fontSize: current.fontSize,
     lineHeight: current.lineHeight,
     cursorStyle: current.cursorStyle,
@@ -90,18 +51,10 @@ export function termOptions(): ITerminalOptions {
     fontWeightBold: 600,
     allowProposedApi: true,
     drawBoldTextInBrightColors: true,
-    minimumContrastRatio: 1.1,
+    minimumContrastRatio: 1.05,
     macOptionIsMeta: true,
-    theme: termTheme(),
+    theme: t.terminal,
   };
-}
-
-export function applyAccent(): void {
-  const s = document.documentElement.style;
-  s.setProperty("--accent", current.accent);
-  s.setProperty("--accent-2", current.accent2);
-  s.setProperty("--accent-soft", hexA(current.accent, 0.16));
-  s.setProperty("--accent-ring", hexA(current.accent, 0.45));
 }
 
 export async function loadSettings(): Promise<void> {
@@ -111,11 +64,10 @@ export async function loadSettings(): Promise<void> {
   } catch {
     Object.assign(current, DEFAULTS);
   }
-  applyAccent();
+  applyTheme(current.theme);
 }
 
 export async function persistSettings(): Promise<void> {
-  applyAccent();
   try {
     await api.settingsSave(current as unknown as Record<string, unknown>);
   } catch {
@@ -123,14 +75,20 @@ export async function persistSettings(): Promise<void> {
   }
 }
 
+/** Switch theme, apply it, and persist. */
+export function setTheme(id: string): void {
+  current.theme = id;
+  applyTheme(id);
+  void persistSettings();
+}
+
 function sanitize(raw: Record<string, unknown>): Partial<Settings> {
   const out: Partial<Settings> = {};
-  const str = (v: unknown) => (typeof v === "string" ? v : undefined);
   const num = (v: unknown) => (typeof v === "number" && isFinite(v) ? v : undefined);
   const bool = (v: unknown) => (typeof v === "boolean" ? v : undefined);
-  if (str(raw.accent)) out.accent = raw.accent as string;
-  if (str(raw.accent2)) out.accent2 = raw.accent2 as string;
-  if (str(raw.fontFamily)) out.fontFamily = raw.fontFamily as string;
+  if (typeof raw.theme === "string" && THEMES.some((t) => t.id === raw.theme))
+    out.theme = raw.theme;
+  if (typeof raw.fontFamily === "string") out.fontFamily = raw.fontFamily;
   if (num(raw.fontSize)) out.fontSize = clamp(raw.fontSize as number, 8, 32);
   if (num(raw.lineHeight)) out.lineHeight = clamp(raw.lineHeight as number, 1, 2.5);
   if (raw.cursorStyle === "bar" || raw.cursorStyle === "block" || raw.cursorStyle === "underline")
@@ -147,13 +105,6 @@ function sanitize(raw: Record<string, unknown>): Partial<Settings> {
 
 function clamp(n: number, lo: number, hi: number): number {
   return Math.max(lo, Math.min(hi, n));
-}
-
-function hexA(hex: string, a: number): string {
-  const m = /^#?([0-9a-f]{6})$/i.exec(hex.trim());
-  if (!m) return `rgba(124,92,255,${a})`;
-  const n = parseInt(m[1], 16);
-  return `rgba(${(n >> 16) & 255}, ${(n >> 8) & 255}, ${n & 255}, ${a})`;
 }
 
 let audioCtx: AudioContext | null = null;

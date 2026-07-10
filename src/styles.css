@@ -1320,40 +1320,126 @@ input[type="range"] {
   width: 100%;
   height: 26px;
 }
-.swatches {
-  display: flex;
-  gap: 8px;
-  flex-wrap: wrap;
-  align-items: center;
-}
-.swatch {
-  width: 28px;
-  height: 28px;
-  border-radius: 8px;
-  border: 2px solid transparent;
-  cursor: pointer;
-  position: relative;
-  padding: 0;
-}
-.swatch.is-active {
-  border-color: var(--bg-2);
-  box-shadow: 0 0 0 2px var(--text-0);
-}
-.swatch-custom {
-  display: grid;
-  place-items: center;
-  background: var(--bg-3);
-  border: 1px dashed var(--line);
+/* ============================================================================
+   Theme picker + retro effects
+   ========================================================================== */
+.theme-group {
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.6px;
+  text-transform: uppercase;
   color: var(--text-3);
-  overflow: hidden;
+  margin: 4px 0 6px 2px;
 }
-.swatch-custom .icon {
-  width: 13px;
-  height: 13px;
+.theme-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 8px;
+  margin-bottom: 12px;
 }
-.swatch-custom input[type="color"] {
-  position: absolute;
-  inset: 0;
-  opacity: 0;
+.theme-card {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 6px;
+  border-radius: 10px;
+  border: 1px solid var(--line);
+  background: var(--bg-3);
   cursor: pointer;
+  text-align: left;
+  transition: border-color 0.15s var(--ease);
+}
+.theme-card:hover {
+  border-color: var(--accent-ring);
+}
+.theme-card.is-active {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent);
+}
+.theme-card__pv {
+  position: relative;
+  height: 48px;
+  border-radius: 7px;
+  border: 1px solid;
+  overflow: hidden;
+  display: flex;
+  padding: 6px 7px;
+}
+.theme-card__txt {
+  font-size: 15px;
+  font-weight: 700;
+  line-height: 1;
+}
+.theme-card__dots {
+  position: absolute;
+  left: 6px;
+  right: 6px;
+  bottom: 6px;
+  display: flex;
+  gap: 3px;
+}
+.theme-card__dots i {
+  flex: 1;
+  height: 6px;
+  border-radius: 2px;
+}
+.theme-card__name {
+  font-size: 11.5px;
+  color: var(--text-1);
+  padding-left: 2px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.theme-card.is-active .theme-card__name {
+  color: var(--text-0);
+  font-weight: 500;
+}
+
+/* ---- CRT / retro effects (toggled per theme) ---- */
+html.fx-scanlines::after {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: 9000;
+  pointer-events: none;
+  background: repeating-linear-gradient(
+      0deg,
+      rgba(0, 0, 0, 0.3) 0 1px,
+      transparent 1px 3px
+    ),
+    radial-gradient(120% 120% at 50% 50%, transparent 58%, rgba(0, 0, 0, 0.5) 100%);
+}
+html.fx-flicker::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: 8999;
+  pointer-events: none;
+  background: rgba(180, 200, 255, 0.035);
+  opacity: 0;
+  animation: crt-flicker 7s steps(80) infinite;
+}
+@keyframes crt-flicker {
+  0%, 97%, 100% { opacity: 0; }
+  98% { opacity: 1; }
+  99% { opacity: 0.4; }
+}
+@media (prefers-reduced-motion: reduce) {
+  html.fx-flicker::before { animation: none; }
+}
+html.fx-grid .sidebar,
+html.fx-grid .stage {
+  background-image: linear-gradient(var(--grid-line) 1px, transparent 1px),
+    linear-gradient(90deg, var(--grid-line) 1px, transparent 1px);
+  background-size: 32px 32px;
+}
+html.fx-glow .term .xterm-rows {
+  text-shadow: 0 0 3px var(--glow-tint);
+}
+html.fx-glow .brand__name,
+html.fx-glow .status-title,
+html.fx-glow .tab.is-active .tab__title,
+html.fx-glow .boot__title {
+  text-shadow: 0 0 8px var(--glow-tint);
 }

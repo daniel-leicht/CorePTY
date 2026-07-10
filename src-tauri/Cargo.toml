@@ -2,7 +2,8 @@
 name = "corepty"
 version = "0.1.0"
 description = "CorePTY — a modern multi-terminal client (local shells, SSH, Telnet)"
-authors = ["CorePTY"]
+authors = ["Daniel Leicht"]
+license = "GPL-3.0-or-later"
 edition = "2021"
 rust-version = "1.77"
 

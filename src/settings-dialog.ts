@@ -1,12 +1,7 @@
 // Settings modal. Changes apply live and persist immediately.
 import { icon } from "./icons";
-import {
-  ACCENT_PRESETS,
-  current,
-  DEFAULTS,
-  persistSettings,
-  type Settings,
-} from "./settings";
+import { current, DEFAULTS, persistSettings, setTheme, type Settings } from "./settings";
+import { THEMES } from "./themes";
 
 export class SettingsDialog {
   private el: HTMLElement | null = null;
@@ -45,31 +40,14 @@ export class SettingsDialog {
           <button class="modal__close" data-act="close">${icon("close")}</button>
         </div>
         <div class="modal__body">
+          <div class="settings-section">Theme</div>
+          ${themeGrid(s.theme)}
+
           <div class="settings-section">Appearance</div>
-
-          <div class="field">
-            <span class="field__label">Accent</span>
-            <div class="swatches">
-              ${ACCENT_PRESETS.map(
-                (p) =>
-                  `<button type="button" class="swatch ${p.accent === s.accent ? "is-active" : ""}" data-accent="${p.accent}" data-accent2="${p.accent2}" style="background:linear-gradient(135deg, ${p.accent}, ${p.accent2})" title="${p.name}"></button>`
-              ).join("")}
-              <label class="swatch swatch-custom" title="Custom accent">
-                ${icon("pencil")}
-                <input type="color" data-role="accent" value="${s.accent}" />
-              </label>
-              <label class="swatch swatch-custom" title="Custom gradient end">
-                ${icon("pencil")}
-                <input type="color" data-role="accent2" value="${s.accent2}" />
-              </label>
-            </div>
-          </div>
-
           <label class="field">
-            <span class="field__label">Font family</span>
-            <input data-role="fontFamily" value="${escAttr(s.fontFamily)}" spellcheck="false" />
+            <span class="field__label">Terminal font <span class="muted">(blank = theme default)</span></span>
+            <input data-role="fontFamily" value="${escAttr(s.fontFamily)}" placeholder="e.g. Cascadia Code" spellcheck="false" />
           </label>
-
           <div class="grid2">
             <label class="field">
               <span class="field__label">Font size <span data-fslabel>${s.fontSize}px</span></span>
@@ -80,7 +58,6 @@ export class SettingsDialog {
               <input type="range" min="1" max="2" step="0.05" data-role="lineHeight" value="${s.lineHeight}" />
             </label>
           </div>
-
           <div class="grid2">
             <div class="field">
               <span class="field__label">Cursor</span>
@@ -93,7 +70,6 @@ export class SettingsDialog {
           </div>
 
           <div class="settings-section">Terminal</div>
-
           <div class="grid2">
             <label class="field">
               <span class="field__label">Scrollback (lines)</span>
@@ -101,12 +77,9 @@ export class SettingsDialog {
             </label>
             <label class="field">
               <span class="field__label">Default shell</span>
-              <select data-role="defaultShell" class="select">
-                ${shellOpts(s.defaultShell)}
-              </select>
+              <select data-role="defaultShell" class="select">${shellOpts(s.defaultShell)}</select>
             </label>
           </div>
-
           <div class="grid2">
             <div class="field">
               <span class="field__label">Bell</span>
@@ -117,7 +90,6 @@ export class SettingsDialog {
               <div class="seg" data-role="rightClick">${seg(["paste", "menu"], s.rightClick)}</div>
             </div>
           </div>
-
           <label class="check">
             <input type="checkbox" data-role="copyOnSelect" ${s.copyOnSelect ? "checked" : ""} />
             <span>Copy on selection (PuTTY-style)</span>
@@ -141,12 +113,9 @@ export class SettingsDialog {
       apply();
     };
 
-    // text / range / number / select / checkbox controls
     root.querySelectorAll<HTMLElement>("[data-role]").forEach((elm) => {
       const role = elm.dataset.role as keyof Settings;
-      if (elm instanceof HTMLInputElement && elm.type === "color") {
-        elm.addEventListener("input", () => set(role, elm.value as Settings[typeof role]));
-      } else if (elm instanceof HTMLInputElement && elm.type === "range") {
+      if (elm instanceof HTMLInputElement && elm.type === "range") {
         elm.addEventListener("input", () => {
           const num = parseFloat(elm.value);
           set(role, num as Settings[typeof role]);
@@ -154,7 +123,9 @@ export class SettingsDialog {
           if (role === "lineHeight") root.querySelector("[data-lhlabel]")!.textContent = `${num}`;
         });
       } else if (elm instanceof HTMLInputElement && elm.type === "number") {
-        elm.addEventListener("change", () => set(role, (parseInt(elm.value, 10) || 100) as Settings[typeof role]));
+        elm.addEventListener("change", () =>
+          set(role, (parseInt(elm.value, 10) || 100) as Settings[typeof role])
+        );
       } else if (elm instanceof HTMLInputElement && elm.type === "checkbox") {
         elm.addEventListener("change", () => set(role, elm.checked as Settings[typeof role]));
       } else if (elm instanceof HTMLInputElement || elm instanceof HTMLSelectElement) {
@@ -170,18 +141,13 @@ export class SettingsDialog {
       }
     });
 
-    // accent preset swatches
-    root.querySelectorAll<HTMLButtonElement>(".swatch[data-accent]").forEach((sw) => {
-      sw.addEventListener("click", () => {
-        root.querySelectorAll(".swatch").forEach((x) => x.classList.remove("is-active"));
-        sw.classList.add("is-active");
-        current.accent = sw.dataset.accent!;
-        current.accent2 = sw.dataset.accent2!;
-        const a = root.querySelector<HTMLInputElement>('input[data-role="accent"]');
-        const a2 = root.querySelector<HTMLInputElement>('input[data-role="accent2"]');
-        if (a) a.value = current.accent;
-        if (a2) a2.value = current.accent2;
-        apply();
+    // theme cards
+    root.querySelectorAll<HTMLButtonElement>(".theme-card").forEach((card) => {
+      card.addEventListener("click", () => {
+        root.querySelectorAll(".theme-card").forEach((c) => c.classList.remove("is-active"));
+        card.classList.add("is-active");
+        setTheme(card.dataset.theme!);
+        this.onChange();
       });
     });
 
@@ -190,11 +156,39 @@ export class SettingsDialog {
     );
     root.querySelector('[data-act="reset"]')?.addEventListener("click", () => {
       Object.assign(current, DEFAULTS);
-      apply();
-      // rebuild the modal to reflect defaults
+      setTheme(current.theme);
+      this.onChange();
       this.open();
     });
   }
+}
+
+function themeGrid(activeId: string): string {
+  const groups = ["Modern", "Classic", "Retro"] as const;
+  return groups
+    .map((g) => {
+      const items = THEMES.filter((t) => t.group === g);
+      if (!items.length) return "";
+      return `<div class="theme-group">${g}</div>
+      <div class="theme-grid">
+        ${items
+          .map((t) => {
+            const c = t.colors;
+            const tm = t.terminal;
+            return `<button type="button" class="theme-card ${t.id === activeId ? "is-active" : ""}" data-theme="${t.id}">
+            <span class="theme-card__pv" style="background:${c.bg1};border-color:${c.line}">
+              <span class="theme-card__txt" style="color:${c.text1}">Aa</span>
+              <span class="theme-card__dots">
+                <i style="background:${c.accent}"></i><i style="background:${tm.red}"></i><i style="background:${tm.green}"></i><i style="background:${tm.yellow}"></i><i style="background:${tm.cyan}"></i><i style="background:${c.accent2}"></i>
+              </span>
+            </span>
+            <span class="theme-card__name">${t.name}</span>
+          </button>`;
+          })
+          .join("")}
+      </div>`;
+    })
+    .join("");
 }
 
 function seg(values: string[], active: string): string {
