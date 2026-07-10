@@ -154,7 +154,7 @@ export const THEMES: Theme[] = [
       line: "#16323d", lineSoft: "#0e2028",
       text0: "#eaf2f6", text1: "#9fb0bd", text2: "#7f909d", text3: "#586573",
       accent: "#3fe0ff", accent2: "#5b76ff", ok: "#4dff84", warn: "#ffe14d", danger: "#ff5d5d",
-      radius: 2,
+      radius: 0,
     },
     fontUi: '"VT323", "Cascadia Mono", "Consolas", ui-monospace, monospace',
     fontMono: '"VT323", "Cascadia Mono", "Consolas", ui-monospace, monospace',
@@ -179,7 +179,7 @@ export const THEMES: Theme[] = [
       line: "#564052", lineSoft: "#3c2e50",
       text0: "#ecdcff", text1: "#dcbed4", text2: "#a4899d", text3: "#7a6b86",
       accent: "#ff2bd6", accent2: "#00fbfb", ok: "#00ff41", warn: "#cdcd00", danger: "#ff6b8b",
-      radius: 2,
+      radius: 0,
     },
     fontUi: '"Space Grotesk", "Segoe UI", system-ui, sans-serif',
     fontMono: '"JetBrains Mono", "Space Mono", ui-monospace, "Cascadia Mono", monospace',
@@ -245,13 +245,15 @@ export function applyTheme(id: string): Theme {
   const r = c.radius ?? 10;
   s.setProperty("--radius-sm", `${Math.max(0, r - 4)}px`);
   s.setProperty("--radius", `${r}px`);
-  s.setProperty("--radius-lg", `${r + 4}px`);
+  s.setProperty("--radius-lg", `${r <= 1 ? r : r + 4}px`);
 
   s.setProperty("--font-ui", t.fontUi ?? DEFAULT_UI_FONT);
   s.setProperty("--font-mono", t.fontMono ?? DEFAULT_MONO_FONT);
 
   s.setProperty("--grid-line", t.gridColor ?? rgba(c.accent2, 0.05));
   s.setProperty("--glow-tint", t.glowColor ?? rgba(c.accent, 0.35));
+  s.setProperty("--glow", `0 0 14px ${rgba(c.accent, 0.45)}`);
+  s.setProperty("--glow-2", `0 0 14px ${rgba(c.accent2, 0.4)}`);
 
   root.classList.remove(`theme-${active.id}`);
   root.classList.add(`theme-${t.id}`);

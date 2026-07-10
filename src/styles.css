@@ -1443,3 +1443,161 @@ html.fx-glow .tab.is-active .tab__title,
 html.fx-glow .boot__title {
   text-shadow: 0 0 8px var(--glow-tint);
 }
+
+/* ============================================================================
+   Per-theme component treatments
+   ========================================================================== */
+
+/* Square off components that hard-code a radius (retro themes). */
+html.theme-bbs
+  :is(.tab, .btn, .ghost-btn, .modal, .pop, .search-bar, .toast, .quick__icon,
+    .tree-conn__icon, .pop__icon, .brand__mark, .tab__close, .tab-add, .side-add,
+    .tree-act, .status-kind, .seg, .seg button, .check input, .quick__btn,
+    .field input, .file-row input, .select),
+html.theme-synapse
+  :is(.tab, .btn, .ghost-btn, .modal, .pop, .search-bar, .toast, .quick__icon,
+    .tree-conn__icon, .pop__icon, .brand__mark, .tab__close, .tab-add, .side-add,
+    .tree-act, .status-kind, .seg, .seg button, .check input, .quick__btn,
+    .field input, .file-row input, .select) {
+  border-radius: 0;
+}
+
+/* Shared: list-row hover marker (a colored inset bar, ANSI/menu-selection style). */
+html.theme-bbs :is(.quick__btn, .tree-folder, .tree-conn, .pop__item, .ctx-item):hover,
+html.theme-synapse :is(.quick__btn, .tree-folder, .tree-conn, .pop__item, .ctx-item):hover {
+  background: var(--accent-soft);
+  box-shadow: inset 3px 0 0 var(--accent);
+}
+
+/* ---- BBS: square ANSI box-panels, cyan borders, yellow titles ---- */
+html.theme-bbs .side-group__label,
+html.theme-bbs .modal__title {
+  color: var(--warn);
+}
+html.theme-bbs .brand__mark {
+  box-shadow: none;
+}
+html.theme-bbs .tab {
+  border: 1px solid transparent;
+}
+html.theme-bbs .tab.is-active {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: var(--bg-3);
+}
+html.theme-bbs .tab.is-active::after {
+  display: none;
+}
+html.theme-bbs .tab__dot.connected,
+html.theme-bbs .status-dot.connected {
+  box-shadow: none;
+}
+html.theme-bbs .btn.primary,
+html.theme-bbs .seg button.is-active {
+  background: var(--accent);
+  color: #03121a;
+  box-shadow: none;
+}
+html.theme-bbs .btn.primary:hover {
+  filter: none;
+  background: var(--ok);
+  color: #03121a;
+  box-shadow: none;
+}
+/* popups / modals: double-line box border + hard shadow */
+html.theme-bbs .modal,
+html.theme-bbs .pop,
+html.theme-bbs .ctx-menu,
+html.theme-bbs .search-bar {
+  border: 3px double var(--accent);
+  box-shadow: 0 0 0 2px rgba(0, 0, 0, 0.6), 0 16px 40px rgba(0, 0, 0, 0.7);
+}
+html.theme-bbs .status-kind {
+  background: var(--accent);
+  color: #03121a;
+  border-color: var(--accent);
+}
+html.theme-bbs .field input,
+html.theme-bbs .file-row input,
+html.theme-bbs .select {
+  background: var(--bg-0);
+}
+html.theme-bbs :is(.field input, .file-row input, .select):focus {
+  border-color: var(--accent);
+  box-shadow: none;
+}
+
+/* ---- Synapse: sharp brutalist panels that GLOW, uppercase mono ---- */
+html.theme-synapse .brand__mark {
+  box-shadow: var(--glow);
+}
+html.theme-synapse .tab.is-active {
+  color: var(--accent-2);
+}
+html.theme-synapse .tab.is-active::after {
+  background: var(--accent-2);
+  box-shadow: var(--glow-2);
+}
+html.theme-synapse :is(.btn, .ghost-btn) {
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  border-width: 2px;
+}
+html.theme-synapse .btn.primary {
+  background: var(--accent);
+  color: #12001a;
+  box-shadow: var(--glow);
+}
+html.theme-synapse .btn.primary:hover {
+  filter: brightness(1.08);
+  box-shadow: var(--glow);
+}
+html.theme-synapse .btn.ghost,
+html.theme-synapse .ghost-btn {
+  border-color: var(--accent-2);
+  color: var(--accent-2);
+}
+html.theme-synapse :is(.btn.ghost, .ghost-btn):hover {
+  color: var(--text-0);
+  box-shadow: var(--glow-2);
+}
+html.theme-synapse .seg button.is-active {
+  color: var(--accent-2);
+  box-shadow: var(--glow-2);
+}
+/* neon-bordered, glowing panels */
+html.theme-synapse .modal {
+  border: 2px solid var(--accent);
+  box-shadow: var(--glow), 0 20px 50px rgba(5, 2, 15, 0.6);
+}
+html.theme-synapse .pop,
+html.theme-synapse .ctx-menu,
+html.theme-synapse .search-bar {
+  border: 1px solid var(--accent-2);
+  box-shadow: var(--glow-2);
+}
+html.theme-synapse .modal__head {
+  border-bottom: 1px solid var(--accent-soft);
+}
+html.theme-synapse .modal__title {
+  color: var(--accent);
+}
+/* uppercase mono labels */
+html.theme-synapse :is(.side-group__label, .field__label, .status-kind) {
+  color: var(--accent-2);
+}
+html.theme-synapse .field__label {
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  font-family: var(--font-mono);
+}
+html.theme-synapse .status-kind {
+  border-color: var(--accent-2);
+}
+html.theme-synapse :is(.field input, .file-row input, .select):focus {
+  border-color: var(--accent-2);
+  box-shadow: var(--glow-2);
+}
+html.theme-synapse .check input {
+  accent-color: var(--accent);
+}

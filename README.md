@@ -30,8 +30,10 @@ SSH with passwords or private keys.
 - **Themes** — seven built-in themes, switched live from Settings: CorePTY Dark /
   Light, Dracula, Nord, Solarized Dark, and two retro themes ported from the
   *esper-theme* collection — **BBS** (VT323 CRT with scanlines + phosphor glow) and
-  **Synapse** (synthwave neon on a violet void, cyber-grid + scanlines). Each sets the
-  full UI palette, terminal ANSI colors, fonts, and CRT effects.
+  **Synapse** (synthwave neon on a violet void, cyber-grid + scanlines). Each restyles
+  the whole app — UI palette, terminal ANSI colors, fonts, CRT effects, and even
+  component treatments (BBS's double-line box-panels and cyan-fill controls; Synapse's
+  sharp neon-glow borders and uppercase mono labels).
 - **Settings** — live-applied font size/family, cursor style/blink, scrollback, default
   shell, bell, copy-on-select, and right-click behavior, persisted to `settings.json`.
 - **Slick dark UI** — session sidebar with quick-launch, tabbed terminals with live
