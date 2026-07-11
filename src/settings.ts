@@ -41,7 +41,9 @@ export function termOptions(): ITerminalOptions {
   const t = activeTheme();
   return {
     fontFamily: current.fontFamily.trim() || t.fontMono || DEFAULT_MONO_FONT,
-    fontSize: current.fontSize,
+    // Some themes render small (e.g. BBS's VT323), so allow a per-theme nudge —
+    // relative to the user's chosen size, rounded to the nearest half-pixel.
+    fontSize: Math.round(current.fontSize * (t.termFontScale ?? 1) * 2) / 2,
     lineHeight: current.lineHeight,
     cursorStyle: t.cursor ?? current.cursorStyle,
     cursorBlink: current.cursorBlink,
