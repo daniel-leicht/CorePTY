@@ -49,6 +49,9 @@ export class App {
   private renamingUid: string | null = null;
   /** Last tab mousedown, for manual double-click (survives tab re-render). */
   private lastTabClick: { uid: string; at: number } | null = null;
+  /** Shared theme-styled tooltip element for tab hover, and its show timer. */
+  private tabTipEl: HTMLElement | null = null;
+  private tabTipTimer: number | null = null;
 
   private stageEl!: HTMLElement;
   private tabsListEl!: HTMLElement;
@@ -474,6 +477,7 @@ export class App {
   // ---- tab bar ------------------------------------------------------------
 
   private renderTabs(): void {
+    this.hideTabTip();
     // Never rebuild the strip while an inline-rename input is open (it would
     // destroy the field mid-edit, e.g. if the program fires an OSC title).
     if (this.renamingUid) return;
@@ -482,14 +486,17 @@ export class App {
       const el = document.createElement("div");
       el.className = "tab" + (t === this.active ? " is-active" : "");
       el.dataset.key = t.uid;
-      el.title = t.pinned ? `${t.title}  ·  renamed` : t.title;
+      el.setAttribute("aria-label", t.title);
       el.innerHTML = `
         <span class="tab__icon">${icon(t.iconName)}</span>
         <span class="tab__title">${escapeHtml(t.title)}</span>
         <span class="tab__dot ${t.status}"></span>
         <button class="tab__close" title="Close (Ctrl+Shift+W)">${icon("close")}</button>
       `;
+      el.addEventListener("mouseenter", () => this.showTabTip(el, t));
+      el.addEventListener("mouseleave", () => this.hideTabTip());
       el.addEventListener("mousedown", (e) => {
+        this.hideTabTip();
         if ((e.target as HTMLElement).closest(".tab__close, .tab__rename")) return;
         if (e.button === 1) {
           e.preventDefault();
@@ -522,9 +529,11 @@ export class App {
     }
   }
 
-  /** Right-click menu on a tab: rename, reset the name (if pinned), or close. */
+  /** Right-click menu on a tab: duplicate, rename, reset the name, or close. */
   private openTabMenu(session: TerminalSession, x: number, y: number): void {
+    this.hideTabTip();
     const items: MenuItem[] = [
+      { label: "Duplicate session", icon: "copy", action: () => this.duplicateSession(session) },
       { label: "Rename…", icon: "pencil", action: () => this.startTabRename(session) },
     ];
     if (session.pinned) {
@@ -541,6 +550,53 @@ export class App {
       action: () => void this.closeTab(session),
     });
     contextMenu(x, y, items);
+  }
+
+  /** Open a new tab launching the same thing as this tab (reusing its spec). */
+  private duplicateSession(session: TerminalSession): void {
+    const spec = session.spec;
+    if (!spec) {
+      this.toast("This tab can't be duplicated", "warn");
+      return;
+    }
+    if (spec.kind === "local") void this.newLocal(spec.shell);
+    else if (spec.kind === "ssh") void this.newSsh(spec.form);
+    else void this.newTelnet(spec.form);
+  }
+
+  // ---- tab hover tooltip (theme-styled) -----------------------------------
+
+  private ensureTabTip(): HTMLElement {
+    if (!this.tabTipEl) {
+      this.tabTipEl = document.createElement("div");
+      this.tabTipEl.className = "tab-tip";
+      document.body.appendChild(this.tabTipEl);
+    }
+    return this.tabTipEl;
+  }
+
+  /** Show the full tab title in a themed tooltip under the tab, after a beat. */
+  private showTabTip(anchor: HTMLElement, session: TerminalSession): void {
+    if (this.tabTipTimer) clearTimeout(this.tabTipTimer);
+    this.tabTipTimer = window.setTimeout(() => {
+      const tip = this.ensureTabTip();
+      tip.textContent = session.title;
+      const r = anchor.getBoundingClientRect();
+      tip.style.top = `${Math.round(r.bottom + 6)}px`;
+      tip.style.left = `${Math.round(r.left)}px`;
+      tip.classList.add("show");
+      // clamp within the viewport now that the tip has a measured width
+      const left = Math.max(8, Math.min(r.left, window.innerWidth - tip.offsetWidth - 8));
+      tip.style.left = `${Math.round(left)}px`;
+    }, 300);
+  }
+
+  private hideTabTip(): void {
+    if (this.tabTipTimer) {
+      clearTimeout(this.tabTipTimer);
+      this.tabTipTimer = null;
+    }
+    this.tabTipEl?.classList.remove("show");
   }
 
   /**

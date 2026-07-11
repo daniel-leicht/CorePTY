@@ -49,7 +49,9 @@ automatically by the [Build &amp; Release workflow](https://github.com/daniel-le
   (like Windows Terminal), so `cd`, an SSH login, or a tool such as Claude Code renames
   the tab automatically — over local shells, SSH, and Telnet alike. Double-click a tab
   (or right-click → **Rename**) to pin a manual name that overrides every programmatic
-  change from then on; right-click → **Reset name** hands control back.
+  change from then on; right-click → **Reset name** hands control back. Right-click
+  also offers **Duplicate session** (a new tab to the same shell/host), and hovering a
+  tab shows its full title in a themed tooltip.
 - **Themes** — eight built-in themes, switched live from Settings: CorePTY Dark /
   Light, Dracula, Nord, Solarized Dark, and three retro themes ported from the
   *esper-theme* collection — **BBS** (VT323 CRT with scanlines, phosphor glow, and
