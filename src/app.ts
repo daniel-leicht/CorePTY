@@ -16,7 +16,7 @@ import { icon } from "./icons";
 import { TerminalSession } from "./terminal";
 import { ConnectionDialog, type ConnForm, type DialogPrefill } from "./dialog";
 import { ConnectionsTree } from "./connections";
-import { contextMenu } from "./menu";
+import { contextMenu, type MenuItem } from "./menu";
 import { SettingsDialog } from "./settings-dialog";
 import { current as settings, loadSettings } from "./settings";
 import { activeTheme } from "./themes";
@@ -45,6 +45,10 @@ export class App {
   private tabs: TerminalSession[] = [];
   private byId = new Map<string, TerminalSession>();
   private active: TerminalSession | null = null;
+  /** uid of the tab whose inline-rename input is currently open (if any). */
+  private renamingUid: string | null = null;
+  /** Last tab mousedown, for manual double-click (survives tab re-render). */
+  private lastTabClick: { uid: string; at: number } | null = null;
 
   private stageEl!: HTMLElement;
   private tabsListEl!: HTMLElement;
@@ -409,7 +413,8 @@ export class App {
   }
 
   private addTab(session: TerminalSession): void {
-    session.onOsTitle = () => {
+    session.onTitleUpdate = () => {
+      this.renderTabs();
       if (session === this.active) this.updateStatus();
     };
     session.onStatusChange = () => {
@@ -466,10 +471,15 @@ export class App {
   // ---- tab bar ------------------------------------------------------------
 
   private renderTabs(): void {
+    // Never rebuild the strip while an inline-rename input is open (it would
+    // destroy the field mid-edit, e.g. if the program fires an OSC title).
+    if (this.renamingUid) return;
     this.tabsListEl.innerHTML = "";
     for (const t of this.tabs) {
       const el = document.createElement("div");
       el.className = "tab" + (t === this.active ? " is-active" : "");
+      el.dataset.key = t.uid;
+      el.title = t.pinned ? `${t.title}  ·  renamed` : t.title;
       el.innerHTML = `
         <span class="tab__icon">${icon(t.iconName)}</span>
         <span class="tab__title">${escapeHtml(t.title)}</span>
@@ -477,13 +487,29 @@ export class App {
         <button class="tab__close" title="Close (Ctrl+Shift+W)">${icon("close")}</button>
       `;
       el.addEventListener("mousedown", (e) => {
-        if ((e.target as HTMLElement).closest(".tab__close")) return;
+        if ((e.target as HTMLElement).closest(".tab__close, .tab__rename")) return;
         if (e.button === 1) {
           e.preventDefault();
           void this.closeTab(t);
           return;
         }
+        if (e.button !== 0) return;
+        // Double-click → rename, detected manually and keyed on the tab uid so it
+        // survives the strip re-rendering on the first click's activate().
+        const now = Date.now();
+        const prev = this.lastTabClick;
+        this.lastTabClick = { uid: t.uid, at: now };
+        if (prev && prev.uid === t.uid && now - prev.at < 400) {
+          this.lastTabClick = null;
+          e.preventDefault();
+          this.startTabRename(t);
+          return;
+        }
         this.activate(t);
+      });
+      el.addEventListener("contextmenu", (e) => {
+        e.preventDefault();
+        this.openTabMenu(t, e.clientX, e.clientY);
       });
       el.querySelector(".tab__close")!.addEventListener("click", (e) => {
         e.stopPropagation();
@@ -491,6 +517,71 @@ export class App {
       });
       this.tabsListEl.appendChild(el);
     }
+  }
+
+  /** Right-click menu on a tab: rename, reset the name (if pinned), or close. */
+  private openTabMenu(session: TerminalSession, x: number, y: number): void {
+    const items: MenuItem[] = [
+      { label: "Rename…", icon: "pencil", action: () => this.startTabRename(session) },
+    ];
+    if (session.pinned) {
+      items.push({
+        label: "Reset name",
+        icon: "refresh",
+        action: () => session.setCustomTitle(null),
+      });
+    }
+    items.push("sep", {
+      label: "Close tab",
+      icon: "close",
+      danger: true,
+      action: () => void this.closeTab(session),
+    });
+    contextMenu(x, y, items);
+  }
+
+  /**
+   * Inline-rename a tab. The typed name is *pinned*: from then on it overrides
+   * any OSC title the program or remote host sets (now and in the future) until
+   * it's reset. Submitting an empty value clears the pin, handing control back
+   * to the OSC / default title.
+   */
+  private startTabRename(session: TerminalSession): void {
+    const tabEl = this.tabsListEl.querySelector<HTMLElement>(`.tab[data-key="${session.uid}"]`);
+    const titleEl = tabEl?.querySelector<HTMLElement>(".tab__title");
+    if (!tabEl || !titleEl) return;
+
+    const input = document.createElement("input");
+    input.className = "tab__rename";
+    input.value = session.title;
+    input.spellcheck = false;
+    titleEl.replaceWith(input);
+    this.renamingUid = session.uid;
+    input.focus();
+    input.select();
+
+    let done = false;
+    const finish = (save: boolean): void => {
+      if (done) return;
+      done = true;
+      this.renamingUid = null;
+      if (save) session.setCustomTitle(input.value);
+      this.renderTabs();
+      if (session === this.active) this.updateStatus();
+    };
+    input.addEventListener("mousedown", (e) => e.stopPropagation());
+    input.addEventListener("dblclick", (e) => e.stopPropagation());
+    input.addEventListener("keydown", (e) => {
+      e.stopPropagation();
+      if (e.key === "Enter") {
+        e.preventDefault();
+        finish(true);
+      } else if (e.key === "Escape") {
+        e.preventDefault();
+        finish(false);
+      }
+    });
+    input.addEventListener("blur", () => finish(true));
   }
 
   // ---- status bar ---------------------------------------------------------

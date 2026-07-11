@@ -7,7 +7,7 @@ import { api, type SessionInfo, type SessionKind } from "./ipc";
 import { icon } from "./icons";
 import { ringBell, termOptions } from "./settings";
 import type { LaunchSpec } from "./spec";
-import { escapeHtml } from "./util";
+import { escapeHtml, uuid } from "./util";
 
 export type SessionStatus = "connecting" | "connected" | "exited" | "error";
 
@@ -23,13 +23,20 @@ export class TerminalSession {
   private overlayEl: HTMLDivElement | null = null;
 
   kind: SessionKind;
-  title: string;
   iconName: string;
+  /** Stable client-side tab identity, independent of the backend session id. */
+  readonly uid = uuid();
   /** How to relaunch this tab (set by the app). */
   spec: LaunchSpec | null = null;
-  osTitle = "";
 
-  onOsTitle?: (title: string) => void;
+  /** Default label (shell name / user@host), set at creation and on attach. */
+  private baseTitle: string;
+  /** Latest OSC 0/2 title set by the program, shell prompt, or remote host. */
+  osTitle = "";
+  /** A manually pinned name. Once set it overrides everything, permanently. */
+  private customTitle: string | null = null;
+
+  onTitleUpdate?: () => void;
   onExit?: (code: number | null) => void;
   onStatusChange?: () => void;
   onReconnect?: () => void;
@@ -37,7 +44,7 @@ export class TerminalSession {
 
   constructor(kind: SessionKind, title: string, iconName = "terminal") {
     this.kind = kind;
-    this.title = title;
+    this.baseTitle = title;
     this.iconName = iconName;
 
     this.element = document.createElement("div");
@@ -56,15 +63,38 @@ export class TerminalSession {
     this.term.onResize(({ cols, rows }) => {
       if (this.info && this.alive) void api.resize(this.info.id, cols, rows);
     });
+    // OSC 0/2 title from the program (e.g. Claude Code, a shell prompt) or, over
+    // SSH / Telnet, from the remote shell. This drives the tab name — unless the
+    // user has pinned a manual one (see `title` / `setCustomTitle`).
     this.term.onTitleChange((t) => {
       this.osTitle = t || "";
-      this.onOsTitle?.(this.osTitle);
+      this.onTitleUpdate?.();
     });
     this.term.onBell(() => ringBell(this.element));
   }
 
   get id(): string | null {
     return this.info?.id ?? null;
+  }
+
+  /**
+   * Effective tab label. A user-pinned name wins over everything; otherwise the
+   * program-set OSC title wins over the default label.
+   */
+  get title(): string {
+    return this.customTitle ?? (this.osTitle || this.baseTitle);
+  }
+
+  /** Whether the user pinned a manual name (which locks out OSC/default titles). */
+  get pinned(): boolean {
+    return this.customTitle !== null;
+  }
+
+  /** Pin a manual tab name; empty / null clears the pin (back to OSC/default). */
+  setCustomTitle(name: string | null): void {
+    const trimmed = name?.trim() ?? "";
+    this.customTitle = trimmed || null;
+    this.onTitleUpdate?.();
   }
 
   open(): void {
@@ -76,7 +106,7 @@ export class TerminalSession {
 
   attach(info: SessionInfo): void {
     this.info = info;
-    this.title = info.title || this.title;
+    this.baseTitle = info.title || this.baseTitle;
   }
 
   setStatus(status: SessionStatus): void {

@@ -27,6 +27,11 @@ SSH with passwords or private keys.
   drag-and-drop to reorganize, inline rename, context menus, and per-folder counts.
 - **Reconnect** — when a session drops or exits, an in-terminal overlay offers a
   one-click reconnect (reusing the same tab); `Ctrl+Shift+R` reconnects the active tab.
+- **Smart tab titles** — tabs follow the title the running program sets via `OSC 0/2`
+  (like Windows Terminal), so `cd`, an SSH login, or a tool such as Claude Code renames
+  the tab automatically — over local shells, SSH, and Telnet alike. Double-click a tab
+  (or right-click → **Rename**) to pin a manual name that overrides every programmatic
+  change from then on; right-click → **Reset name** hands control back.
 - **Themes** — eight built-in themes, switched live from Settings: CorePTY Dark /
   Light, Dracula, Nord, Solarized Dark, and three retro themes ported from the
   *esper-theme* collection — **BBS** (VT323 CRT with scanlines, phosphor glow, and
