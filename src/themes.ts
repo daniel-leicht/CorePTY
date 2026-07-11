@@ -165,7 +165,7 @@ export const THEMES: Theme[] = [
     },
     fontUi: '"VT323", "Cascadia Mono", "Consolas", ui-monospace, monospace',
     fontMono: '"VT323", "Cascadia Mono", "Consolas", ui-monospace, monospace',
-    termFontScale: 1.15,
+    termFontScale: 1.2,
     cursor: "block",
     effects: { scanlines: true, flicker: true, glow: true },
     glowColor: "rgba(120, 200, 220, 0.5)",

@@ -1423,7 +1423,7 @@ html.fx-scanlines::after {
   pointer-events: none;
   background: repeating-linear-gradient(
       0deg,
-      rgba(0, 0, 0, 0.3) 0 1px,
+      rgba(0, 0, 0, 0.22) 0 1px,
       transparent 1px 3px
     ),
     radial-gradient(120% 120% at 50% 50%, transparent 58%, rgba(0, 0, 0, 0.5) 100%);
@@ -1483,12 +1483,13 @@ html.theme-bbs {
   --bbs-magenta: #ff67d4; /* hover marker / chromatic ghost */
   --bbs-ink: #03121a; /* dark legend on solid cyan/yellow fills */
   --bbs-field: #02030a; /* input wells / status line / screen void */
+  --bbs-text-scale: 1.15; /* UI text nudge (+15%) — see the font-size block below */
 }
 
 /* VT323 renders tiny — scale the chrome up (the source body is 19px) and turn
    off smoothing for the crisp bitmap look, with a faint phosphor halo. */
 html.theme-bbs body {
-  font-size: 16px;
+  font-size: calc(16px * var(--bbs-text-scale));
   -webkit-font-smoothing: none;
   text-shadow: 0 0 1px rgba(120, 200, 220, 0.25);
 }
@@ -1496,21 +1497,21 @@ html.theme-bbs
   :is(.quick__label, .tree-folder__name, .tree-conn__name, .conn__name, .pop__name,
     .tab__title, .ctx-item, .field input, .file-row input, .select, .btn,
     .search-bar__input, .tree-rename, .term-overlay__msg) {
-  font-size: 16px;
+  font-size: calc(16px * var(--bbs-text-scale));
 }
 html.theme-bbs
   :is(.quick__hint, .tree-conn__sub, .conn__sub, .side-group__label, .status-os,
     .field__label, .empty-hint p, .side-footer__btn, .theme-card__name, .check,
     .seg button, .ghost-btn, .toast) {
-  font-size: 14px;
+  font-size: calc(14px * var(--bbs-text-scale));
 }
 html.theme-bbs
   :is(.pop__label, .pop__hint, .tree-folder__count, .theme-group, .settings-section,
     .side-footer__ver, .status-kind) {
-  font-size: 13px;
+  font-size: calc(13px * var(--bbs-text-scale));
 }
 html.theme-bbs .modal__title {
-  font-size: 19px;
+  font-size: calc(19px * var(--bbs-text-scale));
   color: var(--warn);
   letter-spacing: 1px;
 }
@@ -1545,7 +1546,7 @@ html.theme-bbs .brand__mark {
   box-shadow: none;
 }
 html.theme-bbs .brand__name {
-  font-size: 20px;
+  font-size: calc(20px * var(--bbs-text-scale));
   letter-spacing: 1px;
   color: var(--accent);
   text-shadow: 2px 0 0 rgba(255, 103, 212, 0.5), 0 0 10px rgba(63, 224, 255, 0.4);
@@ -1616,7 +1617,7 @@ html.theme-bbs .tab.is-active::after {
 /* status line: colored segments with dark legends (node/user/clock blocks) */
 html.theme-bbs .statusbar {
   background: var(--bbs-field);
-  font-size: 15px;
+  font-size: calc(15px * var(--bbs-text-scale));
 }
 html.theme-bbs .status-title {
   background: var(--accent-2);
@@ -2074,7 +2075,7 @@ html.theme-synapse input[type="range"] {
 
 /* CRT overlay: alternating scanlines + faint RGB chromatic stripes */
 html.theme-synapse.fx-scanlines::after {
-  background: linear-gradient(rgba(18, 16, 16, 0) 50%, rgba(0, 0, 0, 0.14) 50%),
+  background: linear-gradient(rgba(18, 16, 16, 0) 50%, rgba(0, 0, 0, 0.1) 50%),
     linear-gradient(90deg, rgba(255, 0, 0, 0.03), rgba(0, 255, 0, 0.012), rgba(0, 0, 255, 0.03)),
     radial-gradient(120% 120% at 50% 40%, transparent 60%, rgba(5, 2, 15, 0.55) 100%);
   background-size: 100% 3px, 3px 100%, 100% 100%;
