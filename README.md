@@ -62,7 +62,8 @@ automatically by the [Build &amp; Release workflow](https://github.com/daniel-le
   controls). Each restyles the whole app — UI palette, terminal ANSI colors, fonts
   (self-hosted, offline), effects, and component treatments.
 - **Settings** — live-applied font size/family, cursor style/blink, scrollback, default
-  shell, bell, copy-on-select, and right-click behavior, persisted to `settings.json`.
+  shell, bell, minimum-contrast (auto-adjusts hard-to-read text like nano's footer keys),
+  copy-on-select, and right-click behavior, persisted to `settings.json`.
 - **Slick dark UI** — session sidebar with quick-launch, tabbed terminals with live
   connection status, a native connection dialog (with a real file picker for keys),
   buffer search, auto-copy-on-select, right-click paste, and toasts.

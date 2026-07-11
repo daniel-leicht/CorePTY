@@ -124,6 +124,7 @@ export class TerminalSession {
     t.cursorStyle = o.cursorStyle;
     t.cursorBlink = o.cursorBlink;
     t.scrollback = o.scrollback;
+    t.minimumContrastRatio = o.minimumContrastRatio;
     t.theme = o.theme;
     this.fit();
   }

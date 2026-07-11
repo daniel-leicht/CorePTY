@@ -18,6 +18,8 @@ export interface Settings {
   rightClick: "paste" | "menu";
   defaultShell: LocalShell;
   bell: "none" | "visual" | "sound";
+  /** Auto-adjust unreadable text to a minimum contrast against its cell background. */
+  minContrast: "off" | "standard" | "high";
 }
 
 export const DEFAULTS: Settings = {
@@ -32,6 +34,7 @@ export const DEFAULTS: Settings = {
   rightClick: "paste",
   defaultShell: "powershell",
   bell: "visual",
+  minContrast: "standard",
 };
 
 /** Live settings object. Mutated in place so importers see updates. */
@@ -53,7 +56,9 @@ export function termOptions(): ITerminalOptions {
     fontWeightBold: 600,
     allowProposedApi: true,
     drawBoldTextInBrightColors: true,
-    minimumContrastRatio: 1.05,
+    // Force a floor on foreground/background contrast per cell, so low-contrast
+    // color pairs (e.g. nano's white-on-beige footer keys) stay readable.
+    minimumContrastRatio: contrastRatio(current.minContrast),
     macOptionIsMeta: true,
     theme: t.terminal,
   };
@@ -102,11 +107,18 @@ function sanitize(raw: Record<string, unknown>): Partial<Settings> {
   if (["cmd", "powershell", "pwsh", "bash"].includes(raw.defaultShell as string))
     out.defaultShell = raw.defaultShell as LocalShell;
   if (raw.bell === "none" || raw.bell === "visual" || raw.bell === "sound") out.bell = raw.bell;
+  if (raw.minContrast === "off" || raw.minContrast === "standard" || raw.minContrast === "high")
+    out.minContrast = raw.minContrast;
   return out;
 }
 
 function clamp(n: number, lo: number, hi: number): number {
   return Math.max(lo, Math.min(hi, n));
+}
+
+/** Map the friendly contrast level to an xterm minimumContrastRatio (1 = off). */
+function contrastRatio(level: Settings["minContrast"]): number {
+  return level === "high" ? 7 : level === "off" ? 1 : 4.5;
 }
 
 let audioCtx: AudioContext | null = null;

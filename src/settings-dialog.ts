@@ -93,6 +93,10 @@ export class SettingsDialog {
               <div class="seg" data-role="rightClick">${seg(["paste", "menu"], s.rightClick)}</div>
             </div>
           </div>
+          <div class="field">
+            <span class="field__label">Minimum contrast <span class="muted">· auto-adjust hard-to-read text</span></span>
+            <div class="seg" data-role="minContrast">${seg(["off", "standard", "high"], s.minContrast)}</div>
+          </div>
           <label class="check">
             <input type="checkbox" data-role="copyOnSelect" ${s.copyOnSelect ? "checked" : ""} />
             <span>Copy on selection (PuTTY-style)</span>
