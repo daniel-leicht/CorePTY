@@ -822,13 +822,18 @@ export class App {
     this.syncWindowFrame();
     for (const t of this.tabs) t.applySettings();
     requestAnimationFrame(() => this.active?.fit());
+    // The frameless transition resizes the window asynchronously; re-fit once it
+    // settles so the terminal's row count matches the new layout.
+    setTimeout(() => this.active?.fit(), 200);
   }
 
   // ---- window chrome (frameless per theme) --------------------------------
 
   /** Match the native window frame to the active theme (LCARS is frameless). */
   private syncWindowFrame(): void {
-    void winSetDecorations(!activeTheme().frameless);
+    void winSetDecorations(!activeTheme().frameless).then(() => {
+      requestAnimationFrame(() => this.active?.fit());
+    });
   }
 
   private wireWindowChrome(): void {

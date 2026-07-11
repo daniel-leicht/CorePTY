@@ -516,7 +516,7 @@ html.theme-synapse .stage {
   margin-bottom: 6px;
 }
 html.theme-starbase .stage {
-  margin-bottom: 4px;
+  margin-bottom: 8px;
 }
 
 .search-bar {
@@ -2109,6 +2109,7 @@ html.theme-synapse.fx-flicker::before {
    for the status bar, and a color-rotated shell rail.
    ========================================================================== */
 html.theme-starbase {
+  --status-h: 32px; /* taller track so the lilac pill clears the terminal's last row */
   --lcars-tan: #ffcc66;
   --lcars-sand: #ffcc99;
   --lcars-lilac: #9999cc;
