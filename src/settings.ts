@@ -2,7 +2,7 @@
 // terminal option derivation. Appearance (colors/fonts/effects) comes from the
 // selected theme; see themes.ts.
 import type { ITerminalOptions } from "@xterm/xterm";
-import { api, type LocalShell } from "./ipc";
+import { api, type LocalShell, type ShellInfo } from "./ipc";
 import { activeTheme, applyTheme, DEFAULT_MONO_FONT, THEMES } from "./themes";
 
 export interface Settings {
@@ -39,6 +39,29 @@ export const DEFAULTS: Settings = {
 
 /** Live settings object. Mutated in place so importers see updates. */
 export const current: Settings = { ...DEFAULTS };
+
+/** Local shells available on this OS, fetched from the backend at startup. */
+export let localShells: ShellInfo[] = [];
+
+/** Fetch the OS-specific shell list from the backend. Call once during mount. */
+export async function loadShells(): Promise<void> {
+  try {
+    const s = await api.listShells();
+    if (s.length) localShells = s;
+  } catch {
+    /* keep whatever we have */
+  }
+}
+
+/**
+ * The effective default shell id: the saved preference if it's actually
+ * available on this OS, otherwise the first available shell. Keeps a Windows
+ * default ("powershell") from breaking a first run on macOS / Linux.
+ */
+export function effectiveDefaultShell(): string {
+  if (localShells.some((s) => s.id === current.defaultShell)) return current.defaultShell;
+  return localShells[0]?.id ?? current.defaultShell;
+}
 
 export function termOptions(): ITerminalOptions {
   const t = activeTheme();
@@ -104,8 +127,9 @@ function sanitize(raw: Record<string, unknown>): Partial<Settings> {
   if (num(raw.scrollback)) out.scrollback = clamp(raw.scrollback as number, 100, 200000);
   if (bool(raw.copyOnSelect) !== undefined) out.copyOnSelect = raw.copyOnSelect as boolean;
   if (raw.rightClick === "paste" || raw.rightClick === "menu") out.rightClick = raw.rightClick;
-  if (["cmd", "powershell", "pwsh", "bash"].includes(raw.defaultShell as string))
-    out.defaultShell = raw.defaultShell as LocalShell;
+  // The shell id is validated against the OS list at launch, so accept any string.
+  if (typeof raw.defaultShell === "string" && raw.defaultShell)
+    out.defaultShell = raw.defaultShell;
   if (raw.bell === "none" || raw.bell === "visual" || raw.bell === "sound") out.bell = raw.bell;
   if (raw.minContrast === "off" || raw.minContrast === "standard" || raw.minContrast === "high")
     out.minContrast = raw.minContrast;

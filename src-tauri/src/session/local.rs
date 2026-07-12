@@ -1,6 +1,7 @@
 // Local shell sessions backed by a real PTY (ConPTY on Windows, openpty
-// elsewhere) via `portable-pty`. Supports CMD, Windows PowerShell, PowerShell 7,
-// Bash (Git Bash / WSL), and arbitrary custom commands.
+// elsewhere) via `portable-pty`. The available shells are OS-specific — Windows:
+// Command Prompt / PowerShell / PowerShell 7 / Git Bash; Unix: bash / zsh / fish
+// / sh / pwsh — plus an arbitrary custom command. See `available_shells`.
 
 use std::io::{Read, Write};
 use std::path::Path;
@@ -22,7 +23,8 @@ pub struct LocalOptions {
     /// before output starts). Generated if absent.
     #[serde(default)]
     pub id: Option<String>,
-    /// One of: "cmd" | "powershell" | "pwsh" | "bash" | "custom".
+    /// A shell id from `available_shells` (OS-specific), or "custom" to run an
+    /// arbitrary `command`.
     pub shell: String,
     /// Program to run when `shell == "custom"`.
     #[serde(default)]
@@ -206,20 +208,113 @@ fn shell_title(shell: &str) -> &'static str {
         "powershell" => "PowerShell",
         "pwsh" => "PowerShell 7",
         "bash" => "Bash",
+        "zsh" => "Zsh",
+        "fish" => "Fish",
+        "sh" => "Shell",
         _ => "Shell",
     }
 }
 
 /// Resolve `(program, args)` for a known shell name — shared with the elevated
-/// broker, which spawns the same shells under an elevated ConPTY.
+/// broker, which spawns the same shells under an elevated ConPTY. Which shells
+/// are valid depends on the OS (no cmd/PowerShell on Unix; no zsh/fish/sh on
+/// Windows); an unknown/unavailable shell yields `None`.
 pub(crate) fn resolve_program(shell: &str) -> Option<(String, Vec<String>)> {
+    let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<String>>();
     Some(match shell {
-        "cmd" => (resolve_cmd(), vec![]),
-        "powershell" => (resolve_powershell(), vec!["-NoLogo".to_string()]),
-        "pwsh" => (resolve_pwsh(), vec!["-NoLogo".to_string()]),
-        "bash" => (resolve_bash(), vec!["-l".to_string(), "-i".to_string()]),
+        #[cfg(windows)]
+        "cmd" => (resolve_cmd(), args(&[])),
+        #[cfg(windows)]
+        "powershell" => (resolve_powershell(), args(&["-NoLogo"])),
+        "pwsh" => (resolve_pwsh(), args(&["-NoLogo"])),
+        "bash" => (resolve_bash(), args(&["-l", "-i"])),
+        #[cfg(not(windows))]
+        "zsh" => (resolve_unix("zsh")?, args(&["-l"])),
+        #[cfg(not(windows))]
+        "fish" => (resolve_unix("fish")?, args(&["-l", "-i"])),
+        #[cfg(not(windows))]
+        "sh" => (
+            resolve_unix("sh").unwrap_or_else(|| "/bin/sh".to_string()),
+            args(&[]),
+        ),
         _ => return None,
     })
+}
+
+/// Display metadata for a selectable local shell, sent to the UI.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ShellInfo {
+    pub id: String,
+    pub label: String,
+    pub hint: String,
+    pub icon: String,
+}
+
+/// The shells offered on this OS, filtered to those actually installed. Windows
+/// always has Command Prompt + PowerShell; Unix always has `sh`; optional shells
+/// (PowerShell 7, Git Bash, fish, …) appear only when present. The UI renders
+/// whatever this returns.
+pub fn available_shells() -> Vec<ShellInfo> {
+    // (id, label, hint, icon, always_present)
+    #[cfg(windows)]
+    let candidates: &[(&str, &str, &str, &str, bool)] = &[
+        ("powershell", "PowerShell", "Windows PowerShell 5.1", "powershell", true),
+        ("pwsh", "PowerShell 7", "Cross-platform pwsh", "pwsh", false),
+        ("cmd", "Command Prompt", "cmd.exe", "cmd", true),
+        ("bash", "Bash", "Git Bash / WSL", "bash", false),
+    ];
+    #[cfg(target_os = "macos")]
+    let candidates: &[(&str, &str, &str, &str, bool)] = &[
+        ("zsh", "Zsh", "Default macOS shell", "terminal", true),
+        ("bash", "Bash", "GNU Bash", "bash", true),
+        ("fish", "Fish", "Friendly shell", "terminal", false),
+        ("sh", "sh", "POSIX shell", "terminal", true),
+        ("pwsh", "PowerShell 7", "Cross-platform pwsh", "pwsh", false),
+    ];
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let candidates: &[(&str, &str, &str, &str, bool)] = &[
+        ("bash", "Bash", "GNU Bash", "bash", false),
+        ("zsh", "Zsh", "Z shell", "terminal", false),
+        ("fish", "Fish", "Friendly shell", "terminal", false),
+        ("sh", "sh", "POSIX shell", "terminal", true),
+        ("pwsh", "PowerShell 7", "Cross-platform pwsh", "pwsh", false),
+    ];
+
+    let mut out: Vec<ShellInfo> = Vec::new();
+    for &(id, label, hint, icon, always) in candidates {
+        if always || shell_available(id) {
+            out.push(ShellInfo {
+                id: id.to_string(),
+                label: label.to_string(),
+                hint: hint.to_string(),
+                icon: icon.to_string(),
+            });
+        }
+    }
+    if out.is_empty() {
+        out.push(ShellInfo {
+            id: "sh".to_string(),
+            label: "Shell".to_string(),
+            hint: String::new(),
+            icon: "terminal".to_string(),
+        });
+    }
+    out
+}
+
+/// Whether an (optional) shell resolves to a real, launchable program.
+fn shell_available(id: &str) -> bool {
+    match resolve_program(id) {
+        Some((prog, _)) => {
+            let p = Path::new(&prog);
+            if p.is_absolute() {
+                p.symlink_metadata().is_ok()
+            } else {
+                which(&prog).is_some()
+            }
+        }
+        None => false,
+    }
 }
 
 fn file_stem(program: &str) -> String {
@@ -243,12 +338,11 @@ fn win_root() -> String {
         .unwrap_or_else(|_| r"C:\Windows".to_string())
 }
 
-/// Find an executable by name on `PATH`, returning a full launchable path.
-/// ConPTY's `CreateProcessW` won't resolve a bare program name via `PATH`, so a
-/// shell installed outside the well-known locations (scoop, a non-C: drive, or
-/// the Store's WindowsApps execution alias) has to be resolved to a real path
-/// here. Uses `symlink_metadata` so 0-byte reparse-point aliases still match.
-#[cfg(windows)]
+/// Find an executable by name on `PATH`, returning a full launchable path — used
+/// both to resolve a shell to a real path (Windows ConPTY won't search `PATH`
+/// for a bare name) and to test whether an optional shell is installed. Uses
+/// `symlink_metadata` so 0-byte reparse-point aliases (e.g. the Windows Store
+/// WindowsApps entry) still match.
 fn which(exe: &str) -> Option<String> {
     let path = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&path) {
@@ -281,16 +375,6 @@ fn resolve_powershell() -> String {
     } else {
         "powershell.exe".to_string()
     }
-}
-
-#[cfg(not(windows))]
-fn resolve_cmd() -> String {
-    "cmd.exe".to_string()
-}
-
-#[cfg(not(windows))]
-fn resolve_powershell() -> String {
-    "pwsh".to_string()
 }
 
 #[cfg(windows)]
@@ -339,17 +423,24 @@ fn resolve_bash() -> String {
     which("bash.exe").unwrap_or_else(|| "bash.exe".to_string())
 }
 
+/// Resolve a Unix program by name: common bin dirs first, then `PATH`.
+#[cfg(not(windows))]
+fn resolve_unix(name: &str) -> Option<String> {
+    for base in ["/bin", "/usr/bin", "/usr/local/bin", "/opt/homebrew/bin"] {
+        let p = format!("{base}/{name}");
+        if Path::new(&p).exists() {
+            return Some(p);
+        }
+    }
+    which(name)
+}
+
 #[cfg(not(windows))]
 fn resolve_pwsh() -> String {
-    "pwsh".to_string()
+    resolve_unix("pwsh").unwrap_or_else(|| "pwsh".to_string())
 }
 
 #[cfg(not(windows))]
 fn resolve_bash() -> String {
-    for c in ["/bin/bash", "/usr/bin/bash", "/usr/local/bin/bash"] {
-        if Path::new(c).exists() {
-            return c.to_string();
-        }
-    }
-    "bash".to_string()
+    resolve_unix("bash").unwrap_or_else(|| "bash".to_string())
 }

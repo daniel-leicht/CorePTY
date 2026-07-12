@@ -96,3 +96,16 @@ pub fn session_close(manager: State<SessionManager>, id: String) -> Result<(), S
 pub fn session_list(manager: State<SessionManager>) -> Vec<SessionInfo> {
     manager.list()
 }
+
+/// The local shells available on this OS, for the sidebar / launcher UI.
+#[tauri::command]
+pub fn list_local_shells() -> Vec<local::ShellInfo> {
+    local::available_shells()
+}
+
+/// The host OS: "windows" | "macos" | "linux" | … — drives OS-specific UI
+/// (e.g. "Run as Administrator" is Windows-only).
+#[tauri::command]
+pub fn host_os() -> String {
+    std::env::consts::OS.to_string()
+}

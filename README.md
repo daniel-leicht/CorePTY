@@ -9,11 +9,11 @@
   </p>
 
   <p>
-    <a href="https://github.com/daniel-leicht/CorePTY/actions/workflows/release-windows.yml"><img src="https://github.com/daniel-leicht/CorePTY/actions/workflows/release-windows.yml/badge.svg" alt="Build &amp; Release (Windows)" /></a>
+    <a href="https://github.com/daniel-leicht/CorePTY/actions/workflows/release.yml"><img src="https://github.com/daniel-leicht/CorePTY/actions/workflows/release.yml/badge.svg" alt="Build &amp; Release" /></a>
     <a href="https://github.com/daniel-leicht/CorePTY/releases/latest"><img src="https://img.shields.io/github/v/release/daniel-leicht/CorePTY?label=release&amp;color=6e5cff" alt="Latest release" /></a>
     <a href="https://github.com/daniel-leicht/CorePTY/releases"><img src="https://img.shields.io/github/downloads/daniel-leicht/CorePTY/total?color=34d399" alt="Downloads" /></a>
     <a href="LICENSE"><img src="https://img.shields.io/badge/license-GPL--3.0--or--later-blue" alt="License: GPL-3.0-or-later" /></a>
-    <img src="https://img.shields.io/badge/platform-Windows%20x64-0a7bbb" alt="Platform: Windows x64" />
+    <img src="https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-0a7bbb" alt="Platform: Windows · macOS · Linux" />
   </p>
 
   <img src="docs/screenshot.png" alt="CorePTY screenshot" width="840" />
@@ -25,25 +25,26 @@
 **Rust** core and a **web-tech UI** ([Tauri&nbsp;2](https://tauri.app) + [xterm.js](https://xtermjs.org)).
 It opens local shells, SSH, and Telnet sessions side by side, stores credentials in the OS
 keychain, and authenticates SSH with passwords or private keys — all in a footprint measured
-in **single-digit megabytes** (native WebView2, no bundled Chromium).
+in **single-digit megabytes** (each OS's native webview, no bundled Chromium).
 
 ---
 
 ## ✨ Highlights
 
-- **🖥️ Local terminals** — Windows PowerShell, PowerShell 7, Command Prompt, and Bash
-  (Git Bash / WSL), backed by real PTYs (ConPTY via [`portable-pty`](https://crates.io/crates/portable-pty)).
+- **🖥️ Local terminals** — the shells that fit your OS, auto-detected: PowerShell / PowerShell 7 /
+  Command Prompt / Git Bash on Windows, and bash / zsh / fish / sh on macOS &amp; Linux — backed by
+  real PTYs (ConPTY / openpty via [`portable-pty`](https://crates.io/crates/portable-pty)).
 - **🔐 SSH** — pure-Rust [`russh`](https://crates.io/crates/russh); password **and** private-key
   auth (with passphrase), `~/.ssh/known_hosts` verification (trust-on-first-use), and live resize.
 - **📡 Telnet** — a hand-rolled client with proper IAC option negotiation (SGA, ECHO,
   TERMINAL-TYPE → `xterm-256color`, NAWS window-size reporting).
-- **🛡️ Run as Administrator** — right-click a shell to open an **elevated tab** in the same
-  window (a UAC broker relays an elevated ConPTY over an admins-only named pipe); admin tabs
+- **🛡️ Run as Administrator** *(Windows)* — right-click a shell to open an **elevated tab** in the
+  same window (a UAC broker relays an elevated ConPTY over an admins-only named pipe); admin tabs
   are marked with a shield.
 - **🗂️ Organized connections** — a folder / subfolder tree in the sidebar with drag-and-drop,
   inline rename, context menus, and per-folder counts.
 - **🔑 Safe secrets** — passwords and key passphrases live **only** in the OS keychain
-  (Windows Credential Manager), never in plaintext on disk.
+  (Windows Credential Manager · macOS Keychain · Linux Secret Service), never in plaintext on disk.
 - **🏷️ Smart tab titles** — tabs follow the title a program or remote shell sets via `OSC 0/2`
   (like Windows Terminal). Double-click a tab to pin a custom name; right-click to
   **Duplicate**; hover for the full title.
@@ -86,14 +87,17 @@ controls.</sub>
 
 ## ⬇️ Download
 
-Prebuilt **Windows (64-bit)** binaries are attached to every [**Release**](https://github.com/daniel-leicht/CorePTY/releases/latest):
+Prebuilt binaries for **Windows, macOS, and Linux** are attached to every [**Release**](https://github.com/daniel-leicht/CorePTY/releases/latest):
 
-| Download | What it is |
-|---|---|
-| **`CorePTY_<version>_x64-setup.exe`** | Installer — Start-menu shortcut, uninstaller, and it provisions the WebView2 runtime if missing. |
-| **`CorePTY_<version>_x64-portable.exe`** | Portable — a single self-contained executable, no install. Needs the Edge **WebView2** runtime (preinstalled on Windows 11 and current Windows 10). |
+| Platform | Download | Notes |
+|---|---|---|
+| 🪟 **Windows 10/11 · x64** | `CorePTY_<version>_x64-setup.exe` | Installer (NSIS) — Start-menu shortcut + uninstaller; provisions the WebView2 runtime if missing. |
+| 🪟 Windows · portable | `CorePTY_<version>_x64-portable.exe` | Single self-contained `.exe`, no install. Needs the Edge **WebView2** runtime (preinstalled on Windows 11 and current Windows 10). |
+| 🍎 **macOS · Universal** | `CorePTY_<version>_universal.dmg` | Intel + Apple Silicon. Unsigned — on first launch, right-click the app → **Open**. |
+| 🐧 **Linux · x86-64** | `CorePTY_<version>_amd64.AppImage` | Portable — `chmod +x` and run. |
+| 🐧 Linux · Debian/Ubuntu | `CorePTY_<version>_amd64.deb` | `sudo apt install ./CorePTY_<version>_amd64.deb` |
 
-> Prefer to build it yourself? See [Build from source](#-build-from-source).
+> macOS and Linux builds are unsigned. Prefer to build it yourself? See [Build from source](#-build-from-source).
 
 ---
 
@@ -119,7 +123,7 @@ Prebuilt **Windows (64-bit)** binaries are attached to every [**Release**](https
 
 | Layer | Choice |
 |---|---|
-| Shell / windowing | [Tauri&nbsp;2](https://tauri.app) (Rust, native WebView2 — no bundled Chromium) |
+| Shell / windowing | [Tauri&nbsp;2](https://tauri.app) (Rust; each OS's native webview — WebView2 / WKWebView / WebKitGTK — no bundled Chromium) |
 | Terminal renderer | [xterm.js](https://xtermjs.org) 5 + fit / web-links / search addons |
 | Local PTY | [`portable-pty`](https://crates.io/crates/portable-pty) (ConPTY / openpty) |
 | SSH | [`russh`](https://crates.io/crates/russh) (`ring` crypto backend — no NASM required) |
@@ -133,9 +137,12 @@ Prebuilt **Windows (64-bit)** binaries are attached to every [**Release**](https
 
 **Prerequisites**
 
-- **Rust** (stable, MSVC toolchain on Windows) + the **Visual C++ Build Tools** — `ring` ships
+- **Rust** (stable). On Windows use the **MSVC toolchain** + Visual C++ Build Tools; `ring` ships
   pre-generated assembly, so **no NASM required**.
 - **Node.js 18+**.
+- **Linux**: the usual Tauri&nbsp;2 system packages — `libwebkit2gtk-4.1-dev`, `libgtk-3-dev`,
+  `librsvg2-dev`, `libayatana-appindicator3-dev`, `libdbus-1-dev`, `pkg-config`, `patchelf`.
+  **macOS**: Xcode Command Line Tools.
 
 ```bash
 npm install            # frontend deps
@@ -144,8 +151,9 @@ npm run tauri build    # produce a release bundle / installer
 ```
 
 **Releases** are cut by pushing a version tag — the
-[Build &amp; Release workflow](.github/workflows/release-windows.yml) builds the Windows x64
-installer + portable exe on GitHub's runners and attaches them to a new GitHub Release. Bump the
+[Build &amp; Release workflow](.github/workflows/release.yml) builds the Windows (installer +
+portable), macOS (universal `.dmg`), and Linux (`.AppImage` + `.deb`) artifacts on GitHub's
+runners and attaches them to a new GitHub Release. Bump the
 version in `src-tauri/tauri.conf.json` (and `Cargo.toml` / `package.json` to match), then:
 
 ```bash

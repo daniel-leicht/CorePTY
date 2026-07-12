@@ -11,7 +11,16 @@ export interface SessionInfo {
   title: string;
 }
 
-export type LocalShell = "cmd" | "powershell" | "pwsh" | "bash" | "custom";
+/** A local shell id — dynamic per OS (see `api.listShells`); "custom" runs an arbitrary command. */
+export type LocalShell = string;
+
+/** A selectable local shell offered on this OS. */
+export interface ShellInfo {
+  id: string;
+  label: string;
+  hint: string;
+  icon: string;
+}
 
 export interface LocalOptions {
   id?: string;
@@ -85,6 +94,11 @@ export const api = {
     invoke<void>("session_resize", { id, cols, rows }),
   close: (id: string) => invoke<void>("session_close", { id }),
   list: () => invoke<SessionInfo[]>("session_list"),
+
+  /** Local shells available on this OS. */
+  listShells: () => invoke<ShellInfo[]>("list_local_shells"),
+  /** Host OS: "windows" | "macos" | "linux" | … */
+  hostOs: () => invoke<string>("host_os"),
 
   secretSet: (id: string, secret: string) => invoke<void>("secret_set", { id, secret }),
   secretGet: (id: string) => invoke<string | null>("secret_get", { id }),

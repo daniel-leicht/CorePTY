@@ -18,27 +18,19 @@ import { ConnectionDialog, type ConnForm, type DialogPrefill } from "./dialog";
 import { ConnectionsTree } from "./connections";
 import { contextMenu, type MenuItem } from "./menu";
 import { SettingsDialog } from "./settings-dialog";
-import { current as settings, loadSettings } from "./settings";
+import {
+  current as settings,
+  effectiveDefaultShell,
+  loadSettings,
+  loadShells,
+  localShells,
+} from "./settings";
 import { activeTheme, preloadThemeFonts } from "./themes";
 import { escapeHtml, uuid } from "./util";
 import { winClose, winMinimize, winSetDecorations, winStartResize, winToggleMaximize } from "./window";
 
 /** App version, injected at build time by Vite (see vite.config.ts). */
 declare const __APP_VERSION__: string;
-
-interface ShellDef {
-  shell: LocalShell;
-  label: string;
-  iconName: string;
-  hint: string;
-}
-
-const SHELLS: ShellDef[] = [
-  { shell: "powershell", label: "PowerShell", iconName: "powershell", hint: "Windows PowerShell 5.1" },
-  { shell: "pwsh", label: "PowerShell 7", iconName: "pwsh", hint: "Cross-platform pwsh" },
-  { shell: "cmd", label: "Command Prompt", iconName: "cmd", hint: "cmd.exe" },
-  { shell: "bash", label: "Bash", iconName: "bash", hint: "Git Bash / WSL" },
-];
 
 export class App {
   private readonly root: HTMLElement;
@@ -48,6 +40,8 @@ export class App {
   private tabs: TerminalSession[] = [];
   private byId = new Map<string, TerminalSession>();
   private active: TerminalSession | null = null;
+  /** Host OS ("windows" | "macos" | "linux" | …); gates OS-specific UI. */
+  private hostOs = "";
   /** uid of the tab whose inline-rename input is currently open (if any). */
   private renamingUid: string | null = null;
   /** Last tab mousedown, for manual double-click (survives tab re-render). */
@@ -78,6 +72,9 @@ export class App {
 
   async mount(): Promise<void> {
     await loadSettings();
+    // Fetch the OS-specific shell list + host OS before the UI renders.
+    await loadShells();
+    this.hostOs = await api.hostOs().catch(() => "");
     this.render();
     this.syncWindowFrame();
     this.tree = new ConnectionsTree(this.connectionsEl, {
@@ -95,7 +92,7 @@ export class App {
   }
 
   private defaultShell(): LocalShell {
-    return settings.defaultShell;
+    return effectiveDefaultShell();
   }
 
   // ---- layout -------------------------------------------------------------
@@ -211,27 +208,33 @@ export class App {
     };
 
     const quick = this.root.querySelector("#quick")!;
-    quick.innerHTML = SHELLS.map(
-      (s) => `
-      <button class="quick__btn" data-shell="${s.shell}">
-        <span class="quick__icon">${icon(s.iconName)}</span>
-        <span class="quick__text"><span class="quick__label">${s.label}</span><span class="quick__hint">${s.hint}</span></span>
+    quick.innerHTML = localShells
+      .map(
+        (s) => `
+      <button class="quick__btn" data-shell="${escapeHtml(s.id)}">
+        <span class="quick__icon">${icon(s.icon)}</span>
+        <span class="quick__text"><span class="quick__label">${escapeHtml(s.label)}</span><span class="quick__hint">${escapeHtml(s.hint)}</span></span>
         <span class="quick__go">${icon("plus")}</span>
       </button>`
-    ).join("");
+      )
+      .join("");
     quick.querySelectorAll<HTMLButtonElement>(".quick__btn").forEach((btn) => {
       const shell = () => btn.dataset.shell as LocalShell;
       btn.addEventListener("click", () => this.newLocal(shell()));
       btn.addEventListener("contextmenu", (e) => {
         e.preventDefault();
-        contextMenu(e.clientX, e.clientY, [
+        const items: MenuItem[] = [
           { label: "New tab", icon: "plus", action: () => void this.newLocal(shell()) },
-          {
+        ];
+        // "Run as Administrator" is Windows-only (the elevated UAC broker).
+        if (this.hostOs === "windows") {
+          items.push({
             label: "Run as Administrator",
             icon: "shield",
             action: () => void this.newLocalElevated(shell()),
-          },
-        ]);
+          });
+        }
+        contextMenu(e.clientX, e.clientY, items);
       });
     });
 
@@ -346,8 +349,8 @@ export class App {
   }
 
   async newLocal(shell: LocalShell): Promise<void> {
-    const def = SHELLS.find((s) => s.shell === shell);
-    const session = new TerminalSession("local", def?.label ?? "Shell", def?.iconName ?? "terminal");
+    const def = localShells.find((s) => s.id === shell);
+    const session = new TerminalSession("local", def?.label ?? "Shell", def?.icon ?? "terminal");
     session.spec = { kind: "local", shell };
     const { id, cols, rows } = this.beginSession(session);
     try {
@@ -365,10 +368,10 @@ export class App {
 
   /** Open a local shell elevated (Administrator) — raises a UAC prompt. */
   async newLocalElevated(shell: LocalShell): Promise<void> {
-    const def = SHELLS.find((s) => s.shell === shell);
+    const def = localShells.find((s) => s.id === shell);
     const label = def?.label ?? "Shell";
     const title = `${label} (Admin)`;
-    const session = new TerminalSession("local", title, def?.iconName ?? "terminal");
+    const session = new TerminalSession("local", title, def?.icon ?? "terminal");
     session.elevated = true;
     session.spec = { kind: "local", shell, elevated: true };
     const { id, cols, rows } = this.beginSession(session);
@@ -737,13 +740,15 @@ export class App {
     menu.className = "launcher pop";
     menu.innerHTML = `
       <div class="pop__label">Local shell</div>
-      ${SHELLS.map(
-        (s) => `<button class="pop__item" data-shell="${s.shell}">
-          <span class="pop__icon">${icon(s.iconName)}</span>
-          <span class="pop__name">${s.label}</span>
-          <span class="pop__hint">${s.hint}</span>
+      ${localShells
+        .map(
+          (s) => `<button class="pop__item" data-shell="${escapeHtml(s.id)}">
+          <span class="pop__icon">${icon(s.icon)}</span>
+          <span class="pop__name">${escapeHtml(s.label)}</span>
+          <span class="pop__hint">${escapeHtml(s.hint)}</span>
         </button>`
-      ).join("")}
+        )
+        .join("")}
       <div class="pop__sep"></div>
       <div class="pop__label">Remote</div>
       <button class="pop__item" data-conn="ssh"><span class="pop__icon">${icon("ssh")}</span><span class="pop__name">SSH connection</span></button>

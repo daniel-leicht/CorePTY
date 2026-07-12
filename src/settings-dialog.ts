@@ -1,6 +1,14 @@
 // Settings modal. Changes apply live and persist immediately.
 import { icon } from "./icons";
-import { current, DEFAULTS, persistSettings, setTheme, type Settings } from "./settings";
+import {
+  current,
+  DEFAULTS,
+  effectiveDefaultShell,
+  localShells,
+  persistSettings,
+  setTheme,
+  type Settings,
+} from "./settings";
 import { activeTheme, THEMES } from "./themes";
 
 export class SettingsDialog {
@@ -80,7 +88,7 @@ export class SettingsDialog {
             </label>
             <label class="field">
               <span class="field__label">Default shell</span>
-              <select data-role="defaultShell" class="select">${shellOpts(s.defaultShell)}</select>
+              <select data-role="defaultShell" class="select">${shellOpts(effectiveDefaultShell())}</select>
             </label>
           </div>
           <div class="grid2">
@@ -207,14 +215,10 @@ function seg(values: string[], active: string): string {
 }
 
 function shellOpts(active: string): string {
-  const opts: Array<[string, string]> = [
-    ["powershell", "PowerShell"],
-    ["pwsh", "PowerShell 7"],
-    ["cmd", "Command Prompt"],
-    ["bash", "Bash"],
-  ];
-  return opts
-    .map(([v, label]) => `<option value="${v}" ${v === active ? "selected" : ""}>${label}</option>`)
+  return localShells
+    .map(
+      (s) => `<option value="${s.id}" ${s.id === active ? "selected" : ""}>${escAttr(s.label)}</option>`
+    )
     .join("");
 }
 

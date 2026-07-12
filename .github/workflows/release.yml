@@ -1,0 +1,200 @@
+name: Build & Release
+
+# Cut a release by pushing a version tag:
+#     git tag v0.1.0 && git push origin v0.1.0
+# …or run it by hand from the Actions tab. On a manual run you may supply a tag to
+# publish a release; leave it blank to just build the downloadable artifacts.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to publish a release for (e.g. v0.1.0). Blank = build artifacts only."
+        required: false
+        default: ""
+
+# Let the built-in token create / update GitHub Releases.
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Build the app on each OS and stage its artifacts with consistent names.
+  # ---------------------------------------------------------------------------
+  build:
+    name: Build (${{ matrix.platform }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            platform: windows
+            target: x86_64-pc-windows-msvc
+            rust-targets: x86_64-pc-windows-msvc
+            bundles: nsis
+          - os: macos-latest
+            platform: macos
+            target: universal-apple-darwin
+            rust-targets: aarch64-apple-darwin,x86_64-apple-darwin
+            bundles: dmg
+          - os: ubuntu-22.04
+            platform: linux
+            target: x86_64-unknown-linux-gnu
+            rust-targets: x86_64-unknown-linux-gnu
+            bundles: deb,appimage
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Set up Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust-targets }}
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+          key: ${{ matrix.target }}
+
+      # Tauri's Linux (WebKitGTK) build + AppImage bundler need these.
+      - name: Install Linux system dependencies
+        if: matrix.platform == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            librsvg2-dev \
+            libayatana-appindicator3-dev \
+            libdbus-1-dev \
+            pkg-config \
+            patchelf \
+            build-essential \
+            file \
+            wget \
+            libssl-dev
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build app
+        run: npx tauri build --target ${{ matrix.target }} --bundles ${{ matrix.bundles }}
+
+      - name: Stage release artifacts
+        id: stage
+        shell: bash
+        run: |
+          set -euo pipefail
+          ver=$(node -p "require('./src-tauri/tauri.conf.json').version")
+          rel="src-tauri/target/${{ matrix.target }}/release"
+          out="release-artifacts"; mkdir -p "$out"
+          echo "version=$ver" >> "$GITHUB_OUTPUT"
+
+          case "${{ matrix.platform }}" in
+            windows)
+              # NSIS installer + the self-contained portable exe (web UI embedded).
+              cp "$(ls "$rel"/bundle/nsis/*-setup.exe | head -n1)" "$out/CorePTY_${ver}_x64-setup.exe"
+              cp "$rel/corepty.exe" "$out/CorePTY_${ver}_x64-portable.exe"
+              ;;
+            macos)
+              # Universal .dmg (Intel + Apple Silicon).
+              cp "$(ls "$rel"/bundle/dmg/*.dmg | head -n1)" "$out/CorePTY_${ver}_universal.dmg"
+              ;;
+            linux)
+              # Portable AppImage + a Debian package.
+              cp "$(ls "$rel"/bundle/appimage/*.AppImage | head -n1)" "$out/CorePTY_${ver}_amd64.AppImage"
+              cp "$(ls "$rel"/bundle/deb/*.deb | head -n1)" "$out/CorePTY_${ver}_amd64.deb"
+              ;;
+          esac
+
+          echo "Staged artifacts:"; ls -la "$out"
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: corepty-${{ matrix.platform }}
+          path: release-artifacts/*
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Collect every OS's artifacts and publish a single, cross-platform release.
+  # ---------------------------------------------------------------------------
+  release:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve tag + version
+        id: rel
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+            tag="${GITHUB_REF_NAME}"
+          else
+            tag="${{ github.event.inputs.tag }}"
+          fi
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+          if [ -n "${tag}" ]; then
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download all build artifacts
+        if: steps.rel.outputs.publish == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: List artifacts
+        if: steps.rel.outputs.publish == 'true'
+        run: ls -la dist
+
+      - name: Publish to GitHub Releases
+        if: steps.rel.outputs.publish == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          tag_name: ${{ steps.rel.outputs.tag }}
+          name: CorePTY ${{ steps.rel.outputs.tag }}
+          draft: false
+          prerelease: false
+          fail_on_unmatched_files: false
+          files: dist/*
+          body: |
+            <div align="center">
+
+            ## CorePTY ${{ steps.rel.outputs.tag }}
+
+            A slick, cross-platform multi-terminal — local shells, SSH &amp; Telnet.
+
+            </div>
+
+            ### ⬇️ Downloads
+
+            | Platform | Download | Notes |
+            |---|---|---|
+            | 🪟 **Windows 10/11 · x64** | `CorePTY_${{ steps.rel.outputs.version }}_x64-setup.exe` | Installer (NSIS) — Start-menu shortcut + uninstaller; provisions WebView2 if missing. |
+            | 🪟 Windows · portable | `CorePTY_${{ steps.rel.outputs.version }}_x64-portable.exe` | Single self-contained exe, no install (needs the Edge WebView2 runtime). |
+            | 🍎 **macOS · Universal** | `CorePTY_${{ steps.rel.outputs.version }}_universal.dmg` | Intel + Apple Silicon. Unsigned — first launch: right-click → **Open**. |
+            | 🐧 **Linux · x86-64** | `CorePTY_${{ steps.rel.outputs.version }}_amd64.AppImage` | Portable — `chmod +x` then run. |
+            | 🐧 Linux · Debian/Ubuntu | `CorePTY_${{ steps.rel.outputs.version }}_amd64.deb` | `sudo apt install ./CorePTY_${{ steps.rel.outputs.version }}_amd64.deb` |
+
+            <sub>Local shells adapt to the OS — PowerShell / cmd on Windows; bash / zsh / fish / sh on macOS &amp; Linux. macOS and Linux builds are unsigned.</sub>

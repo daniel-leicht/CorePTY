@@ -43,6 +43,8 @@ pub fn run() {
             commands::session_resize,
             commands::session_close,
             commands::session_list,
+            commands::list_local_shells,
+            commands::host_os,
             store::secret_set,
             store::secret_get,
             store::secret_delete,

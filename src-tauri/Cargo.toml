@@ -1,6 +1,6 @@
 [package]
 name = "corepty"
-version = "0.2.8"
+version = "0.3.0"
 description = "CorePTY — a modern multi-terminal client (local shells, SSH, Telnet)"
 authors = ["Daniel Leicht"]
 license = "GPL-3.0-or-later"
@@ -26,7 +26,8 @@ tokio = { version = "1.52.3", features = ["rt-multi-thread", "sync", "macros", "
 # Use the `ring` crypto backend instead of the default `aws-lc-rs`, which needs
 # the NASM assembler to build on Windows. `ring` ships pre-generated MSVC asm.
 russh = { version = "0.54.5", default-features = false, features = ["ring", "flate2", "rsa"] }
-keyring = { version = "3.6.3", features = ["windows-native"] }
+# Base (mock) keystore; the real OS backend is selected per-platform below.
+keyring = { version = "3.6.3", default-features = false }
 toml = "1.0.7"
 tauri-plugin-dialog = "2"
 
@@ -43,6 +44,18 @@ windows = { version = "0.58", features = [
   "Win32_UI_Shell",
   "Win32_UI_WindowsAndMessaging",
 ] }
+# Windows Credential Manager.
+keyring = { version = "3.6.3", features = ["windows-native"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# macOS Keychain (Security framework — no extra system deps).
+keyring = { version = "3.6.3", features = ["apple-native"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Secret Service (blocking) over D-Bus + pure-Rust crypto. Needs libdbus to build
+# (libdbus-1-dev + pkg-config) and D-Bus at runtime — both standard on any Linux
+# desktop, which is also where the Secret Service (gnome-keyring/kwallet) lives.
+keyring = { version = "3.6.3", features = ["sync-secret-service", "crypto-rust"] }
 
 [profile.release]
 opt-level = "s"
