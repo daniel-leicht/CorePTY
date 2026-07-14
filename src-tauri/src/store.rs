@@ -66,6 +66,9 @@ pub struct SavedSession {
     pub folder_id: Option<String>,
     #[serde(default)]
     pub color: Option<String>,
+    /// Sort index within its folder (drag-to-reorder). Absent = sort by name.
+    #[serde(default)]
+    pub order: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -123,6 +126,25 @@ pub fn sessions_upsert(app: AppHandle, session: SavedSession) -> Result<(), Stri
         *existing = session;
     } else {
         store.sessions.push(session);
+    }
+    write_store(&app, &store)
+}
+
+/// Set the folder + order of a batch of sessions in one write. `ids` is the new
+/// display order of the sessions now in `folder`; each is moved into `folder`
+/// (None = root) and given its list index as `order`. Used by drag-to-reorder.
+#[tauri::command]
+pub fn sessions_reorder(
+    app: AppHandle,
+    folder: Option<String>,
+    ids: Vec<String>,
+) -> Result<(), String> {
+    let mut store = read_store(&app)?;
+    for (i, id) in ids.iter().enumerate() {
+        if let Some(s) = store.sessions.iter_mut().find(|s| &s.id == id) {
+            s.folder_id = folder.clone();
+            s.order = Some(i as i64);
+        }
     }
     write_store(&app, &store)
 }

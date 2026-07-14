@@ -26,7 +26,6 @@ export interface ThemeColors {
 
 export interface ThemeEffects {
   scanlines?: boolean;
-  flicker?: boolean;
   grid?: boolean;
   glow?: boolean;
 }
@@ -167,7 +166,7 @@ export const THEMES: Theme[] = [
     fontMono: '"VT323", "Cascadia Mono", "Consolas", ui-monospace, monospace',
     termFontScale: 1.2,
     cursor: "block",
-    effects: { scanlines: true, flicker: true, glow: true },
+    effects: { scanlines: true, glow: true },
     glowColor: "rgba(120, 200, 220, 0.5)",
     terminal: {
       background: "#080a12", foreground: "#9fb0bd", cursor: "#3fe0ff", cursorAccent: "#03121a",
@@ -195,7 +194,7 @@ export const THEMES: Theme[] = [
     fontUi: '"Space Mono", "JetBrains Mono", ui-monospace, "Cascadia Mono", monospace',
     fontMono: '"JetBrains Mono", "Space Mono", ui-monospace, "Cascadia Mono", monospace',
     cursor: "underline",
-    effects: { scanlines: true, flicker: true, grid: true, glow: true },
+    effects: { scanlines: true, grid: true, glow: true },
     gridColor: "rgba(0, 251, 251, 0.045)",
     glowColor: "rgba(255, 0, 255, 0.45)",
     terminal: {
@@ -294,7 +293,6 @@ export function applyTheme(id: string): Theme {
   root.classList.remove(`theme-${active.id}`);
   root.classList.add(`theme-${t.id}`);
   root.classList.toggle("fx-scanlines", !!t.effects?.scanlines);
-  root.classList.toggle("fx-flicker", !!t.effects?.flicker);
   root.classList.toggle("fx-grid", !!t.effects?.grid);
   root.classList.toggle("fx-glow", !!t.effects?.glow);
   root.classList.toggle("frameless", !!t.frameless);

@@ -53,7 +53,7 @@ export class TerminalSession {
     this.element = document.createElement("div");
     this.element.className = "term";
 
-    this.term = new Terminal(termOptions());
+    this.term = new Terminal(termOptions(kind));
     this.fitAddon = new FitAddon();
     this.search = new SearchAddon();
     this.term.loadAddon(this.fitAddon);

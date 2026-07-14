@@ -385,6 +385,16 @@ button {
   border-radius: 2px 2px 0 0;
   background: var(--grad-accent);
 }
+/* Drag-to-reorder feedback */
+.tab--dragging {
+  opacity: 0.45;
+}
+.tab--drop-before {
+  box-shadow: inset 3px 0 0 0 var(--accent);
+}
+.tab--drop-after {
+  box-shadow: inset -3px 0 0 0 var(--accent);
+}
 .tab__icon {
   display: grid;
   place-items: center;
@@ -1300,6 +1310,13 @@ html.theme-starbase .tab-tip {
   box-shadow: inset 0 0 0 2px var(--accent-ring);
   border-radius: 8px;
 }
+/* drag-to-reorder connections: an insertion line above/below the target row */
+.tree-conn.drop-above {
+  box-shadow: inset 0 2px 0 0 var(--accent);
+}
+.tree-conn.drop-below {
+  box-shadow: inset 0 -2px 0 0 var(--accent);
+}
 
 /* ---- context menu ---- */
 .ctx-menu {
@@ -1527,24 +1544,6 @@ html.fx-scanlines::after {
       transparent 1px 3px
     ),
     radial-gradient(120% 120% at 50% 50%, transparent 58%, rgba(0, 0, 0, 0.5) 100%);
-}
-html.fx-flicker::before {
-  content: "";
-  position: fixed;
-  inset: 0;
-  z-index: 8999;
-  pointer-events: none;
-  background: rgba(180, 200, 255, 0.035);
-  opacity: 0;
-  animation: crt-flicker 7s steps(80) infinite;
-}
-@keyframes crt-flicker {
-  0%, 97%, 100% { opacity: 0; }
-  98% { opacity: 1; }
-  99% { opacity: 0.4; }
-}
-@media (prefers-reduced-motion: reduce) {
-  html.fx-flicker::before { animation: none; }
 }
 html.fx-grid .sidebar,
 html.fx-grid .stage {
@@ -1817,10 +1816,6 @@ html.theme-bbs :is(.field input, .file-row input)::placeholder {
   color: var(--text-3);
 }
 
-/* cool phosphor flicker tint */
-html.theme-bbs.fx-flicker::before {
-  background: rgba(63, 224, 255, 0.03);
-}
 
 /* ============================================================================
    Synapse — 80s synthwave "NEURAL_OS".
@@ -2135,9 +2130,6 @@ html.theme-synapse.fx-scanlines::after {
     linear-gradient(90deg, rgba(255, 0, 0, 0.03), rgba(0, 255, 0, 0.012), rgba(0, 0, 255, 0.03)),
     radial-gradient(120% 120% at 50% 40%, transparent 60%, rgba(5, 2, 15, 0.55) 100%);
   background-size: 100% 3px, 3px 100%, 100% 100%;
-}
-html.theme-synapse.fx-flicker::before {
-  background: rgba(120, 40, 160, 0.05);
 }
 
 /* ============================================================================

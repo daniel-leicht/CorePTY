@@ -69,6 +69,8 @@ export interface SavedSession {
   saveSecret: boolean;
   folderId?: string | null;
   color?: string | null;
+  /** Sort index within its folder (drag-to-reorder); absent = sort by name. */
+  order?: number | null;
 }
 
 export interface Folder {
@@ -106,6 +108,9 @@ export const api = {
 
   sessionsLoad: () => invoke<SavedSession[]>("sessions_load"),
   sessionsUpsert: (session: SavedSession) => invoke<void>("sessions_upsert", { session }),
+  /** Set the folder + order of `ids` in one write (drag-to-reorder). */
+  sessionsReorder: (folder: string | null, ids: string[]) =>
+    invoke<void>("sessions_reorder", { folder, ids }),
   sessionsDelete: (id: string) => invoke<void>("sessions_delete", { id }),
 
   foldersLoad: () => invoke<Folder[]>("folders_load"),

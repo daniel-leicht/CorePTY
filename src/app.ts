@@ -46,6 +46,8 @@ export class App {
   private renamingUid: string | null = null;
   /** Last tab mousedown, for manual double-click (survives tab re-render). */
   private lastTabClick: { uid: string; at: number } | null = null;
+  /** Tab currently being drag-reordered (if any). */
+  private dragTab: TerminalSession | null = null;
   /** Shared theme-styled tooltip element for tab hover, and its show timer. */
   private tabTipEl: HTMLElement | null = null;
   private tabTipTimer: number | null = null;
@@ -495,18 +497,28 @@ export class App {
     session.onClose = () => void this.closeTab(session);
     this.tabs.push(session);
     this.stageEl.appendChild(session.element);
+    this.renderTabs();
     this.activate(session);
   }
 
   private activate(session: TerminalSession): void {
     this.active = session;
     for (const t of this.tabs) t.element.classList.toggle("is-active", t === session);
-    this.renderTabs();
+    // Update the strip highlight in place rather than rebuilding it — keeps tab
+    // switches cheap and, crucially, doesn't destroy a tab element mid-drag.
+    this.markActiveTab();
     this.updateStatus();
     requestAnimationFrame(() => {
       session.open();
       session.fit();
       session.focus();
+    });
+  }
+
+  /** Reflect the active tab in the strip without rebuilding it. */
+  private markActiveTab(): void {
+    this.tabsListEl.querySelectorAll<HTMLElement>(".tab").forEach((el) => {
+      el.classList.toggle("is-active", el.dataset.key === this.active?.uid);
     });
   }
 
@@ -520,17 +532,14 @@ export class App {
     session.dispose();
     this.tabs.splice(idx, 1);
 
-    if (this.active === session) {
+    const wasActive = this.active === session;
+    if (wasActive) this.active = null;
+    this.renderTabs();
+    if (wasActive) {
+      // Focus a neighbour; if none remain, renderTabs already showed the empty state.
       const next = this.tabs[idx] ?? this.tabs[idx - 1] ?? null;
-      this.active = null;
       if (next) this.activate(next);
-      else {
-        // No tabs left — show the empty state rather than forcing a new session.
-        this.renderTabs();
-        this.updateStatus();
-      }
-    } else {
-      this.renderTabs();
+      else this.updateStatus();
     }
   }
 
@@ -587,8 +596,60 @@ export class App {
         e.stopPropagation();
         void this.closeTab(t);
       });
+
+      // Drag to reorder within the strip.
+      el.draggable = true;
+      el.addEventListener("dragstart", (e) => {
+        this.dragTab = t;
+        e.dataTransfer!.effectAllowed = "move";
+        el.classList.add("tab--dragging");
+      });
+      el.addEventListener("dragend", () => this.clearDragMarks());
+      el.addEventListener("dragover", (e) => {
+        if (!this.dragTab || this.dragTab === t) return;
+        e.preventDefault();
+        e.dataTransfer!.dropEffect = "move";
+        const after = e.clientX > el.getBoundingClientRect().left + el.offsetWidth / 2;
+        el.classList.toggle("tab--drop-after", after);
+        el.classList.toggle("tab--drop-before", !after);
+      });
+      el.addEventListener("dragleave", () => {
+        el.classList.remove("tab--drop-before", "tab--drop-after");
+      });
+      el.addEventListener("drop", (e) => {
+        e.preventDefault();
+        const dragged = this.dragTab;
+        const after = e.clientX > el.getBoundingClientRect().left + el.offsetWidth / 2;
+        this.clearDragMarks();
+        if (dragged && dragged !== t) this.moveTab(dragged, t, after);
+      });
+
       this.tabsListEl.appendChild(el);
     }
+  }
+
+  /** Clear any in-progress drag state + drop indicators. */
+  private clearDragMarks(): void {
+    this.dragTab = null;
+    this.tabsListEl
+      .querySelectorAll(".tab--dragging, .tab--drop-before, .tab--drop-after")
+      .forEach((el) =>
+        el.classList.remove("tab--dragging", "tab--drop-before", "tab--drop-after")
+      );
+  }
+
+  /** Reorder the strip: move `dragged` to just before/after `target`. */
+  private moveTab(dragged: TerminalSession, target: TerminalSession, after: boolean): void {
+    const from = this.tabs.indexOf(dragged);
+    if (from < 0 || dragged === target) return;
+    this.tabs.splice(from, 1);
+    const ti = this.tabs.indexOf(target);
+    if (ti < 0) {
+      this.tabs.splice(from, 0, dragged); // target vanished — restore, no-op
+      return;
+    }
+    this.tabs.splice(after ? ti + 1 : ti, 0, dragged);
+    this.renderTabs();
   }
 
   /** Right-click menu on a tab: duplicate, rename, reset the name, or close. */

@@ -2,7 +2,7 @@
 // terminal option derivation. Appearance (colors/fonts/effects) comes from the
 // selected theme; see themes.ts.
 import type { ITerminalOptions } from "@xterm/xterm";
-import { api, type LocalShell, type ShellInfo } from "./ipc";
+import { api, type LocalShell, type SessionKind, type ShellInfo } from "./ipc";
 import { activeTheme, applyTheme, DEFAULT_MONO_FONT, THEMES } from "./themes";
 
 export interface Settings {
@@ -63,9 +63,9 @@ export function effectiveDefaultShell(): string {
   return localShells[0]?.id ?? current.defaultShell;
 }
 
-export function termOptions(): ITerminalOptions {
+export function termOptions(kind?: SessionKind): ITerminalOptions {
   const t = activeTheme();
-  return {
+  const opts: ITerminalOptions = {
     fontFamily: current.fontFamily.trim() || t.fontMono || DEFAULT_MONO_FONT,
     // Some themes render small (e.g. BBS's VT323), so allow a per-theme nudge —
     // relative to the user's chosen size, rounded to the nearest half-pixel.
@@ -85,6 +85,14 @@ export function termOptions(): ITerminalOptions {
     macOptionIsMeta: true,
     theme: t.terminal,
   };
+  // Local shells on Windows run under ConPTY. Telling xterm this enables its
+  // ConPTY line-wrap / reflow heuristics, which prevents stale cells and cursor
+  // desync when a TUI (e.g. Claude Code) redraws a line you've edited. Not set
+  // for SSH/Telnet (a real remote PTY) or for openpty on macOS/Linux.
+  if (kind === "local" && typeof navigator !== "undefined" && /Windows/i.test(navigator.userAgent)) {
+    opts.windowsPty = { backend: "conpty" };
+  }
+  return opts;
 }
 
 export async function loadSettings(): Promise<void> {

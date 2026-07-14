@@ -50,6 +50,7 @@ pub fn run() {
             store::secret_delete,
             store::sessions_load,
             store::sessions_upsert,
+            store::sessions_reorder,
             store::sessions_delete,
             store::folders_load,
             store::folder_upsert,

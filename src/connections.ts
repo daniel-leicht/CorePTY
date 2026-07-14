@@ -109,7 +109,7 @@ export class ConnectionsTree {
     return this.folders.filter((f) => (f.parentId ?? null) === parentId).sort(byName);
   }
   private childSessions(folderId: string | null): SavedSession[] {
-    return this.sessions.filter((s) => (s.folderId ?? null) === folderId).sort(byName);
+    return this.sessions.filter((s) => (s.folderId ?? null) === folderId).sort(byOrder);
   }
 
   private renderLevel(container: HTMLElement, parentId: string | null, depth: number): void {
@@ -182,6 +182,7 @@ export class ConnectionsTree {
       this.sessionMenu(e, s);
     });
     this.wireDrag(row, { type: "session", id: s.id }, null);
+    this.wireReorder(row, s);
     container.appendChild(row);
   }
 
@@ -305,7 +306,9 @@ export class ConnectionsTree {
     row.addEventListener("dragend", () => {
       this.drag = null;
       row.classList.remove("dragging");
-      this.el.querySelectorAll(".drop-into").forEach((el) => el.classList.remove("drop-into"));
+      this.el
+        .querySelectorAll(".drop-into, .drop-above, .drop-below")
+        .forEach((el) => el.classList.remove("drop-into", "drop-above", "drop-below"));
     });
     if (dropFolderId !== null) {
       row.addEventListener("dragover", (e) => {
@@ -329,9 +332,13 @@ export class ConnectionsTree {
     this.drag = null;
     if (!d) return;
     if (d.type === "session") {
-      const s = this.sessions.find((x) => x.id === d.id);
-      if (!s || (s.folderId ?? null) === targetFolderId) return;
-      await api.sessionsUpsert({ ...s, folderId: targetFolderId });
+      if (!this.sessions.some((x) => x.id === d.id)) return;
+      // Move into the target folder, appended to the end (via the reorder model).
+      const ids = this.childSessions(targetFolderId)
+        .filter((x) => x.id !== d.id)
+        .map((x) => x.id);
+      ids.push(d.id);
+      await api.sessionsReorder(targetFolderId, ids);
     } else {
       if (d.id === targetFolderId) return;
       if (targetFolderId && this.isDescendant(targetFolderId, d.id)) {
@@ -343,6 +350,55 @@ export class ConnectionsTree {
       await api.folderUpsert({ ...f, parentId: targetFolderId });
     }
     if (targetFolderId) this.collapsed.delete(targetFolderId);
+    await this.refresh();
+  }
+
+  /** Session rows are reorder targets: drop above/below to reposition (dragging
+   *  a session; folders still drop *into* via wireDrag). */
+  private wireReorder(row: HTMLElement, s: SavedSession): void {
+    const mark = (e: DragEvent): boolean => {
+      const d = this.drag;
+      if (d?.type !== "session" || d.id === s.id) return false;
+      const r = row.getBoundingClientRect();
+      const below = e.clientY > r.top + r.height / 2;
+      row.classList.toggle("drop-below", below);
+      row.classList.toggle("drop-above", !below);
+      return below;
+    };
+    row.addEventListener("dragover", (e) => {
+      if (this.drag?.type !== "session" || this.drag.id === s.id) return;
+      e.preventDefault();
+      e.stopPropagation();
+      mark(e);
+    });
+    row.addEventListener("dragleave", () => row.classList.remove("drop-above", "drop-below"));
+    row.addEventListener("drop", (e) => {
+      const d = this.drag;
+      if (d?.type !== "session" || d.id === s.id) return;
+      e.preventDefault();
+      e.stopPropagation();
+      const below = mark(e);
+      row.classList.remove("drop-above", "drop-below");
+      this.drag = null;
+      void this.reorderSession(d.id, s, below);
+    });
+  }
+
+  /** Move a dragged session into `target`'s folder, positioned before/after it. */
+  private async reorderSession(
+    draggedId: string,
+    target: SavedSession,
+    after: boolean
+  ): Promise<void> {
+    if (draggedId === target.id) return;
+    const folderId = target.folderId ?? null;
+    const ids = this.childSessions(folderId)
+      .filter((x) => x.id !== draggedId)
+      .map((x) => x.id);
+    const ti = ids.indexOf(target.id);
+    if (ti < 0) return;
+    ids.splice(after ? ti + 1 : ti, 0, draggedId);
+    await api.sessionsReorder(folderId, ids);
     await this.refresh();
   }
 
@@ -362,4 +418,12 @@ export class ConnectionsTree {
 
 function byName(a: { name: string }, b: { name: string }): number {
   return a.name.localeCompare(b.name, undefined, { sensitivity: "base" });
+}
+
+/** Sort by explicit `order` (drag-to-reorder), falling back to name. */
+function byOrder(
+  a: { order?: number | null; name: string },
+  b: { order?: number | null; name: string }
+): number {
+  return (a.order ?? 0) - (b.order ?? 0) || byName(a, b);
 }
