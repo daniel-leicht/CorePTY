@@ -3,6 +3,7 @@ import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import { SearchAddon } from "@xterm/addon-search";
+import { Unicode11Addon } from "@xterm/addon-unicode11";
 import { WebglAddon } from "@xterm/addon-webgl";
 import { api, type SessionInfo, type SessionKind } from "./ipc";
 import { icon } from "./icons";
@@ -59,6 +60,11 @@ export class TerminalSession {
     this.term.loadAddon(this.fitAddon);
     this.term.loadAddon(new WebLinksAddon());
     this.term.loadAddon(this.search);
+    // Use Unicode 11 character widths so xterm agrees with what modern CLIs
+    // (Node/Ink — e.g. Claude Code) assume; a width mismatch desyncs the cursor
+    // and leaves stray blank cells while editing.
+    this.term.loadAddon(new Unicode11Addon());
+    this.term.unicode.activeVersion = "11";
 
     this.term.onData((d) => {
       if (this.info && this.alive) void api.write(this.info.id, d);

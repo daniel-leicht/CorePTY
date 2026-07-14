@@ -1,7 +1,7 @@
 {
   "name": "corepty",
   "private": true,
-  "version": "0.3.1",
+  "version": "0.3.2",
   "type": "module",
   "description": "CorePTY — a modern multi-terminal client (local shells, SSH, Telnet)",
   "license": "GPL-3.0-or-later",
@@ -16,6 +16,7 @@
     "@tauri-apps/plugin-dialog": "^2.7.1",
     "@xterm/addon-fit": "^0.10.0",
     "@xterm/addon-search": "^0.15.0",
+    "@xterm/addon-unicode11": "^0.8.0",
     "@xterm/addon-web-links": "^0.11.0",
     "@xterm/addon-webgl": "^0.18.0",
     "@xterm/xterm": "^5.5.0"
