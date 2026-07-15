@@ -793,7 +793,9 @@ export class App {
     title.textContent = s.title;
     kind.textContent = kindLabel(s.kind);
     os.textContent = s.osTitle && s.osTitle !== s.title ? s.osTitle : "";
-    dims.textContent = s.alive ? `${s.term.cols} × ${s.term.rows}` : "";
+    dims.textContent = s.alive
+      ? `${s.term.cols} × ${s.term.rows} · ${s.renderer === "webgl" ? "WebGL" : "DOM"}`
+      : "";
     dot.className = `status-dot ${s.status}`;
   }
 

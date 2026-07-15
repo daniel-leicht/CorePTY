@@ -9,6 +9,7 @@ import { api, type SessionInfo, type SessionKind } from "./ipc";
 import { icon } from "./icons";
 import { ringBell, termOptions } from "./settings";
 import type { LaunchSpec } from "./spec";
+import { SgrDimFilter } from "./dimfix";
 import { escapeHtml, uuid } from "./util";
 
 export type SessionStatus = "connecting" | "connected" | "exited" | "error";
@@ -24,6 +25,11 @@ export class TerminalSession {
   private opened = false;
   private overlayEl: HTMLDivElement | null = null;
   private repaintTimer: number | null = null;
+  /** Rewrites SGR dim → grey (WebGL doesn't render the faint attribute). */
+  private readonly dimFilter = new SgrDimFilter();
+  /** Re-fits when the element gains/changes size (e.g. becomes visible). */
+  private sizeObserver: ResizeObserver | null = null;
+  private fitRaf = 0;
 
   kind: SessionKind;
   iconName: string;
@@ -33,6 +39,8 @@ export class TerminalSession {
   spec: LaunchSpec | null = null;
   /** Whether this tab runs elevated (Administrator). */
   elevated = false;
+  /** Which xterm renderer is live: "webgl" once the addon loads, else "dom". */
+  renderer: "webgl" | "dom" = "dom";
 
   /** Default label (shell name / user@host), set at creation and on attach. */
   private baseTitle: string;
@@ -129,11 +137,24 @@ export class TerminalSession {
         } catch {
           /* ignore — xterm reverts to the DOM renderer */
         }
+        this.renderer = "dom";
+        this.onStatusChange?.();
       });
       this.term.loadAddon(webgl);
+      this.renderer = "webgl";
     } catch {
       /* WebGL unavailable — keep the DOM renderer. */
     }
+    console.info(`[corepty] terminal renderer: ${this.renderer}`);
+    // Re-fit whenever this terminal's box changes size — most importantly when
+    // it first gains a size (a tab opened right after launch, before the stage
+    // had laid out, would otherwise fit to 0 and come up blank). Debounced to a
+    // frame so a burst of layout changes collapses to one fit.
+    this.sizeObserver = new ResizeObserver(() => {
+      if (this.fitRaf) cancelAnimationFrame(this.fitRaf);
+      this.fitRaf = requestAnimationFrame(() => this.fit());
+    });
+    this.sizeObserver.observe(this.element);
     this.fit();
   }
 
@@ -165,6 +186,9 @@ export class TerminalSession {
 
   fit(): void {
     if (!this.opened) return;
+    // Don't fit a hidden / not-yet-laid-out terminal: fitAddon would compute 0
+    // rows/cols and the session would come up blank until the next resize.
+    if (this.element.clientWidth === 0 || this.element.clientHeight === 0) return;
     try {
       this.fitAddon.fit();
     } catch {
@@ -177,7 +201,7 @@ export class TerminalSession {
   }
 
   writeBytes(bytes: Uint8Array): void {
-    this.term.write(bytes);
+    this.term.write(this.dimFilter.feed(bytes));
     this.scheduleRepaint();
   }
 
@@ -274,6 +298,9 @@ export class TerminalSession {
       clearTimeout(this.repaintTimer);
       this.repaintTimer = null;
     }
+    if (this.fitRaf) cancelAnimationFrame(this.fitRaf);
+    this.sizeObserver?.disconnect();
+    this.sizeObserver = null;
     try {
       this.term.dispose();
     } catch {

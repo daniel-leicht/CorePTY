@@ -1,6 +1,6 @@
 [package]
 name = "corepty"
-version = "0.3.3"
+version = "0.3.4"
 description = "CorePTY — a modern multi-terminal client (local shells, SSH, Telnet)"
 authors = ["Daniel Leicht"]
 license = "GPL-3.0-or-later"
