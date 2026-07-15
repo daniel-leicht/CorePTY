@@ -169,8 +169,8 @@ export const THEMES: Theme[] = [
     fontUi: '"VT323", "Cascadia Mono", "Consolas", ui-monospace, monospace',
     fontMono: '"VT323", "Cascadia Mono", "Consolas", ui-monospace, monospace',
     termFontScale: 1.2,
-    // VT323 is a very narrow glyph; widen each cell ~30% so BBS text isn't cramped.
-    termLetterSpacing: 0.15,
+    // VT323 is a very narrow glyph; widen each cell a little so BBS isn't cramped.
+    termLetterSpacing: 0.05,
     cursor: "block",
     effects: { scanlines: true, glow: true },
     glowColor: "rgba(120, 200, 220, 0.5)",

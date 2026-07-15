@@ -40,17 +40,37 @@ function hexToRgb(hex: string): [number, number, number] {
   return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
 }
 
-/** Rewrite an SGR parameter list: bare `2` → grey fg; `22` (intensity off) also
- *  resets the fg (`39`) so the grey doesn't linger. Everything else is passed
- *  through untouched. Params are ASCII digits / `;` / `:`, so exact matching on
- *  a split-by-`;` element never collides with 256/truecolor sub-parameters. */
+/** Rewrite an SGR parameter list: a bare `2` (dim) → grey fg; `22` (intensity
+ *  off) also resets the fg (`39`) so the grey doesn't linger. Everything else is
+ *  passed through untouched.
+ *
+ *  Crucially, the extended-colour introducers `38`/`48`/`58` are followed by
+ *  sub-parameters (`;5;N` or `;2;R;G;B`) whose digits — including a `2` selector
+ *  or an R/G/B/index that happens to equal `2` — must NOT be read as the dim
+ *  attribute. We copy those sub-parameters verbatim. (Colon-packed colours like
+ *  `38:2::r:g:b` are a single `;`-element and never equal `"2"`, so they're
+ *  already safe.) */
 function rewriteSgr(params: string): string {
-  // Cheap reject: only `2` or `22` matter; if neither can be present, skip.
+  // Cheap reject: only a bare `2` / `22` matters; if no `2` digit at all, skip.
   if (params.indexOf("2") === -1) return params;
-  return params
-    .split(";")
-    .map((p) => (p === "2" ? dimParams() : p === "22" ? "22;39" : p))
-    .join(";");
+  const parts = params.split(";");
+  const out: string[] = [];
+  for (let i = 0; i < parts.length; i++) {
+    const p = parts[i];
+    if (p === "38" || p === "48" || p === "58") {
+      out.push(p);
+      const mode = parts[i + 1];
+      const take = mode === "5" ? 2 : mode === "2" ? 4 : mode !== undefined ? 1 : 0;
+      const consumed = Math.min(take, parts.length - 1 - i);
+      for (let k = 1; k <= consumed; k++) out.push(parts[i + k]);
+      i += consumed;
+      continue;
+    }
+    if (p === "2") out.push(dimParams());
+    else if (p === "22") out.push("22;39");
+    else out.push(p);
+  }
+  return out.join(";");
 }
 
 /**
