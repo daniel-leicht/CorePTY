@@ -41,6 +41,10 @@ export interface Theme {
   /** Multiplier for the terminal font size (default 1). Retro bitmap fonts like
    *  VT323 render small, so a theme can nudge the terminal text up a little. */
   termFontScale?: number;
+  /** Extra horizontal spacing per cell, as a fraction of the effective terminal
+   *  font size. Widens the monospace rhythm for narrow bitmap fonts (VT323) with
+   *  no change to row height. ~0.15 ≈ +30% cell width. */
+  termLetterSpacing?: number;
   /** Preferred terminal cursor style; overrides the user setting when set. */
   cursor?: "bar" | "block" | "underline";
   effects?: ThemeEffects;
@@ -165,6 +169,8 @@ export const THEMES: Theme[] = [
     fontUi: '"VT323", "Cascadia Mono", "Consolas", ui-monospace, monospace',
     fontMono: '"VT323", "Cascadia Mono", "Consolas", ui-monospace, monospace',
     termFontScale: 1.2,
+    // VT323 is a very narrow glyph; widen each cell ~30% so BBS text isn't cramped.
+    termLetterSpacing: 0.15,
     cursor: "block",
     effects: { scanlines: true, glow: true },
     glowColor: "rgba(120, 200, 220, 0.5)",
