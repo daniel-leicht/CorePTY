@@ -23,6 +23,7 @@ export class TerminalSession {
   readonly search: SearchAddon;
   private opened = false;
   private overlayEl: HTMLDivElement | null = null;
+  private repaintTimer: number | null = null;
 
   kind: SessionKind;
   iconName: string;
@@ -80,6 +81,10 @@ export class TerminalSession {
       this.onTitleUpdate?.();
     });
     this.term.onBell(() => ringBell(this.element));
+    // Scrolling the scrollback (mouse wheel) exposes many rows at once; the WebGL
+    // renderer can surface stale/partial cells from earlier in-place redraws
+    // ("broken parts" of the session). Repaint once the scroll settles.
+    this.term.onScroll(() => this.scheduleRepaint());
   }
 
   get id(): string | null {
@@ -148,6 +153,7 @@ export class TerminalSession {
     const t = this.term.options;
     t.fontFamily = o.fontFamily;
     t.fontSize = o.fontSize;
+    t.letterSpacing = o.letterSpacing;
     t.lineHeight = o.lineHeight;
     t.cursorStyle = o.cursorStyle;
     t.cursorBlink = o.cursorBlink;
@@ -172,6 +178,29 @@ export class TerminalSession {
 
   writeBytes(bytes: Uint8Array): void {
     this.term.write(bytes);
+    this.scheduleRepaint();
+  }
+
+  /**
+   * Belt-and-braces full repaint once output settles. During a burst of
+   * cursor-relative redraws (e.g. Claude Code's input box on ConPTY) the WebGL
+   * renderer can leave a single cell mispainted — a swallowed or doubled space —
+   * that only corrects itself when something later marks that row dirty. That's
+   * the "spaces that fix themselves after a few seconds". Forcing a refresh a
+   * beat after the last write collapses that window to ~120 ms. Trailing-edge
+   * debounced, so a continuous stream (which repaints every cell anyway) doesn't
+   * pay for it until it pauses.
+   */
+  private scheduleRepaint(): void {
+    if (this.repaintTimer !== null) clearTimeout(this.repaintTimer);
+    this.repaintTimer = window.setTimeout(() => {
+      this.repaintTimer = null;
+      try {
+        this.term.refresh(0, this.term.rows - 1);
+      } catch {
+        /* terminal disposed — nothing to repaint */
+      }
+    }, 120);
   }
 
   focus(): void {
@@ -241,6 +270,10 @@ export class TerminalSession {
   }
 
   dispose(): void {
+    if (this.repaintTimer !== null) {
+      clearTimeout(this.repaintTimer);
+      this.repaintTimer = null;
+    }
     try {
       this.term.dispose();
     } catch {

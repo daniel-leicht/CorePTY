@@ -51,6 +51,12 @@ export class App {
   /** Shared theme-styled tooltip element for tab hover, and its show timer. */
   private tabTipEl: HTMLElement | null = null;
   private tabTipTimer: number | null = null;
+  /** Double-tap-Shift tab switcher: overlay element + highlighted index. */
+  private switcherEl: HTMLElement | null = null;
+  private switcherIdx = 0;
+  /** Double-Shift detection: armed on a lone Shift, timestamp of the last tap. */
+  private shiftArmed = false;
+  private lastShiftTapAt = 0;
 
   private stageEl!: HTMLElement;
   private stageEmptyEl!: HTMLElement;
@@ -89,7 +95,10 @@ export class App {
     // Web fonts load lazily; wait for the theme fonts before the first terminal
     // measures its glyph cell, else selection columns and row count come out wrong.
     await preloadThemeFonts();
-    await this.newLocal(this.defaultShell());
+    // Start empty — no tab is opened on launch. The empty-state card invites the
+    // user to pick a shell (or Ctrl+Shift+T) instead of forcing a PowerShell tab.
+    this.renderTabs();
+    this.updateStatus();
     void this.tree.refresh();
   }
 
@@ -1002,6 +1011,14 @@ export class App {
     document.addEventListener(
       "keydown",
       (e) => {
+        // Double-tap Shift → tab switcher. Arm on a lone Shift press; any other
+        // key disarms it, so real chords (Ctrl+Shift+T, capitals) never count.
+        if (e.key === "Shift") {
+          if (!e.repeat) this.shiftArmed = true;
+        } else {
+          this.shiftArmed = false;
+          this.lastShiftTapAt = 0;
+        }
         const ctrl = e.ctrlKey || e.metaKey;
         if (ctrl && e.shiftKey && (e.key === "T" || e.key === "t")) {
           e.preventDefault();
@@ -1039,6 +1056,113 @@ export class App {
       },
       true
     );
+
+    // Second half of double-Shift detection: fire on the Shift *release* of a
+    // clean lone tap, when the previous such tap was within the window.
+    document.addEventListener("keyup", (e) => {
+      if (e.key !== "Shift") return;
+      if (this.shiftArmed) {
+        const now = Date.now();
+        if (this.lastShiftTapAt && now - this.lastShiftTapAt <= 400) {
+          this.lastShiftTapAt = 0;
+          this.openTabSwitcher();
+        } else {
+          this.lastShiftTapAt = now;
+        }
+      }
+      this.shiftArmed = false;
+    });
+  }
+
+  // ---- double-Shift tab switcher ------------------------------------------
+
+  /** Open the quick tab switcher (double-Shift). Arrow keys / mouse to pick. */
+  private openTabSwitcher(): void {
+    if (this.switcherEl || this.renamingUid || this.tabs.length < 2) return;
+    // Don't hijack Shift while a dialog or a text field (rename/search) is open.
+    // The xterm helper is a <textarea>, so an INPUT check leaves the terminal fine.
+    if (document.querySelector(".modal-backdrop")) return;
+    const ae = document.activeElement;
+    if (ae instanceof HTMLInputElement || ae instanceof HTMLSelectElement) return;
+
+    const overlay = document.createElement("div");
+    overlay.className = "switcher-overlay";
+    overlay.innerHTML = `
+      <div class="switcher" tabindex="-1">
+        <div class="switcher__head">Switch tab</div>
+        <div class="switcher__list"></div>
+        <div class="switcher__hint">↑ ↓ to move · Enter to switch · Esc to cancel</div>
+      </div>`;
+    document.body.appendChild(overlay);
+    this.switcherEl = overlay;
+    this.switcherIdx = Math.max(0, this.tabs.indexOf(this.active!));
+
+    const list = overlay.querySelector(".switcher__list")!;
+    this.tabs.forEach((t, i) => {
+      const item = document.createElement("div");
+      item.className = "switcher__item";
+      item.dataset.idx = String(i);
+      item.innerHTML = `
+        <span class="switcher__icon">${icon(t.iconName)}</span>
+        <span class="switcher__title">${escapeHtml(t.title)}</span>
+        ${t.elevated ? `<span class="switcher__admin" title="Administrator">${icon("shield")}</span>` : ""}
+        <span class="switcher__dot ${t.status}"></span>`;
+      item.addEventListener("mouseenter", () => this.selectSwitcher(i));
+      item.addEventListener("click", () => {
+        this.closeTabSwitcher();
+        this.activate(t);
+      });
+      list.appendChild(item);
+    });
+    this.selectSwitcher(this.switcherIdx);
+
+    overlay.addEventListener("mousedown", (e) => {
+      if (e.target === overlay) this.closeTabSwitcher();
+    });
+    // Focus the panel so arrow keys don't leak into the terminal underneath.
+    overlay.querySelector<HTMLElement>(".switcher")!.focus();
+    document.addEventListener("keydown", this.switcherKeyHandler, true);
+  }
+
+  private switcherKeyHandler = (e: KeyboardEvent): void => {
+    if (!this.switcherEl) return;
+    const n = this.tabs.length;
+    if (e.key === "ArrowDown" || (e.key === "Tab" && !e.shiftKey)) {
+      e.preventDefault();
+      e.stopPropagation();
+      this.selectSwitcher((this.switcherIdx + 1) % n);
+    } else if (e.key === "ArrowUp" || (e.key === "Tab" && e.shiftKey)) {
+      e.preventDefault();
+      e.stopPropagation();
+      this.selectSwitcher((this.switcherIdx - 1 + n) % n);
+    } else if (e.key === "Enter") {
+      e.preventDefault();
+      e.stopPropagation();
+      const t = this.tabs[this.switcherIdx];
+      this.closeTabSwitcher();
+      if (t) this.activate(t);
+    } else if (e.key === "Escape") {
+      e.preventDefault();
+      e.stopPropagation();
+      this.closeTabSwitcher();
+    }
+  };
+
+  /** Move the switcher highlight to index `i` and scroll it into view. */
+  private selectSwitcher(i: number): void {
+    this.switcherIdx = i;
+    this.switcherEl?.querySelectorAll<HTMLElement>(".switcher__item").forEach((el) => {
+      const sel = Number(el.dataset.idx) === i;
+      el.classList.toggle("is-sel", sel);
+      if (sel) el.scrollIntoView({ block: "nearest" });
+    });
+  }
+
+  private closeTabSwitcher(): void {
+    document.removeEventListener("keydown", this.switcherKeyHandler, true);
+    this.switcherEl?.remove();
+    this.switcherEl = null;
+    this.active?.focus();
   }
 
   private cycleTab(dir: number): void {

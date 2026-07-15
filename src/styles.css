@@ -783,6 +783,99 @@ html.theme-starbase .tab-tip {
   margin: 6px 4px;
 }
 
+/* ---- Double-Shift tab switcher ---- */
+.switcher-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 400;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.35);
+  backdrop-filter: blur(2px);
+  animation: fade 0.1s var(--ease);
+}
+.switcher {
+  width: min(560px, 82vw);
+  max-height: 70vh;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-2);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.55);
+  outline: none;
+  overflow: hidden;
+}
+.switcher__head {
+  padding: 11px 16px;
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-2);
+  border-bottom: 1px solid var(--line-soft);
+}
+.switcher__list {
+  overflow-y: auto;
+  padding: 6px;
+}
+.switcher__item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 11px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  color: var(--text-1);
+}
+.switcher__item.is-sel {
+  background: var(--accent-soft);
+  color: var(--text-0);
+  box-shadow: inset 0 0 0 1px var(--accent-ring);
+}
+.switcher__icon {
+  display: inline-flex;
+  width: 16px;
+  height: 16px;
+  opacity: 0.85;
+  flex: none;
+}
+.switcher__title {
+  flex: 1;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.switcher__admin {
+  display: inline-flex;
+  width: 13px;
+  height: 13px;
+  opacity: 0.8;
+  flex: none;
+}
+.switcher__dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--text-3);
+  flex: none;
+}
+.switcher__dot.connected {
+  background: var(--ok);
+}
+.switcher__dot.connecting {
+  background: var(--warn);
+}
+.switcher__dot.error {
+  background: var(--danger);
+}
+.switcher__hint {
+  padding: 9px 16px;
+  font-size: 11px;
+  color: var(--text-3);
+  border-top: 1px solid var(--line-soft);
+}
+
 /* ---- Toasts ---- */
 .toasts {
   position: fixed;
@@ -1538,12 +1631,17 @@ html.fx-scanlines::after {
   inset: 0;
   z-index: 9000;
   pointer-events: none;
+  /* --scanline-alpha controls line darkness; a theme can dial it down. */
   background: repeating-linear-gradient(
       0deg,
-      rgba(0, 0, 0, 0.22) 0 1px,
+      rgba(0, 0, 0, var(--scanline-alpha, 0.22)) 0 1px,
       transparent 1px 3px
     ),
     radial-gradient(120% 120% at 50% 50%, transparent 58%, rgba(0, 0, 0, 0.5) 100%);
+}
+/* BBS scanlines 20% lighter than the default (0.22 → 0.176). */
+html.theme-bbs {
+  --scanline-alpha: 0.176;
 }
 html.fx-grid .sidebar,
 html.fx-grid .stage {

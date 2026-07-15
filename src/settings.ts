@@ -34,7 +34,10 @@ export const DEFAULTS: Settings = {
   rightClick: "paste",
   defaultShell: "powershell",
   bell: "visual",
-  minContrast: "standard",
+  // Off by default (like Windows Terminal): forcing a contrast floor brightens
+  // text that a program *intends* to be low-contrast — e.g. Claude Code's grey
+  // autosuggest / ghost text — until it's indistinguishable from normal output.
+  minContrast: "off",
 };
 
 /** Live settings object. Mutated in place so importers see updates. */
@@ -65,11 +68,14 @@ export function effectiveDefaultShell(): string {
 
 export function termOptions(kind?: SessionKind): ITerminalOptions {
   const t = activeTheme();
+  // Some themes render small (e.g. BBS's VT323), so allow a per-theme nudge —
+  // relative to the user's chosen size, rounded to the nearest half-pixel.
+  const fontSize = Math.round(current.fontSize * (t.termFontScale ?? 1) * 2) / 2;
   const opts: ITerminalOptions = {
     fontFamily: current.fontFamily.trim() || t.fontMono || DEFAULT_MONO_FONT,
-    // Some themes render small (e.g. BBS's VT323), so allow a per-theme nudge —
-    // relative to the user's chosen size, rounded to the nearest half-pixel.
-    fontSize: Math.round(current.fontSize * (t.termFontScale ?? 1) * 2) / 2,
+    fontSize,
+    // Optional per-theme horizontal widening (narrow bitmap fonts like VT323).
+    letterSpacing: t.termLetterSpacing ? Math.round(fontSize * t.termLetterSpacing) : 0,
     lineHeight: current.lineHeight,
     cursorStyle: t.cursor ?? current.cursorStyle,
     cursorBlink: current.cursorBlink,
@@ -79,8 +85,9 @@ export function termOptions(kind?: SessionKind): ITerminalOptions {
     fontWeightBold: 600,
     allowProposedApi: true,
     drawBoldTextInBrightColors: true,
-    // Force a floor on foreground/background contrast per cell, so low-contrast
-    // color pairs (e.g. nano's white-on-beige footer keys) stay readable.
+    // Optional floor on foreground/background contrast per cell. Off by default;
+    // when enabled it rescues low-contrast pairs (e.g. nano's white-on-beige
+    // footer) at the cost of washing out intentionally-dim text (ghost/hint text).
     minimumContrastRatio: contrastRatio(current.minContrast),
     macOptionIsMeta: true,
     theme: t.terminal,

@@ -102,7 +102,7 @@ export class SettingsDialog {
             </div>
           </div>
           <div class="field">
-            <span class="field__label">Minimum contrast <span class="muted">· auto-adjust hard-to-read text</span></span>
+            <span class="field__label">Minimum contrast <span class="muted">· lift hard-to-read text (may wash out dim/ghost text)</span></span>
             <div class="seg" data-role="minContrast">${seg(["off", "standard", "high"], s.minContrast)}</div>
           </div>
           <label class="check">

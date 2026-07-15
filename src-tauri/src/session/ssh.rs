@@ -155,7 +155,11 @@ async fn run_session(
             opts.rows as u32,
             0,
             0,
-            &[],
+            // VERASE = 127 (DEL): make the remote's tty erase char match the 0x7f
+            // xterm sends for Backspace. Without it the remote defaults to ^H/0x08,
+            // and vim (which keys backspace off the erase char) inserts a literal
+            // ^? instead of deleting. Unset modes fall back to the remote defaults.
+            &[(russh::Pty::VERASE, 127)],
         )
         .await
         .map_err(|e| format!("pty request failed: {e}"))?;
