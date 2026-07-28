@@ -52,7 +52,7 @@ Prebuilt packages are available from the
 
 | Platform | Package | Notes |
 |---|---|---|
-| Windows 10/11 x64 | `CorePTY_<version>_x64-setup.exe` | NSIS installer with Start menu integration and an uninstaller. |
+| Windows 10/11 x64 | `CorePTY_<version>_x64-setup.exe` | NSIS installer; upgrades an existing per-user installation in place. |
 | Windows x64 portable | `CorePTY_<version>_x64-portable.exe` | Standalone executable; requires the Microsoft Edge WebView2 runtime. |
 | macOS universal | `CorePTY_<version>_universal.dmg` | Supports Intel and Apple Silicon. |
 | Linux x86-64 | `CorePTY_<version>_amd64.AppImage` | Portable AppImage. Mark it executable before launching. |

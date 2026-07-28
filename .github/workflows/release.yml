@@ -101,11 +101,12 @@ jobs:
           const fs = require("node:fs");
           const readJson = (path) => JSON.parse(fs.readFileSync(path, "utf8"));
           const cargo = fs.readFileSync("src-tauri/Cargo.toml", "utf8");
+          const tauri = readJson("src-tauri/tauri.conf.json");
           const packageSection = cargo.match(/\[package\]([\s\S]*?)(?:\n\[|$)/)?.[1];
           const cargoVersion = packageSection?.match(/^version\s*=\s*"([^"]+)"/m)?.[1];
           const versions = {
             package: readJson("package.json").version,
-            tauri: readJson("src-tauri/tauri.conf.json").version,
+            tauri: tauri.version,
             cargo: cargoVersion,
           };
           const expected = versions.package;
@@ -115,6 +116,24 @@ jobs:
           const tag = process.env.RELEASE_TAG;
           if (tag && tag !== `v${expected}`) {
             throw new Error(`Release tag ${tag} does not match project version v${expected}`);
+          }
+          const nsis = tauri.bundle?.windows?.nsis;
+          if (
+            nsis?.installMode !== "currentUser" ||
+            nsis?.template !== "windows/installer.nsi"
+          ) {
+            throw new Error("NSIS must use the CorePTY current-user installer template");
+          }
+          const installer = fs
+            .readFileSync(`src-tauri/${nsis.template}`, "utf8")
+            .replace(/\r\n/g, "\n");
+          const inPlaceUpgrade = [
+            '${If} $WixMode <> 1',
+            '      StrCpy $UpdateMode 1',
+            '      Abort',
+          ].join("\n");
+          if (!installer.includes(inPlaceUpgrade)) {
+            throw new Error("NSIS template no longer enables in-place upgrades");
           }
           console.log(`Validated CorePTY ${expected}${tag ? ` (${tag})` : ""}`);
           NODE
@@ -218,7 +237,7 @@ jobs:
 
             | Platform | Download | Notes |
             |---|---|---|
-            | Windows 10/11 x64 | `CorePTY_${{ steps.rel.outputs.version }}_x64-setup.exe` | NSIS installer with Start menu integration and an uninstaller. |
+            | Windows 10/11 x64 | `CorePTY_${{ steps.rel.outputs.version }}_x64-setup.exe` | NSIS installer; upgrades an existing per-user installation in place. |
             | Windows x64 portable | `CorePTY_${{ steps.rel.outputs.version }}_x64-portable.exe` | Standalone executable; requires the Edge WebView2 runtime. |
             | macOS universal | `CorePTY_${{ steps.rel.outputs.version }}_universal.dmg` | Supports Intel and Apple Silicon. |
             | Linux x86-64 | `CorePTY_${{ steps.rel.outputs.version }}_amd64.AppImage` | Portable AppImage; run `chmod +x` before launching. |

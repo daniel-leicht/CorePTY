@@ -502,7 +502,10 @@ button {
 }
 .term {
   position: absolute;
-  inset: 0;
+  /* Size the host to the intended gutter so FitAddon measures the usable area.
+     Padding xterm itself makes its layered viewport/canvas look like a frame,
+     especially on light and colored terminal backgrounds. */
+  inset: 8px 6px 8px 12px;
   display: none;
 }
 .term.is-active {
@@ -510,10 +513,6 @@ button {
 }
 .term .xterm {
   height: 100%;
-  /* FitAddon subtracts padding from the xterm element itself, not its wrapper.
-     Keeping the terminal gutter here prevents it from counting a clipped final
-     row (and partially hidden final column) beneath the status bar. */
-  padding: 8px 6px 8px 12px;
 }
 .term .xterm-viewport::-webkit-scrollbar {
   width: 10px;

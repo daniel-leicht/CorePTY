@@ -531,18 +531,13 @@ export class App {
   }
 
   private addTab(session: TerminalSession): void {
-    session.onTitleUpdate = () => {
-      this.renderTabs();
+    const updateTab = () => {
+      this.updateTabPresentation(session);
       if (session === this.active) this.updateStatus();
     };
-    session.onStatusChange = () => {
-      this.renderTabs();
-      if (session === this.active) this.updateStatus();
-    };
-    session.onExit = () => {
-      this.renderTabs();
-      if (session === this.active) this.updateStatus();
-    };
+    session.onTitleUpdate = updateTab;
+    session.onStatusChange = updateTab;
+    session.onExit = updateTab;
     session.onReconnect = () => void this.relaunch(session);
     session.onClose = () => void this.closeTab(session);
     this.tabs.push(session);
@@ -570,6 +565,34 @@ export class App {
     this.tabsListEl.querySelectorAll<HTMLElement>(".tab").forEach((el) => {
       el.classList.toggle("is-active", el.dataset.key === this.active?.uid);
     });
+  }
+
+  /**
+   * Update volatile tab state without replacing its DOM node. OSC titles can
+   * arrive many times per second; rebuilding the strip would detach the native
+   * drag source and make an in-progress reorder flicker or abort.
+   */
+  private updateTabPresentation(session: TerminalSession): void {
+    // Keep the strip's geometry stable until the native drag operation ends.
+    // The session retains the newest title/status, which clearDragMarks applies.
+    if (this.dragTab) return;
+
+    const el = Array.from(this.tabsListEl.querySelectorAll<HTMLElement>(".tab")).find(
+      (candidate) => candidate.dataset.key === session.uid
+    );
+    if (!el) return;
+
+    if (el.getAttribute("aria-label") !== session.title) {
+      el.setAttribute("aria-label", session.title);
+    }
+    const titleEl = el.querySelector<HTMLElement>(".tab__title");
+    if (titleEl && titleEl.textContent !== session.title) {
+      titleEl.textContent = session.title;
+    }
+
+    const dotEl = el.querySelector<HTMLElement>(".tab__dot");
+    const dotClass = `tab__dot ${session.status}`;
+    if (dotEl && dotEl.className !== dotClass) dotEl.className = dotClass;
   }
 
   private async closeTab(session: TerminalSession): Promise<void> {
@@ -686,6 +709,7 @@ export class App {
       .forEach((el) =>
         el.classList.remove("tab--dragging", "tab--drop-before", "tab--drop-after")
       );
+    for (const session of this.tabs) this.updateTabPresentation(session);
   }
 
   /** Reorder the strip: move `dragged` to just before/after `target`. */
