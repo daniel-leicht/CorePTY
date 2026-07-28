@@ -93,6 +93,11 @@ export class TerminalSession {
     // renderer can surface stale/partial cells from earlier in-place redraws
     // ("broken parts" of the session). Repaint once the scroll settles.
     this.term.onScroll(() => this.scheduleRepaint());
+    // xterm parses writes asynchronously. Start the trailing-edge repair only
+    // after a parse slice has updated both the buffer and its scroll geometry;
+    // scheduling it when write() merely enqueues bytes can repaint the old
+    // viewport while fast-redrawing CLIs are still moving the prompt.
+    this.term.onWriteParsed(() => this.scheduleRepaint());
   }
 
   get id(): string | null {
@@ -201,8 +206,23 @@ export class TerminalSession {
   }
 
   writeBytes(bytes: Uint8Array): void {
-    this.term.write(this.dimFilter.feed(bytes));
-    this.scheduleRepaint();
+    const buffer = this.term.buffer.active;
+    const followFrom = buffer.viewportY === buffer.baseY ? buffer.viewportY : null;
+    this.term.write(this.dimFilter.feed(bytes), () => {
+      if (followFrom === null) return;
+      const current = this.term.buffer.active;
+      // If output started at the live prompt but xterm's viewport remained at
+      // the old bottom, complete the same follow-to-bottom action that keyboard
+      // input performs. A user who wheeled upward will be below followFrom, so
+      // their scrollback position is left untouched.
+      if (
+        current.type === buffer.type &&
+        current.viewportY >= followFrom &&
+        current.viewportY < current.baseY
+      ) {
+        this.term.scrollToBottom();
+      }
+    });
   }
 
   /**
