@@ -28,6 +28,13 @@ import {
 import { activeTheme, preloadThemeFonts } from "./themes";
 import { escapeHtml, uuid } from "./util";
 import { winClose, winMinimize, winSetDecorations, winStartResize, winToggleMaximize } from "./window";
+import {
+  applyStoredSecret,
+  buildSavedSession,
+  planSecretMutation,
+  type SecretMutation,
+} from "./profile";
+import { pasteIntoTerminal } from "./paste";
 
 /** App version, injected at build time by Vite (see vite.config.ts). */
 declare const __APP_VERSION__: string;
@@ -277,39 +284,75 @@ export class App {
     if (!result) return;
     const form = result.form;
     if (existing) form.id = existing.id;
-    if (result.action === "save") {
-      await this.saveProfile(form);
-    } else {
-      if (form.name || existing) await this.saveProfile(form, true);
-      this.connectForm(form);
+    try {
+      if (result.action === "save") {
+        await this.saveProfile(form, false, existing);
+      } else {
+        if (form.name || existing) await this.saveProfile(form, true, existing);
+        await this.hydrateStoredSecret(form, existing);
+        this.connectForm(form);
+      }
+    } catch (err) {
+      this.toast(`Connection could not be saved: ${err}`, "error");
     }
   }
 
-  private async saveProfile(form: ConnForm, silent = false): Promise<string> {
+  private async saveProfile(
+    form: ConnForm,
+    silent = false,
+    existing?: SavedSession
+  ): Promise<string> {
     const id = form.id ?? uuid();
-    const saved: SavedSession = {
-      id,
-      name: form.name || form.host,
-      kind: form.kind,
-      host: form.host,
-      port: form.port,
-      username: form.kind === "ssh" ? form.username : null,
-      authType: form.kind === "ssh" ? form.authType : null,
-      keyPath: form.authType === "key" ? form.keyPath : null,
-      saveSecret: form.kind === "ssh" ? form.saveSecret : false,
-      folderId: form.folderId ?? null,
-    };
-    await api.sessionsUpsert(saved);
-    if (saved.saveSecret) {
-      const secret = form.authType === "key" ? form.passphrase : form.password;
-      if (secret) await api.secretSet(id, secret);
-      else await api.secretDelete(id);
-    } else {
-      await api.secretDelete(id);
+    const saved = buildSavedSession(form, id, existing);
+    const mutation = planSecretMutation(form, existing);
+    let previousSecret: string | null = null;
+
+    // Apply the keychain change first, then persist profile metadata. If the
+    // profile write fails, restore the previous keychain state.
+    if (mutation.kind !== "keep") {
+      if (existing?.saveSecret) previousSecret = await api.secretGet(id);
+      await this.applySecretMutation(id, mutation);
     }
+    try {
+      await api.sessionsUpsert(saved);
+    } catch (err) {
+      if (mutation.kind !== "keep") {
+        try {
+          if (previousSecret === null) await api.secretDelete(id);
+          else await api.secretSet(id, previousSecret);
+        } catch (rollbackErr) {
+          throw new Error(`${err}; keychain rollback also failed: ${rollbackErr}`);
+        }
+      }
+      throw err;
+    }
+
     await this.tree.refresh();
     if (!silent) this.toast(`Saved "${saved.name}"`, "info");
     return id;
+  }
+
+  private async applySecretMutation(id: string, mutation: SecretMutation): Promise<void> {
+    if (mutation.kind === "set") await api.secretSet(id, mutation.value);
+    else if (mutation.kind === "delete") await api.secretDelete(id);
+  }
+
+  private async hydrateStoredSecret(
+    form: ConnForm,
+    existing?: SavedSession
+  ): Promise<void> {
+    if (
+      form.kind !== "ssh" ||
+      !form.saveSecret ||
+      !existing?.saveSecret ||
+      existing.authType !== form.authType
+    ) {
+      return;
+    }
+    const supplied = form.authType === "key" ? form.passphrase : form.password;
+    if (supplied) return;
+    const stored = await api.secretGet(existing.id);
+    if (stored !== null) applyStoredSecret(form, stored);
   }
 
   private async connectSaved(s: SavedSession): Promise<void> {
@@ -367,7 +410,6 @@ export class App {
     try {
       const info = await api.createLocal({ id, shell, cols, rows });
       session.attach(info);
-      session.setStatus("connected");
     } catch (err) {
       this.byId.delete(id);
       session.markError(String(err));
@@ -473,7 +515,6 @@ export class App {
           session.attach(await api.createLocalElevated({ id, shell: spec.shell, cols, rows }));
         } else {
           session.attach(await api.createLocal({ id, shell: spec.shell, cols, rows }));
-          session.setStatus("connected");
         }
       } else if (spec.kind === "ssh") {
         session.attach(await api.createSsh(this.sshOptions(spec.form, id, cols, rows)));
@@ -903,7 +944,7 @@ export class App {
     if (!s?.info || !s.alive) return;
     try {
       const text = await navigator.clipboard.readText();
-      if (text) await api.write(s.info.id, text);
+      if (text) pasteIntoTerminal(s.term, text);
     } catch {
       this.toast("Clipboard access was blocked", "warn");
     }

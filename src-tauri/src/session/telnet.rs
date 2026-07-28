@@ -88,7 +88,12 @@ pub fn connect(
 
     let (tx, rx) = unbounded_channel::<SessionInput>();
     manager.register(info.clone(), tx);
-    emit_status(&app, &id, "connecting", Some(format!("{}:{}", opts.host, opts.port)));
+    emit_status(
+        &app,
+        &id,
+        "connecting",
+        Some(format!("{}:{}", opts.host, opts.port)),
+    );
 
     let app_task = app.clone();
     let id_task = id.clone();
@@ -344,7 +349,9 @@ impl Telnet {
                         self.state = State::Data;
                     }
                     IAC => {
-                        self.sub.push(IAC);
+                        if self.sub.len() < MAX_SUBNEG {
+                            self.sub.push(IAC);
+                        }
                         self.state = State::SbData;
                     }
                     _ => self.state = State::SbData,
@@ -395,5 +402,40 @@ impl Telnet {
             }
             reply.extend_from_slice(&[IAC, SE]);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn escaped_iac_cannot_grow_subnegotiation_past_the_cap() {
+        let mut parser = Telnet::new();
+        let mut input = vec![IAC, SB, OPT_TTYPE];
+        input.extend(std::iter::repeat_n(b'x', MAX_SUBNEG));
+        for _ in 0..MAX_SUBNEG {
+            input.extend_from_slice(&[IAC, IAC]);
+        }
+        let _ = parser.feed(&input, 80, 24);
+        assert_eq!(parser.sub.len(), MAX_SUBNEG);
+    }
+
+    #[test]
+    fn terminal_type_subnegotiation_is_answered() {
+        let mut parser = Telnet::new();
+        let (_, reply) = parser.feed(&[IAC, SB, OPT_TTYPE, 1, IAC, SE], 80, 24);
+        let mut expected = vec![IAC, SB, OPT_TTYPE, 0];
+        expected.extend_from_slice(TERM);
+        expected.extend_from_slice(&[IAC, SE]);
+        assert_eq!(reply, expected);
+    }
+
+    #[test]
+    fn outgoing_data_escapes_iac_and_normalizes_crlf() {
+        assert_eq!(
+            encode_output(&[b'a', IAC, b'\r', b'\n']),
+            vec![b'a', IAC, IAC, b'\r', b'\n']
+        );
     }
 }

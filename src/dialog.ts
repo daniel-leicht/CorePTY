@@ -127,7 +127,7 @@ export class ConnectionDialog {
 
           <label class="field ssh-only auth-password ${authType === "password" ? "" : "hidden"}">
             <span class="field__label">Password</span>
-            <input name="password" type="password" value="${esc(prefill.password ?? "")}" placeholder="••••••••" autocomplete="off" />
+            <input name="password" type="password" value="${esc(prefill.password ?? "")}" placeholder="${editing && saveSecret ? "Leave blank to keep the stored password" : "Password"}" autocomplete="off" />
           </label>
 
           <div class="ssh-only auth-key ${authType === "key" ? "" : "hidden"}">
@@ -140,13 +140,13 @@ export class ConnectionDialog {
             </label>
             <label class="field">
               <span class="field__label">Passphrase <span class="muted">(if encrypted)</span></span>
-              <input name="passphrase" type="password" value="${esc(prefill.passphrase ?? "")}" placeholder="••••••••" autocomplete="off" />
+              <input name="passphrase" type="password" value="${esc(prefill.passphrase ?? "")}" placeholder="${editing && saveSecret ? "Leave blank to keep the stored passphrase" : "Optional passphrase"}" autocomplete="off" />
             </label>
           </div>
 
           <label class="check ssh-only">
             <input type="checkbox" name="saveSecret" ${saveSecret ? "checked" : ""} />
-            <span>Save secret in Windows Credential Manager</span>
+            <span>Save secret in the operating system keychain</span>
           </label>
         </div>
         <div class="modal__foot">

@@ -24,5 +24,15 @@ export default defineConfig({
     target: "es2021",
     minify: "esbuild",
     sourcemap: false,
+    rollupOptions: {
+      output: {
+        // Keep the application code separate from xterm/Tauri dependencies.
+        // This avoids one oversized startup chunk and gives the webview a
+        // stable vendor asset it can cache between application changes.
+        manualChunks(id) {
+          return id.includes("node_modules") ? "vendor" : undefined;
+        },
+      },
+    },
   },
 });

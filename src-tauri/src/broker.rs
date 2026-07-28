@@ -24,13 +24,16 @@ use crate::session::proto::{self, TAG_CLOSE, TAG_DATA, TAG_EXIT, TAG_RESIZE};
 
 /// Entry point for a `--broker` invocation. Blocks until the elevated shell ends.
 pub fn run(args: &[String]) {
-    let (Some(pipe_out), Some(pipe_in)) = (arg(args, "--pipe-out"), arg(args, "--pipe-in"))
-    else {
+    let (Some(pipe_out), Some(pipe_in)) = (arg(args, "--pipe-out"), arg(args, "--pipe-in")) else {
         return;
     };
     let shell = arg(args, "--shell").unwrap_or_else(|| "powershell".to_string());
-    let cols: u16 = arg(args, "--cols").and_then(|s| s.parse().ok()).unwrap_or(80);
-    let rows: u16 = arg(args, "--rows").and_then(|s| s.parse().ok()).unwrap_or(24);
+    let cols: u16 = arg(args, "--cols")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(80);
+    let rows: u16 = arg(args, "--rows")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(24);
     log(&format!("start: shell={shell} cols={cols} rows={rows}"));
     // Detach any console handed to us by the elevation service.
     let _ = unsafe { FreeConsole() };
@@ -41,7 +44,9 @@ pub fn run(args: &[String]) {
 }
 
 fn arg(args: &[String], key: &str) -> Option<String> {
-    args.iter().position(|a| a == key).and_then(|i| args.get(i + 1).cloned())
+    args.iter()
+        .position(|a| a == key)
+        .and_then(|i| args.get(i + 1).cloned())
 }
 
 fn bridge(pipe_out: &str, pipe_in: &str, shell: &str, cols: u16, rows: u16) -> Result<(), String> {
@@ -55,7 +60,12 @@ fn bridge(pipe_out: &str, pipe_in: &str, shell: &str, cols: u16, rows: u16) -> R
 
     let pty = native_pty_system();
     let pair = pty
-        .openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
+        .openpty(PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
         .map_err(|e| format!("openpty: {e}"))?;
 
     let mut cmd = CommandBuilder::new(&program);
@@ -71,7 +81,10 @@ fn bridge(pipe_out: &str, pipe_in: &str, shell: &str, cols: u16, rows: u16) -> R
         }
     }
 
-    let mut child = pair.slave.spawn_command(cmd).map_err(|e| format!("spawn: {e}"))?;
+    let mut child = pair
+        .slave
+        .spawn_command(cmd)
+        .map_err(|e| format!("spawn: {e}"))?;
     log("shell spawned; streaming");
     drop(pair.slave);
     let mut reader = pair.master.try_clone_reader().map_err(|e| e.to_string())?;
@@ -132,7 +145,11 @@ fn bridge(pipe_out: &str, pipe_in: &str, shell: &str, cols: u16, rows: u16) -> R
     });
 
     // Wait for the shell, drain its output, then tell the app it exited.
-    let code = child.wait().ok().map(|s| s.exit_code() as i32).unwrap_or(-1);
+    let code = child
+        .wait()
+        .ok()
+        .map(|s| s.exit_code() as i32)
+        .unwrap_or(-1);
     log(&format!("shell exited: code={code}"));
     let _ = out.join();
     {
@@ -151,7 +168,11 @@ fn log(msg: &str) {
         return;
     }
     let path = std::env::temp_dir().join("corepty-broker.log");
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
         let _ = writeln!(f, "{msg}");
     }
 }

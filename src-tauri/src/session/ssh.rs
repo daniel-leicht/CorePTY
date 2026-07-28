@@ -88,7 +88,12 @@ pub fn connect(
 
     let (tx, rx) = unbounded_channel::<SessionInput>();
     manager.register(info.clone(), tx);
-    emit_status(&app, &id, "connecting", Some(format!("{}:{}", opts.host, opts.port)));
+    emit_status(
+        &app,
+        &id,
+        "connecting",
+        Some(format!("{}:{}", opts.host, opts.port)),
+    );
 
     let app_task = app.clone();
     let id_task = id.clone();
@@ -134,7 +139,11 @@ async fn run_session(
         Ok(Err(e)) => {
             // A rejected host key surfaces here as a generic handshake failure;
             // prefer the specific reason (changed key / possible MITM / etc.).
-            if let Some(reason) = reject_reason.lock().unwrap_or_else(|p| p.into_inner()).take() {
+            if let Some(reason) = reject_reason
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .take()
+            {
                 return Err(reason);
             }
             return Err(format!("could not connect: {e}"));
@@ -195,9 +204,7 @@ async fn run_session(
                 }
             }
             Action::Input(Some(SessionInput::Resize { cols, rows })) => {
-                let _ = channel
-                    .window_change(cols as u32, rows as u32, 0, 0)
-                    .await;
+                let _ = channel.window_change(cols as u32, rows as u32, 0, 0).await;
             }
             Action::Input(Some(SessionInput::Close)) | Action::Input(None) => break,
         }
@@ -221,13 +228,8 @@ async fn authenticate(session: &mut Handle<Client>, opts: &SshOptions) -> Result
         SshAuth::Key { path, passphrase } => {
             let key = load_secret_key(path, passphrase.as_deref())
                 .map_err(|e| format!("could not load private key: {e}"))?;
-            let hash_alg = session
-                .best_supported_rsa_hash()
-                .await
-                .ok()
-                .flatten()
-                .flatten();
-            let key = PrivateKeyWithHashAlg::new(Arc::new(key), hash_alg);
+            ensure_safe_private_key_algorithm(key.algorithm())?;
+            let key = PrivateKeyWithHashAlg::new(Arc::new(key), None);
             let result = session
                 .authenticate_publickey(opts.username.as_str(), key)
                 .await
@@ -236,6 +238,17 @@ async fn authenticate(session: &mut Handle<Client>, opts: &SshOptions) -> Result
                 return Err("key rejected by server — is the public key installed?".into());
             }
         }
+    }
+    Ok(())
+}
+
+fn ensure_safe_private_key_algorithm(algorithm: ssh_key::Algorithm) -> Result<(), String> {
+    if algorithm.is_rsa() {
+        return Err(
+            "RSA private keys are disabled because the available implementation has an \
+             unresolved timing-side-channel advisory; use an Ed25519 or ECDSA key"
+                .into(),
+        );
     }
     Ok(())
 }
@@ -261,7 +274,13 @@ impl client::Handler for Client {
         &mut self,
         server_public_key: &ssh_key::PublicKey,
     ) -> Result<bool, Self::Error> {
-        match verify_host_key(&self.app, &self.id, &self.host, self.port, server_public_key) {
+        match verify_host_key(
+            &self.app,
+            &self.id,
+            &self.host,
+            self.port,
+            server_public_key,
+        ) {
             Ok(()) => Ok(true),
             Err(reason) => {
                 *self.reject_reason.lock().unwrap_or_else(|p| p.into_inner()) = Some(reason);
@@ -286,16 +305,17 @@ fn verify_host_key(
         // blindly accept a host key we can never verify against anything.
         return Err("cannot locate ~/.ssh/known_hosts to verify the host key — refused".into());
     };
-    // Ensure ~/.ssh exists so a first-connect can actually persist the new key.
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
     match check_known_hosts_path(host, port, key, &path) {
         Ok(true) => Ok(()),
         Ok(false) => {
             // First time we've seen this host: trust on first use and record it,
             // surfacing the fingerprint so the user can at least eyeball it.
-            let _ = learn_known_hosts_path(host, port, key, &path);
+            if let Some(directory) = path.parent() {
+                std::fs::create_dir_all(directory).map_err(|e| {
+                    format!("could not prepare the SSH host-key store — refused ({e})")
+                })?;
+            }
+            require_host_key_persisted(learn_known_hosts_path(host, port, key, &path))?;
             let fp = key.fingerprint(ssh_key::HashAlg::Sha256);
             emit_status(
                 app,
@@ -314,6 +334,10 @@ fn verify_host_key(
     }
 }
 
+fn require_host_key_persisted<E: std::fmt::Display>(result: Result<(), E>) -> Result<(), String> {
+    result.map_err(|e| format!("could not record the new host key — refused ({e})"))
+}
+
 fn home_dir() -> Option<PathBuf> {
     std::env::var_os("USERPROFILE")
         .or_else(|| std::env::var_os("HOME"))
@@ -322,4 +346,30 @@ fn home_dir() -> Option<PathBuf> {
 
 fn known_hosts_file() -> Option<PathBuf> {
     home_dir().map(|h| h.join(".ssh").join("known_hosts"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ensure_safe_private_key_algorithm, require_host_key_persisted};
+    use russh::keys::ssh_key::{Algorithm, HashAlg};
+
+    #[test]
+    fn unknown_host_is_rejected_when_its_key_cannot_be_recorded() {
+        let result = require_host_key_persisted::<&str>(Err("read-only file"));
+        assert_eq!(
+            result.unwrap_err(),
+            "could not record the new host key — refused (read-only file)"
+        );
+    }
+
+    #[test]
+    fn rsa_private_keys_are_rejected_until_the_timing_advisory_is_resolved() {
+        let rsa = Algorithm::Rsa {
+            hash: Some(HashAlg::Sha256),
+        };
+        assert!(ensure_safe_private_key_algorithm(rsa)
+            .unwrap_err()
+            .contains("timing-side-channel"));
+        assert!(ensure_safe_private_key_algorithm(Algorithm::Ed25519).is_ok());
+    }
 }

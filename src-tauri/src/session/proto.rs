@@ -20,6 +20,7 @@ pub const TAG_CLOSE: u8 = 4;
 /// 4 GiB) allocation before any bytes are even sent.
 pub const MAX_FRAME_LEN: usize = 16 * 1024 * 1024;
 
+#[derive(Debug)]
 pub struct Frame {
     pub tag: u8,
     pub payload: Vec<u8>,
@@ -52,4 +53,27 @@ pub fn read_frame(r: &mut impl Read) -> io::Result<Frame> {
         tag: header[0],
         payload,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[test]
+    fn frame_round_trip_preserves_binary_payload() {
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, TAG_DATA, &[0, 1, 255]).unwrap();
+        let frame = read_frame(&mut Cursor::new(bytes)).unwrap();
+        assert_eq!(frame.tag, TAG_DATA);
+        assert_eq!(frame.payload, [0, 1, 255]);
+    }
+
+    #[test]
+    fn oversized_frame_is_rejected_before_allocation() {
+        let mut header = vec![TAG_DATA];
+        header.extend_from_slice(&((MAX_FRAME_LEN as u32) + 1).to_le_bytes());
+        let error = read_frame(&mut Cursor::new(header)).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
 }

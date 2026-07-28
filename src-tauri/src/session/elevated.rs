@@ -8,21 +8,23 @@
 //! Two pipes avoid the synchronous-handle serialization that a single duplex
 //! handle would suffer from concurrent read+write (which deadlocks).
 
+use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::fs::File;
 use std::mem::size_of;
 use std::os::windows::io::FromRawHandle;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use tauri::AppHandle;
+use tauri::{AppHandle, Manager};
 use tokio::sync::mpsc::unbounded_channel;
 use uuid::Uuid;
 
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::{CloseHandle, FALSE, HANDLE};
+use windows::Win32::Foundation::{
+    CloseHandle, GetLastError, LocalFree, ERROR_PIPE_CONNECTED, ERROR_PIPE_LISTENING, FALSE,
+    HANDLE, HLOCAL,
+};
 use windows::Win32::Security::Authorization::{
     ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
 };
@@ -30,21 +32,27 @@ use windows::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
 use windows::Win32::Storage::FileSystem::{FILE_FLAG_FIRST_PIPE_INSTANCE, PIPE_ACCESS_DUPLEX};
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
 use windows::Win32::System::Pipes::{
-    ConnectNamedPipe, CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE, PIPE_WAIT,
+    ConnectNamedPipe, CreateNamedPipeW, SetNamedPipeHandleState, PIPE_NOWAIT, PIPE_READMODE_BYTE,
+    PIPE_TYPE_BYTE, PIPE_WAIT,
 };
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::SW_HIDE;
 
 use super::local::LocalOptions;
 use super::proto::{self, TAG_CLOSE, TAG_DATA, TAG_EXIT, TAG_RESIZE};
-use super::{emit_data, emit_exit, emit_status, SessionInfo, SessionInput, SessionKind, SessionManager};
+use super::{
+    emit_data, emit_exit, emit_status, SessionInfo, SessionInput, SessionKind, SessionManager,
+};
 
 pub fn spawn(
     app: AppHandle,
     manager: &SessionManager,
     opts: LocalOptions,
 ) -> Result<SessionInfo, String> {
-    let id = opts.id.clone().unwrap_or_else(|| Uuid::new_v4().to_string());
+    let id = opts
+        .id
+        .clone()
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
     if manager.exists(&id) {
         return Err(format!("session id already in use: {id}"));
     }
@@ -65,7 +73,13 @@ pub fn spawn(
 
     // 1. Create the pipes — restricted so only elevated (admin) clients can open them.
     let h_out = create_pipe(&pipe_out)?;
-    let h_in = create_pipe(&pipe_in)?;
+    let h_in = match create_pipe(&pipe_in) {
+        Ok(handle) => handle,
+        Err(error) => {
+            let _ = unsafe { CloseHandle(h_out) };
+            return Err(error);
+        }
+    };
     log(&format!("pipes created: {base}"));
 
     // 2. Re-launch ourselves elevated as the broker (raises the UAC prompt).
@@ -76,7 +90,10 @@ pub fn spawn(
     }
 
     // 3. Register the session and bridge the pipes <-> UI on a worker thread.
-    let title = opts.title.clone().unwrap_or_else(|| format!("{shell} (Admin)"));
+    let title = opts
+        .title
+        .clone()
+        .unwrap_or_else(|| format!("{shell} (Admin)"));
     let info = SessionInfo {
         id: id.clone(),
         kind: SessionKind::Local,
@@ -87,36 +104,36 @@ pub fn spawn(
     emit_status(&app, &id, "connecting", None);
     log(&format!("broker launched (id={id}); awaiting connect"));
 
-    // If the elevated broker never connects, surface an error (pointing at its log).
-    let connected = Arc::new(AtomicBool::new(false));
-    {
-        let (app, id, connected) = (app.clone(), id.clone(), connected.clone());
-        thread::spawn(move || {
-            thread::sleep(Duration::from_secs(25));
-            if !connected.load(Ordering::SeqCst) {
-                log("broker did not connect within 25s");
-                emit_exit(
-                    &app,
-                    &id,
-                    None,
-                    Some(
-                        "The elevated broker didn't connect — see %TEMP%\\corepty-broker.log."
-                            .to_string(),
-                    ),
-                );
-            }
-        });
-    }
-
     let raw_out = h_out.0 as isize; // HANDLEs aren't Send; smuggle them across as ints.
     let raw_in = h_in.0 as isize;
     thread::spawn(move || {
         let ho = HANDLE(raw_out as *mut c_void);
         let hi = HANDLE(raw_in as *mut c_void);
-        // Wait for the elevated broker to connect both pipes.
-        let _ = unsafe { ConnectNamedPipe(ho, None) };
-        let _ = unsafe { ConnectNamedPipe(hi, None) };
-        connected.store(true, Ordering::SeqCst);
+        let mut pending = VecDeque::new();
+        let deadline = Instant::now() + Duration::from_secs(25);
+
+        // Nonblocking connection polling lets close and timeout tear down the
+        // server handles instead of leaving a thread stuck in ConnectNamedPipe.
+        let connect_result = wait_for_pipe(ho, deadline, &mut rx, &mut pending)
+            .and_then(|()| wait_for_pipe(hi, deadline, &mut rx, &mut pending));
+        if let Err(error) = connect_result {
+            let _ = unsafe { CloseHandle(ho) };
+            let _ = unsafe { CloseHandle(hi) };
+            app.state::<SessionManager>().remove(&id);
+            if error != PipeConnectError::Cancelled {
+                log(&format!("broker connection failed: {error}"));
+                emit_exit(
+                    &app,
+                    &id,
+                    None,
+                    Some(format!(
+                        "The elevated broker did not connect: {error}. See %TEMP%\\corepty-broker.log."
+                    )),
+                );
+            }
+            return;
+        }
+
         let fout = unsafe { File::from_raw_handle(ho.0) }; // read-only here
         let fin = unsafe { File::from_raw_handle(hi.0) }; // write-only here
         emit_status(&app, &id, "connected", None);
@@ -146,11 +163,13 @@ pub fn spawn(
                                     frame.payload[3],
                                 ])
                             });
+                            app.state::<SessionManager>().remove(&id);
                             emit_exit(&app, &id, code, None);
                             return;
                         }
                         Ok(_) => {}
                         Err(_) => {
+                            app.state::<SessionManager>().remove(&id);
                             emit_exit(&app, &id, None, None);
                             return;
                         }
@@ -160,17 +179,25 @@ pub fn spawn(
         };
 
         // UI -> input pipe
-        while let Some(msg) = rx.blocking_recv() {
+        loop {
+            let msg = pending.pop_front().or_else(|| rx.blocking_recv());
+            let Some(msg) = msg else {
+                break;
+            };
             let mut w: &File = &fin;
             match msg {
                 SessionInput::Data(bytes) => {
-                    let _ = proto::write_frame(&mut w, TAG_DATA, &bytes);
+                    if proto::write_frame(&mut w, TAG_DATA, &bytes).is_err() {
+                        break;
+                    }
                 }
                 SessionInput::Resize { cols, rows } => {
                     let mut p = [0u8; 4];
                     p[0..2].copy_from_slice(&cols.to_le_bytes());
                     p[2..4].copy_from_slice(&rows.to_le_bytes());
-                    let _ = proto::write_frame(&mut w, TAG_RESIZE, &p);
+                    if proto::write_frame(&mut w, TAG_RESIZE, &p).is_err() {
+                        break;
+                    }
                 }
                 SessionInput::Close => {
                     let _ = proto::write_frame(&mut w, TAG_CLOSE, &[]);
@@ -183,6 +210,62 @@ pub fn spawn(
     });
 
     Ok(info)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum PipeConnectError {
+    Cancelled,
+    Timeout,
+    System(String),
+}
+
+impl std::fmt::Display for PipeConnectError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Cancelled => write!(f, "cancelled"),
+            Self::Timeout => write!(f, "timed out"),
+            Self::System(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+fn wait_for_pipe(
+    handle: HANDLE,
+    deadline: Instant,
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<SessionInput>,
+    pending: &mut VecDeque<SessionInput>,
+) -> Result<(), PipeConnectError> {
+    loop {
+        loop {
+            match rx.try_recv() {
+                Ok(SessionInput::Close) => return Err(PipeConnectError::Cancelled),
+                Ok(message) => pending.push_back(message),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                    return Err(PipeConnectError::Cancelled)
+                }
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(PipeConnectError::Timeout);
+        }
+
+        match unsafe { ConnectNamedPipe(handle, None) } {
+            Ok(()) => return set_pipe_blocking(handle),
+            Err(error) => match unsafe { GetLastError() } {
+                ERROR_PIPE_CONNECTED => return set_pipe_blocking(handle),
+                ERROR_PIPE_LISTENING => {}
+                _ => return Err(PipeConnectError::System(error.to_string())),
+            },
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn set_pipe_blocking(handle: HANDLE) -> Result<(), PipeConnectError> {
+    let mode = PIPE_READMODE_BYTE | PIPE_WAIT;
+    unsafe { SetNamedPipeHandleState(handle, Some(&mode), None, None) }
+        .map_err(|e| PipeConnectError::System(e.to_string()))
 }
 
 /// Create a named pipe with a DACL that grants access only to Administrators and
@@ -209,7 +292,7 @@ fn create_pipe(name: &str) -> Result<HANDLE, String> {
         CreateNamedPipeW(
             PCWSTR(wname.as_ptr()),
             PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE,
-            PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+            PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_NOWAIT,
             1,
             64 * 1024,
             64 * 1024,
@@ -217,6 +300,7 @@ fn create_pipe(name: &str) -> Result<HANDLE, String> {
             Some(&sa),
         )
     };
+    let _ = unsafe { LocalFree(HLOCAL(psd.0)) };
     if handle.is_invalid() {
         return Err(format!(
             "CreateNamedPipe failed: {}",
@@ -282,7 +366,11 @@ fn log(msg: &str) {
         return;
     }
     let path = std::env::temp_dir().join("corepty-elevated.log");
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
         let _ = writeln!(f, "{msg}");
     }
 }

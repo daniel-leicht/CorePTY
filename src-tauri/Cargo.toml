@@ -1,11 +1,11 @@
 [package]
 name = "corepty"
-version = "0.3.5"
+version = "0.3.6"
 description = "CorePTY — a modern multi-terminal client (local shells, SSH, Telnet)"
 authors = ["Daniel Leicht"]
 license = "GPL-3.0-or-later"
 edition = "2021"
-rust-version = "1.77"
+rust-version = "1.85"
 
 # The library is what Tauri builds/links; main.rs is a thin launcher.
 [lib]
@@ -24,8 +24,9 @@ uuid = { version = "1.20.0", features = ["v4"] }
 base64 = "0.22.1"
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "sync", "macros", "io-util", "net", "time"] }
 # Use the `ring` crypto backend instead of the default `aws-lc-rs`, which needs
-# the NASM assembler to build on Windows. `ring` ships pre-generated MSVC asm.
-russh = { version = "0.54.5", default-features = false, features = ["ring", "flate2", "rsa"] }
+# the NASM assembler to build on Windows. RSA is intentionally disabled while
+# its pure-Rust implementation is affected by RUSTSEC-2023-0071.
+russh = { version = "0.62.4", default-features = false, features = ["ring", "flate2"] }
 # Base (mock) keystore; the real OS backend is selected per-platform below.
 keyring = { version = "3.6.3", default-features = false }
 toml = "1.0.7"

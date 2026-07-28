@@ -92,11 +92,7 @@ impl SessionManager {
     }
 
     pub fn list(&self) -> Vec<SessionInfo> {
-        let mut list: Vec<SessionInfo> = self
-            .guard()
-            .values()
-            .map(|h| h.info.clone())
-            .collect();
+        let mut list: Vec<SessionInfo> = self.guard().values().map(|h| h.info.clone()).collect();
         list.sort_by(|a, b| a.id.cmp(&b.id));
         list
     }

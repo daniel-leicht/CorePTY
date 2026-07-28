@@ -2,7 +2,7 @@ name: Build & Release
 
 # Cut a release by pushing a version tag:
 #     git tag v0.1.0 && git push origin v0.1.0
-# …or run it by hand from the Actions tab. On a manual run you may supply a tag to
+# Alternatively, run it from the Actions tab. On a manual run you may supply a tag to
 # publish a release; leave it blank to just build the downloadable artifacts.
 
 on:
@@ -16,9 +16,8 @@ on:
         required: false
         default: ""
 
-# Let the built-in token create / update GitHub Releases.
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: release-${{ github.ref }}
@@ -93,6 +92,40 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
+      - name: Validate project versions and release tag
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.event_name == 'push' && github.ref_name || inputs.tag }}
+        run: |
+          node <<'NODE'
+          const fs = require("node:fs");
+          const readJson = (path) => JSON.parse(fs.readFileSync(path, "utf8"));
+          const cargo = fs.readFileSync("src-tauri/Cargo.toml", "utf8");
+          const packageSection = cargo.match(/\[package\]([\s\S]*?)(?:\n\[|$)/)?.[1];
+          const cargoVersion = packageSection?.match(/^version\s*=\s*"([^"]+)"/m)?.[1];
+          const versions = {
+            package: readJson("package.json").version,
+            tauri: readJson("src-tauri/tauri.conf.json").version,
+            cargo: cargoVersion,
+          };
+          const expected = versions.package;
+          if (!expected || Object.values(versions).some((value) => value !== expected)) {
+            throw new Error(`Project versions do not match: ${JSON.stringify(versions)}`);
+          }
+          const tag = process.env.RELEASE_TAG;
+          if (tag && tag !== `v${expected}`) {
+            throw new Error(`Release tag ${tag} does not match project version v${expected}`);
+          }
+          console.log(`Validated CorePTY ${expected}${tag ? ` (${tag})` : ""}`);
+          NODE
+
+      - name: Check frontend
+        run: npm run check
+
+      - name: Test native core
+        working-directory: src-tauri
+        run: cargo test --all-targets
+
       - name: Build app
         run: npx tauri build --target ${{ matrix.target }} --bundles ${{ matrix.bundles }}
 
@@ -139,6 +172,8 @@ jobs:
     name: Publish release
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - name: Resolve tag + version
         id: rel
@@ -176,25 +211,18 @@ jobs:
           name: CorePTY ${{ steps.rel.outputs.tag }}
           draft: false
           prerelease: false
-          fail_on_unmatched_files: false
+          fail_on_unmatched_files: true
           files: dist/*
           body: |
-            <div align="center">
-
             ## CorePTY ${{ steps.rel.outputs.tag }}
-
-            A slick, cross-platform multi-terminal — local shells, SSH &amp; Telnet.
-
-            </div>
-
-            ### ⬇️ Downloads
 
             | Platform | Download | Notes |
             |---|---|---|
-            | 🪟 **Windows 10/11 · x64** | `CorePTY_${{ steps.rel.outputs.version }}_x64-setup.exe` | Installer (NSIS) — Start-menu shortcut + uninstaller; provisions WebView2 if missing. |
-            | 🪟 Windows · portable | `CorePTY_${{ steps.rel.outputs.version }}_x64-portable.exe` | Single self-contained exe, no install (needs the Edge WebView2 runtime). |
-            | 🍎 **macOS · Universal** | `CorePTY_${{ steps.rel.outputs.version }}_universal.dmg` | Intel + Apple Silicon. Unsigned — first launch: right-click → **Open**. |
-            | 🐧 **Linux · x86-64** | `CorePTY_${{ steps.rel.outputs.version }}_amd64.AppImage` | Portable — `chmod +x` then run. |
-            | 🐧 Linux · Debian/Ubuntu | `CorePTY_${{ steps.rel.outputs.version }}_amd64.deb` | `sudo apt install ./CorePTY_${{ steps.rel.outputs.version }}_amd64.deb` |
+            | Windows 10/11 x64 | `CorePTY_${{ steps.rel.outputs.version }}_x64-setup.exe` | NSIS installer with Start menu integration and an uninstaller. |
+            | Windows x64 portable | `CorePTY_${{ steps.rel.outputs.version }}_x64-portable.exe` | Standalone executable; requires the Edge WebView2 runtime. |
+            | macOS universal | `CorePTY_${{ steps.rel.outputs.version }}_universal.dmg` | Supports Intel and Apple Silicon. |
+            | Linux x86-64 | `CorePTY_${{ steps.rel.outputs.version }}_amd64.AppImage` | Portable AppImage; run `chmod +x` before launching. |
+            | Debian or Ubuntu x86-64 | `CorePTY_${{ steps.rel.outputs.version }}_amd64.deb` | Install with `sudo apt install ./CorePTY_${{ steps.rel.outputs.version }}_amd64.deb`. |
 
-            <sub>Local shells adapt to the OS — PowerShell / cmd on Windows; bash / zsh / fish / sh on macOS &amp; Linux. macOS and Linux builds are unsigned.</sub>
+            Release artifacts are unsigned. See the project README for build
+            instructions, security details, and supported features.

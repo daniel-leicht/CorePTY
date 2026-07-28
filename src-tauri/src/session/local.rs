@@ -120,9 +120,10 @@ pub fn spawn(
     };
     let (tx, mut rx) = unbounded_channel::<SessionInput>();
     manager.register(info.clone(), tx);
+    emit_status(&app, &id, "connected", None);
 
     // Reader: PTY output -> UI.
-    {
+    let reader_thread = {
         let app = app.clone();
         let id = id.clone();
         std::thread::spawn(move || {
@@ -134,16 +135,19 @@ pub fn spawn(
                     Err(_) => break,
                 }
             }
-        });
-    }
+        })
+    };
 
-    // Waiter: child exit -> emit exit + deregister.
+    // Waiter: child exit -> drain output, emit exit, and deregister.
     {
         let app = app.clone();
         let id = id.clone();
         std::thread::spawn(move || {
             let code = child.wait().ok().map(|s| s.exit_code() as i32);
+            // Deregistering drops the last input sender, allowing the control
+            // thread to release its PTY handles before we wait for output EOF.
             app.state::<SessionManager>().remove(&id);
+            let _ = reader_thread.join();
             emit_exit(&app, &id, code, None);
         });
     }
@@ -180,7 +184,6 @@ pub fn spawn(
         });
     }
 
-    emit_status(&app, &id, "connected", None);
     Ok(info)
 }
 
@@ -258,7 +261,13 @@ pub fn available_shells() -> Vec<ShellInfo> {
     // (id, label, hint, icon, always_present)
     #[cfg(windows)]
     let candidates: &[(&str, &str, &str, &str, bool)] = &[
-        ("powershell", "PowerShell", "Windows PowerShell 5.1", "powershell", true),
+        (
+            "powershell",
+            "PowerShell",
+            "Windows PowerShell 5.1",
+            "powershell",
+            true,
+        ),
         ("pwsh", "PowerShell 7", "Cross-platform pwsh", "pwsh", false),
         ("cmd", "Command Prompt", "cmd.exe", "cmd", true),
         ("bash", "Bash", "Git Bash / WSL", "bash", false),
@@ -347,7 +356,11 @@ fn which(exe: &str) -> Option<String> {
     let path = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&path) {
         let candidate = dir.join(exe);
-        if candidate.symlink_metadata().map(|m| !m.is_dir()).unwrap_or(false) {
+        if candidate
+            .symlink_metadata()
+            .map(|m| !m.is_dir())
+            .unwrap_or(false)
+        {
             return Some(candidate.to_string_lossy().into_owned());
         }
     }

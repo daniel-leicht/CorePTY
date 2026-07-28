@@ -40,46 +40,108 @@ function hexToRgb(hex: string): [number, number, number] {
   return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
 }
 
-/** Rewrite an SGR parameter list: a bare `2` (dim) → grey fg; `22` (intensity
- *  off) also resets the fg (`39`) so the grey doesn't linger. Everything else is
- *  passed through untouched.
+/** Whether an SGR parameter selects one of the basic ANSI foreground colors. */
+function isBasicForeground(param: string): boolean {
+  const n = Number(param);
+  return (n >= 30 && n <= 37) || (n >= 90 && n <= 97);
+}
+
+/** Number of parameters occupied by an extended color beginning at `index`. */
+function extendedColorLength(parts: string[], index: number): number {
+  const mode = parts[index + 1];
+  const wanted = mode === "5" ? 2 : mode === "2" ? 4 : mode !== undefined ? 1 : 0;
+  return Math.min(wanted, parts.length - 1 - index);
+}
+
+/**
+ * Rewriting needs a small amount of SGR state. The replacement grey is only
+ * active while dim was requested on the default foreground; SGR 22 restores the
+ * default foreground only in that case. This preserves the standard meaning of
+ * SGR 22 for ordinary bold/colored output.
  *
  *  Crucially, the extended-colour introducers `38`/`48`/`58` are followed by
  *  sub-parameters (`;5;N` or `;2;R;G;B`) whose digits — including a `2` selector
  *  or an R/G/B/index that happens to equal `2` — must NOT be read as the dim
  *  attribute. We copy those sub-parameters verbatim. (Colon-packed colours like
  *  `38:2::r:g:b` are a single `;`-element and never equal `"2"`, so they're
- *  already safe.) */
-function rewriteSgr(params: string): string {
-  // Cheap reject: only a bare `2` / `22` matters; if no `2` digit at all, skip.
-  if (params.indexOf("2") === -1) return params;
-  const parts = params.split(";");
-  const out: string[] = [];
-  for (let i = 0; i < parts.length; i++) {
-    const p = parts[i];
-    if (p === "38" || p === "48" || p === "58") {
-      out.push(p);
-      const mode = parts[i + 1];
-      const take = mode === "5" ? 2 : mode === "2" ? 4 : mode !== undefined ? 1 : 0;
-      const consumed = Math.min(take, parts.length - 1 - i);
-      for (let k = 1; k <= consumed; k++) out.push(parts[i + k]);
-      i += consumed;
-      continue;
-    }
-    if (p === "2") out.push(dimParams());
-    else if (p === "22") out.push("22;39");
-    else out.push(p);
-  }
-  return out.join(";");
-}
-
-/**
+ *  already safe.)
+ *
  * Stateful, per-terminal stream filter. `feed()` returns the byte stream with
  * SGR dim rewritten; an incomplete escape sequence at a chunk boundary is
  * carried to the next call so a split `ESC [ … m` is still rewritten as a unit.
  */
 export class SgrDimFilter {
   private carry: Uint8Array | null = null;
+  private foregroundIsDefault = true;
+  private dimActive = false;
+  private dimReplacementActive = false;
+
+  private rewriteSgr(params: string): string {
+    const parts = params.split(";");
+    const out: string[] = [];
+
+    for (let i = 0; i < parts.length; i++) {
+      const p = parts[i];
+      if (p === "" || p === "0") {
+        out.push(p);
+        this.foregroundIsDefault = true;
+        this.dimActive = false;
+        this.dimReplacementActive = false;
+        continue;
+      }
+
+      if (p === "38" || p === "48" || p === "58") {
+        const consumed = extendedColorLength(parts, i);
+        const color = parts.slice(i, i + consumed + 1);
+        out.push(...color);
+        if (p === "38") {
+          this.foregroundIsDefault = false;
+          // Preserve the semantic dim attribute when an explicit foreground
+          // supersedes our grey replacement. WebGL may still render it at full
+          // intensity, but later SGR 22 will now leave this foreground intact.
+          if (this.dimReplacementActive) out.push("2");
+          this.dimReplacementActive = false;
+        }
+        i += consumed;
+        continue;
+      }
+
+      if (p.startsWith("38:") || isBasicForeground(p)) {
+        out.push(p);
+        this.foregroundIsDefault = false;
+        if (this.dimReplacementActive) out.push("2");
+        this.dimReplacementActive = false;
+      } else if (p === "39") {
+        this.foregroundIsDefault = true;
+        if (this.dimActive) {
+          out.push(dimParams());
+          this.dimReplacementActive = true;
+        } else {
+          out.push(p);
+        }
+      } else if (p === "2") {
+        this.dimActive = true;
+        if (this.foregroundIsDefault) {
+          out.push(dimParams());
+          this.dimReplacementActive = true;
+        } else {
+          out.push(p);
+        }
+      } else if (p === "22") {
+        this.dimActive = false;
+        out.push(p);
+        if (this.dimReplacementActive) {
+          out.push("39");
+          this.foregroundIsDefault = true;
+          this.dimReplacementActive = false;
+        }
+      } else {
+        out.push(p);
+      }
+    }
+
+    return out.join(";");
+  }
 
   feed(input: Uint8Array): Uint8Array {
     // Fast path: the overwhelming majority of chunks contain no ESC.
@@ -126,7 +188,7 @@ export class SgrDimFilter {
       if (buf[j] === SGR_FINAL) {
         let params = "";
         for (let k = i + 2; k < j; k++) params += String.fromCharCode(buf[k]);
-        const rewritten = rewriteSgr(params);
+        const rewritten = this.rewriteSgr(params);
         out.push(ESC, CSI);
         for (let k = 0; k < rewritten.length; k++) out.push(rewritten.charCodeAt(k));
         out.push(SGR_FINAL);

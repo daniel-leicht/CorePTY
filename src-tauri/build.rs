@@ -25,7 +25,10 @@ fn sideload_conpty() {
         let src = Path::new(&manifest).join("conpty").join(name);
         println!("cargo:rerun-if-changed={}", src.display());
         if let Err(e) = std::fs::copy(&src, profile_dir.join(name)) {
-            println!("cargo:warning=sideload_conpty: copy {} failed: {e}", src.display());
+            println!(
+                "cargo:warning=sideload_conpty: copy {} failed: {e}",
+                src.display()
+            );
         }
     }
 }
