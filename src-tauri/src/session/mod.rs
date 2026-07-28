@@ -7,6 +7,7 @@
 #[cfg(windows)]
 pub mod elevated;
 pub mod local;
+#[cfg(windows)]
 pub mod proto;
 pub mod ssh;
 pub mod telnet;
