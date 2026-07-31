@@ -268,6 +268,7 @@ export function applyTheme(id: string): Theme {
   s.setProperty("--bg-2", c.bg2);
   s.setProperty("--bg-3", c.bg3);
   s.setProperty("--bg-4", c.bg4);
+  s.setProperty("--terminal-bg", t.terminal.background ?? c.bg1);
   s.setProperty("--line", c.line);
   s.setProperty("--line-soft", c.lineSoft);
   s.setProperty("--text-0", c.text0);

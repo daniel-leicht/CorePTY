@@ -106,15 +106,19 @@ the terminal palette.
 <table>
   <tr>
     <td align="center" width="50%"><img src="docs/theme-corepty-dark.png" alt="CorePTY Dark theme" /><br /><strong>CorePTY Dark</strong></td>
+    <td align="center" width="50%"><img src="docs/theme-corepty-light.png" alt="CorePTY Light theme" /><br /><strong>CorePTY Light</strong></td>
+  </tr>
+  <tr>
     <td align="center" width="50%"><img src="docs/theme-dracula.png" alt="Dracula theme" /><br /><strong>Dracula</strong></td>
-  </tr>
-  <tr>
     <td align="center" width="50%"><img src="docs/theme-nord.png" alt="Nord theme" /><br /><strong>Nord</strong></td>
-    <td align="center" width="50%"><img src="docs/theme-synapse.png" alt="Synapse theme" /><br /><strong>Synapse</strong></td>
   </tr>
   <tr>
-    <td align="center" width="50%"><img src="docs/theme-starbase.png" alt="Starbase theme" /><br /><strong>Starbase</strong></td>
+    <td align="center" width="50%"><img src="docs/theme-solarized-dark.png" alt="Solarized Dark theme" /><br /><strong>Solarized Dark</strong></td>
     <td align="center" width="50%"><img src="docs/theme-bbs.png" alt="BBS theme" /><br /><strong>BBS</strong></td>
+  </tr>
+  <tr>
+    <td align="center" width="50%"><img src="docs/theme-synapse.png" alt="Synapse theme" /><br /><strong>Synapse</strong></td>
+    <td align="center" width="50%"><img src="docs/theme-starbase.png" alt="Starbase theme" /><br /><strong>Starbase</strong></td>
   </tr>
 </table>
 
@@ -123,7 +127,7 @@ the terminal palette.
 | Area | Implementation |
 |---|---|
 | Desktop shell | Tauri 2 and each platform's native webview |
-| Terminal renderer | xterm.js 5 with fit, search, Unicode, web-links, and WebGL addons |
+| Terminal renderer | xterm.js 6 with fit, search, Unicode, web-links, and WebGL addons |
 | Local sessions | `portable-pty` |
 | SSH | `russh` with the `ring` cryptography backend |
 | Telnet | CorePTY's bounded IAC parser over Tokio TCP |
@@ -184,6 +188,9 @@ cargo test --all-targets
 
 `npm run check` performs TypeScript type checking, runs the Vitest suite, and
 produces a release-mode frontend bundle.
+
+Regenerate the README's deterministic theme gallery on Windows with
+`npm run screenshots`.
 
 ### Release build
 

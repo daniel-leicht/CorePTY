@@ -9,6 +9,7 @@
   --bg-2: #14161d;
   --bg-3: #1b1e27;
   --bg-4: #232734;
+  --terminal-bg: #0e0f13;
 
   --line: #232634;
   --line-soft: #1a1d27;
@@ -513,6 +514,11 @@ button {
 }
 .term .xterm {
   height: 100%;
+}
+.term .xterm .xterm-viewport {
+  /* FitAddon rounds down to whole rows. Color the remaining partial row with
+     the active terminal background instead of xterm.css's hard-coded black. */
+  background-color: var(--terminal-bg);
 }
 .term .xterm-viewport::-webkit-scrollbar {
   width: 10px;

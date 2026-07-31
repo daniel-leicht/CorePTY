@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en" data-capture-stage="html-loaded">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>CorePTY theme showcase</title>
+  </head>
+  <body>
+    <script>
+      function showCaptureError(reason) {
+        document.body.style.visibility = "visible";
+        document.body.style.color = "#ff7b9c";
+        document.body.style.font = "16px/1.5 ui-monospace, monospace";
+        document.body.style.padding = "32px";
+        document.body.textContent = `Screenshot fixture failed:\n${String(reason?.stack ?? reason)}`;
+      }
+      window.addEventListener("error", (event) => showCaptureError(event.error ?? event.message));
+      window.addEventListener("unhandledrejection", (event) => showCaptureError(event.reason));
+    </script>
+    <div class="shot-canvas">
+      <div class="shot-window">
+        <div class="shot-nativebar" aria-hidden="true">
+          <div class="shot-nativebar__title">
+            <span class="shot-nativebar__mark">&gt;_</span>
+            <span>CorePTY</span>
+          </div>
+          <div class="shot-nativebar__controls">
+            <span>&minus;</span>
+            <span>&#9633;</span>
+            <span class="shot-nativebar__close">&times;</span>
+          </div>
+        </div>
+        <div class="shot-app"><div id="app"></div></div>
+      </div>
+    </div>
+    <script type="module">
+      import("/src/showcase.ts").catch(showCaptureError);
+    </script>
+  </body>
+</html>
