@@ -8,7 +8,6 @@ import {
   onStatus,
   type LocalShell,
   type SavedSession,
-  type SessionKind,
   type SshConnectOptions,
   type TelnetConnectOptions,
 } from "./ipc";
@@ -35,6 +34,8 @@ import {
   type SecretMutation,
 } from "./profile";
 import { pasteIntoTerminal } from "./paste";
+import { FileManagerTab } from "./file-manager";
+import type { AppTab } from "./tab";
 
 /** App version, injected at build time by Vite (see vite.config.ts). */
 declare const __APP_VERSION__: string;
@@ -44,9 +45,9 @@ export class App {
   private readonly dialog = new ConnectionDialog();
   private readonly settingsDialog = new SettingsDialog(() => this.applySettingsToAll());
   private tree!: ConnectionsTree;
-  private tabs: TerminalSession[] = [];
+  private tabs: AppTab[] = [];
   private byId = new Map<string, TerminalSession>();
-  private active: TerminalSession | null = null;
+  private active: AppTab | null = null;
   /** Host OS ("windows" | "macos" | "linux" | …); gates OS-specific UI. */
   private hostOs = "";
   /** uid of the tab whose inline-rename input is currently open (if any). */
@@ -54,7 +55,7 @@ export class App {
   /** Last tab mousedown, for manual double-click (survives tab re-render). */
   private lastTabClick: { uid: string; at: number } | null = null;
   /** Tab currently being drag-reordered (if any). */
-  private dragTab: TerminalSession | null = null;
+  private dragTab: AppTab | null = null;
   /** Shared theme-styled tooltip element for tab hover, and its show timer. */
   private tabTipEl: HTMLElement | null = null;
   private tabTipTimer: number | null = null;
@@ -141,6 +142,17 @@ export class App {
             </div>
 
             <div class="side-group">
+              <div class="side-group__label">Tools</div>
+              <div class="quick">
+                <button class="quick__btn" id="open-files">
+                  <span class="quick__icon">${icon("files")}</span>
+                  <span class="quick__text"><span class="quick__label">File Manager</span><span class="quick__hint">Dual-pane local files</span></span>
+                  <span class="quick__go">${icon("plus")}</span>
+                </button>
+              </div>
+            </div>
+
+            <div class="side-group">
               <div class="side-group__label">
                 Connections
                 <span class="side-group__actions">
@@ -161,7 +173,7 @@ export class App {
         <main class="main">
           <div class="tabbar">
             <div class="tabs" id="tabs"></div>
-            <button class="tab-add" id="tab-add" title="New tab (Ctrl+Shift+T)">${icon("plus")}</button>
+            <button class="tab-add" id="tab-add" title="New tab">${icon("plus")}</button>
           </div>
 
           <div class="stage" id="stage">
@@ -175,9 +187,12 @@ export class App {
             <div class="stage-empty" id="stage-empty" hidden>
               <div class="stage-empty__card">
                 <span class="stage-empty__icon">${icon("terminal")}</span>
-                <div class="stage-empty__title">No open sessions</div>
-                <div class="stage-empty__hint">Pick a shell on the left, or press Ctrl + Shift + T</div>
-                <button class="btn primary" id="stage-empty-new">${icon("plus")} New tab</button>
+                <div class="stage-empty__title">No open tabs</div>
+                <div class="stage-empty__hint">Open a shell or browse local files</div>
+                <div class="stage-empty__actions">
+                  <button class="btn primary" id="stage-empty-new">${icon("terminal")} New terminal</button>
+                  <button class="btn ghost" id="stage-empty-files">${icon("files")} File manager</button>
+                </div>
               </div>
             </div>
           </div>
@@ -269,8 +284,14 @@ export class App {
       .querySelector("#open-settings")!
       .addEventListener("click", () => this.settingsDialog.open());
     this.root
+      .querySelector("#open-files")!
+      .addEventListener("click", () => this.newFileManager());
+    this.root
       .querySelector("#stage-empty-new")!
       .addEventListener("click", () => void this.newLocal(this.defaultShell()));
+    this.root
+      .querySelector("#stage-empty-files")!
+      .addEventListener("click", () => this.newFileManager());
 
     this.setupStageInteractions();
     this.setupSearch();
@@ -474,6 +495,14 @@ export class App {
     this.updateStatus();
   }
 
+  newFileManager(initialPaths?: [string | undefined, string | undefined]): void {
+    const tab = new FileManagerTab({
+      toast: (message, kind) => this.toast(message, kind),
+      initialPaths,
+    });
+    this.addTab(tab);
+  }
+
   private sshOptions(form: ConnForm, id: string, cols: number, rows: number): SshConnectOptions {
     const auth =
       form.authType === "key"
@@ -530,15 +559,17 @@ export class App {
     session.focus();
   }
 
-  private addTab(session: TerminalSession): void {
+  private addTab(session: AppTab): void {
     const updateTab = () => {
       this.updateTabPresentation(session);
       if (session === this.active) this.updateStatus();
     };
     session.onTitleUpdate = updateTab;
     session.onStatusChange = updateTab;
-    session.onExit = updateTab;
-    session.onReconnect = () => void this.relaunch(session);
+    if (session instanceof TerminalSession) {
+      session.onExit = updateTab;
+      session.onReconnect = () => void this.relaunch(session);
+    }
     session.onClose = () => void this.closeTab(session);
     this.tabs.push(session);
     this.stageEl.appendChild(session.element);
@@ -546,12 +577,13 @@ export class App {
     this.activate(session);
   }
 
-  private activate(session: TerminalSession): void {
+  private activate(session: AppTab): void {
     this.active = session;
     for (const t of this.tabs) t.element.classList.toggle("is-active", t === session);
     // Update the strip highlight in place rather than rebuilding it — keeps tab
     // switches cheap and, crucially, doesn't destroy a tab element mid-drag.
     this.markActiveTab();
+    if (!(session instanceof TerminalSession)) this.searchBar.setAttribute("hidden", "");
     this.updateStatus();
     requestAnimationFrame(() => {
       session.open();
@@ -572,7 +604,7 @@ export class App {
    * arrive many times per second; rebuilding the strip would detach the native
    * drag source and make an in-progress reorder flicker or abort.
    */
-  private updateTabPresentation(session: TerminalSession): void {
+  private updateTabPresentation(session: AppTab): void {
     // Keep the strip's geometry stable until the native drag operation ends.
     // The session retains the newest title/status, which clearDragMarks applies.
     if (this.dragTab) return;
@@ -595,10 +627,10 @@ export class App {
     if (dotEl && dotEl.className !== dotClass) dotEl.className = dotClass;
   }
 
-  private async closeTab(session: TerminalSession): Promise<void> {
+  private async closeTab(session: AppTab): Promise<void> {
     const idx = this.tabs.indexOf(session);
     if (idx < 0) return;
-    if (session.info) {
+    if (session instanceof TerminalSession && session.info) {
       void api.close(session.info.id).catch(() => {});
       this.byId.delete(session.info.id);
     }
@@ -713,7 +745,7 @@ export class App {
   }
 
   /** Reorder the strip: move `dragged` to just before/after `target`. */
-  private moveTab(dragged: TerminalSession, target: TerminalSession, after: boolean): void {
+  private moveTab(dragged: AppTab, target: AppTab, after: boolean): void {
     const from = this.tabs.indexOf(dragged);
     if (from < 0 || dragged === target) return;
     this.tabs.splice(from, 1);
@@ -727,10 +759,14 @@ export class App {
   }
 
   /** Right-click menu on a tab: duplicate, rename, reset the name, or close. */
-  private openTabMenu(session: TerminalSession, x: number, y: number): void {
+  private openTabMenu(session: AppTab, x: number, y: number): void {
     this.hideTabTip();
     const items: MenuItem[] = [
-      { label: "Duplicate session", icon: "copy", action: () => this.duplicateSession(session) },
+      {
+        label: session instanceof TerminalSession ? "Duplicate session" : "Duplicate file manager",
+        icon: "copy",
+        action: () => this.duplicateTab(session),
+      },
       { label: "Rename…", icon: "pencil", action: () => this.startTabRename(session) },
     ];
     if (session.pinned) {
@@ -763,6 +799,11 @@ export class App {
     else void this.newTelnet(spec.form);
   }
 
+  private duplicateTab(tab: AppTab): void {
+    if (tab instanceof TerminalSession) this.duplicateSession(tab);
+    else if (tab instanceof FileManagerTab) this.newFileManager(tab.currentPaths());
+  }
+
   // ---- tab hover tooltip (theme-styled) -----------------------------------
 
   private ensureTabTip(): HTMLElement {
@@ -775,7 +816,7 @@ export class App {
   }
 
   /** Show the full tab title in a themed tooltip under the tab, after a beat. */
-  private showTabTip(anchor: HTMLElement, session: TerminalSession): void {
+  private showTabTip(anchor: HTMLElement, session: AppTab): void {
     if (this.tabTipTimer) clearTimeout(this.tabTipTimer);
     this.tabTipTimer = window.setTimeout(() => {
       const tip = this.ensureTabTip();
@@ -804,7 +845,7 @@ export class App {
    * it's reset. Submitting an empty value clears the pin, handing control back
    * to the OSC / default title.
    */
-  private startTabRename(session: TerminalSession): void {
+  private startTabRename(session: AppTab): void {
     const tabEl = this.tabsListEl.querySelector<HTMLElement>(`.tab[data-key="${session.uid}"]`);
     const titleEl = tabEl?.querySelector<HTMLElement>(".tab__title");
     if (!tabEl || !titleEl) return;
@@ -855,12 +896,11 @@ export class App {
       dot.className = "status-dot";
       return;
     }
+    const info = s.statusInfo();
     title.textContent = s.title;
-    kind.textContent = kindLabel(s.kind);
-    os.textContent = s.osTitle && s.osTitle !== s.title ? s.osTitle : "";
-    dims.textContent = s.alive
-      ? `${s.term.cols} × ${s.term.rows} · ${s.renderer === "webgl" ? "WebGL" : "DOM"}`
-      : "";
+    kind.textContent = info.kind;
+    os.textContent = info.context ?? "";
+    dims.textContent = info.metrics ?? "";
     dot.className = `status-dot ${s.status}`;
   }
 
@@ -890,6 +930,9 @@ export class App {
       <div class="pop__label">Remote</div>
       <button class="pop__item" data-conn="ssh"><span class="pop__icon">${icon("ssh")}</span><span class="pop__name">SSH connection</span></button>
       <button class="pop__item" data-conn="telnet"><span class="pop__icon">${icon("telnet")}</span><span class="pop__name">Telnet connection</span></button>
+      <div class="pop__sep"></div>
+      <div class="pop__label">Tools</div>
+      <button class="pop__item" data-tool="files"><span class="pop__icon">${icon("files")}</span><span class="pop__name">File Manager</span><span class="pop__hint">Ctrl+Shift+E</span></button>
     `;
     document.body.appendChild(menu);
     const r = anchor.getBoundingClientRect();
@@ -902,6 +945,7 @@ export class App {
         if (item.dataset.shell) void this.newLocal(item.dataset.shell as LocalShell);
         else if (item.dataset.conn)
           void this.openDialog(undefined, { presetKind: item.dataset.conn as "ssh" | "telnet" });
+        else if (item.dataset.tool === "files") this.newFileManager();
       });
     });
 
@@ -926,7 +970,7 @@ export class App {
     this.stageEl.addEventListener("mouseup", () => {
       if (!settings.copyOnSelect) return;
       const s = this.active;
-      if (s && s.hasSelection()) {
+      if (s instanceof TerminalSession && s.hasSelection()) {
         const text = s.getSelection();
         if (text) navigator.clipboard.writeText(text).catch(() => {});
       }
@@ -935,7 +979,7 @@ export class App {
     this.stageEl.addEventListener("contextmenu", (e) => {
       e.preventDefault();
       const s = this.active;
-      if (!s) return;
+      if (!(s instanceof TerminalSession)) return;
       if (settings.rightClick === "menu") {
         const items = [];
         if (s.hasSelection()) items.push({ label: "Copy", icon: "copy", action: () => this.copy() });
@@ -965,7 +1009,7 @@ export class App {
 
   private async paste(): Promise<void> {
     const s = this.active;
-    if (!s?.info || !s.alive) return;
+    if (!(s instanceof TerminalSession) || !s.info || !s.alive) return;
     try {
       const text = await navigator.clipboard.readText();
       if (text) pasteIntoTerminal(s.term, text);
@@ -976,7 +1020,8 @@ export class App {
 
   private copy(): void {
     const s = this.active;
-    if (s?.hasSelection()) navigator.clipboard.writeText(s.getSelection()).catch(() => {});
+    if (s instanceof TerminalSession && s.hasSelection())
+      navigator.clipboard.writeText(s.getSelection()).catch(() => {});
   }
 
   // ---- settings -----------------------------------------------------------
@@ -1022,9 +1067,10 @@ export class App {
   private setupSearch(): void {
     const run = (dir: "next" | "prev") => {
       const q = this.searchInput.value;
-      if (!q || !this.active) return;
-      if (dir === "next") this.active.search.findNext(q);
-      else this.active.search.findPrevious(q);
+      const terminal = this.active instanceof TerminalSession ? this.active : null;
+      if (!q || !terminal) return;
+      if (dir === "next") terminal.search.findNext(q);
+      else terminal.search.findPrevious(q);
     };
     this.searchInput.addEventListener("keydown", (e) => {
       if (e.key === "Enter") {
@@ -1046,13 +1092,15 @@ export class App {
 
   private toggleSearch(show?: boolean): void {
     const next = show ?? this.searchBar.hasAttribute("hidden");
+    const terminal = this.active instanceof TerminalSession ? this.active : null;
+    if (next && !terminal) return;
     if (next) {
       this.searchBar.removeAttribute("hidden");
       this.searchInput.focus();
       this.searchInput.select();
     } else {
       this.searchBar.setAttribute("hidden", "");
-      this.active?.search.clearDecorations();
+      terminal?.search.clearDecorations();
       this.active?.focus();
     }
   }
@@ -1093,20 +1141,24 @@ export class App {
         } else if (ctrl && e.shiftKey && (e.key === "N" || e.key === "n")) {
           e.preventDefault();
           void this.openDialog();
+        } else if (ctrl && e.shiftKey && (e.key === "E" || e.key === "e")) {
+          e.preventDefault();
+          this.newFileManager();
         } else if (ctrl && e.shiftKey && (e.key === "W" || e.key === "w")) {
           e.preventDefault();
           if (this.active) void this.closeTab(this.active);
         } else if (ctrl && e.shiftKey && (e.key === "R" || e.key === "r")) {
           e.preventDefault();
-          if (this.active) void this.relaunch(this.active);
+          if (this.active instanceof TerminalSession) void this.relaunch(this.active);
         } else if (ctrl && e.shiftKey && (e.key === "F" || e.key === "f")) {
           e.preventDefault();
-          this.toggleSearch();
+          if (this.active instanceof FileManagerTab) this.active.openSearch();
+          else this.toggleSearch();
         } else if (ctrl && e.key === ",") {
           e.preventDefault();
           this.settingsDialog.open();
         } else if (ctrl && e.shiftKey && (e.key === "C" || e.key === "c")) {
-          if (this.active?.hasSelection()) {
+          if (this.active instanceof TerminalSession && this.active.hasSelection()) {
             e.preventDefault();
             this.copy();
           }
@@ -1252,8 +1304,4 @@ export class App {
       setTimeout(() => el.remove(), 250);
     }, 4000);
   }
-}
-
-function kindLabel(kind: SessionKind): string {
-  return kind === "local" ? "local" : kind.toUpperCase();
 }

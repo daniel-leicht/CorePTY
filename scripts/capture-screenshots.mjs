@@ -92,11 +92,19 @@ async function main() {
 
     for (const theme of themes) {
       const output = join(renderDir, `theme-${theme}.png`);
-      await capture(client, theme, output);
+      await capture(client, theme, output, "terminal");
       const { size } = await stat(output);
       if (size < 10_000) throw new Error(`Screenshot looks incomplete: ${output} (${size} bytes)`);
       process.stdout.write(`captured ${theme} (${Math.round(size / 1024)} KiB)\n`);
     }
+
+    const fileManagerOutput = join(renderDir, "file-manager.png");
+    await capture(client, "corepty-dark", fileManagerOutput, "files");
+    const { size: fileManagerSize } = await stat(fileManagerOutput);
+    if (fileManagerSize < 10_000) {
+      throw new Error(`Screenshot looks incomplete: ${fileManagerOutput} (${fileManagerSize} bytes)`);
+    }
+    process.stdout.write(`captured file manager (${Math.round(fileManagerSize / 1024)} KiB)\n`);
 
     // Stop the watcher before publishing images into docs/ so it cannot reload
     // a page during a later capture.
@@ -107,6 +115,7 @@ async function main() {
       await copyFile(join(renderDir, `theme-${theme}.png`), join(docsDir, `theme-${theme}.png`));
     }
     await copyFile(join(renderDir, "theme-corepty-dark.png"), join(docsDir, "screenshot.png"));
+    await copyFile(fileManagerOutput, join(docsDir, "file-manager.png"));
     process.stdout.write("updated docs/screenshot.png\n");
   } finally {
     if (client) {
@@ -186,8 +195,8 @@ async function waitForBrowser(debugPort, browser, readError) {
   throw new Error(`Timed out waiting for Edge DevTools.\n${readError()}`);
 }
 
-async function capture(client, theme, output) {
-  const url = `${origin}/scripts/showcase.html?theme=${encodeURIComponent(theme)}`;
+async function capture(client, theme, output, scene) {
+  const url = `${origin}/scripts/showcase.html?theme=${encodeURIComponent(theme)}&scene=${encodeURIComponent(scene)}`;
   const loaded = client.waitForEvent("Page.loadEventFired", 15_000);
   const navigation = await client.send("Page.navigate", { url });
   if (navigation.errorText) throw new Error(`Could not load ${theme}: ${navigation.errorText}`);

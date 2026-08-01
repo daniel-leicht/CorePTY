@@ -11,10 +11,12 @@ import { ringBell, termOptions } from "./settings";
 import type { LaunchSpec } from "./spec";
 import { SgrDimFilter } from "./dimfix";
 import { escapeHtml, uuid } from "./util";
+import type { AppTab, TabStatusInfo } from "./tab";
 
 export type SessionStatus = "connecting" | "connected" | "exited" | "error";
 
-export class TerminalSession {
+export class TerminalSession implements AppTab {
+  readonly tabType = "terminal" as const;
   info: SessionInfo | null = null;
   status: SessionStatus = "connecting";
   alive = true;
@@ -257,6 +259,16 @@ export class TerminalSession {
 
   getSelection(): string {
     return this.term.getSelection();
+  }
+
+  statusInfo(): TabStatusInfo {
+    return {
+      kind: this.kind === "local" ? "local" : this.kind.toUpperCase(),
+      context: this.osTitle && this.osTitle !== this.title ? this.osTitle : undefined,
+      metrics: this.alive
+        ? `${this.term.cols} × ${this.term.rows} · ${this.renderer === "webgl" ? "WebGL" : "DOM"}`
+        : undefined,
+    };
   }
 
   markExited(code: number | null): void {

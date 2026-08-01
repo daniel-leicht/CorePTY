@@ -16,7 +16,39 @@ markCaptureStage("module-loaded");
 
 const params = new URLSearchParams(location.search);
 const theme = params.get("theme") ?? "corepty-dark";
+const scene = params.get("scene") ?? "terminal";
 const sessionIds: string[] = [];
+
+const leftLocation = {
+  provider: "local",
+  path: "C:\\Projects\\CorePTY",
+  token: "demo:left",
+};
+const rightLocation = {
+  provider: "local",
+  path: "C:\\Users\\dev\\Downloads",
+  token: "demo:right",
+};
+const demoEntries = {
+  "demo:left": [
+    demoEntry(".github", "directory", true, null, 1785517260000),
+    demoEntry("docs", "directory", true, null, 1785516840000),
+    demoEntry("src", "directory", true, null, 1785517320000),
+    demoEntry("src-tauri", "directory", true, null, 1785517140000),
+    demoEntry("package.json", "file", false, 1426, 1785517200000),
+    demoEntry("README.md", "file", false, 12184, 1785517100000),
+    demoEntry("LICENSE", "file", false, 35150, 1784090400000),
+    demoEntry("vite.config.ts", "file", false, 1173, 1785517020000),
+  ],
+  "demo:right": [
+    demoEntry("Screenshots", "directory", true, null, 1785516500000, "demo:right"),
+    demoEntry("Releases", "directory", true, null, 1785516200000, "demo:right"),
+    demoEntry("corepty-0.3.8-x64-setup.exe", "file", false, 8_734_912, 1785517300000, "demo:right"),
+    demoEntry("corepty-portable.zip", "file", false, 7_218_432, 1785517240000, "demo:right"),
+    demoEntry("terminal-themes.png", "file", false, 1_842_205, 1785516800000, "demo:right"),
+    demoEntry("release-notes.txt", "file", false, 4821, 1785516600000, "demo:right"),
+  ],
+} as const;
 
 const folders = [
   { id: "production", name: "Production", parentId: null },
@@ -98,6 +130,24 @@ mockIPC(
         ];
       case "host_os":
         return "windows";
+      case "files_home":
+        return leftLocation;
+      case "files_roots":
+        return [
+          { label: "Home", location: leftLocation },
+          { label: "C:", location: { provider: "local", path: "C:\\", token: "demo:root" } },
+        ];
+      case "files_resolve": {
+        const path = (args as { path?: string } | undefined)?.path ?? "";
+        return path.includes("Downloads") ? rightLocation : leftLocation;
+      }
+      case "files_list": {
+        const token = (args as { token?: string } | undefined)?.token ?? "demo:left";
+        const location = token === "demo:right" ? rightLocation : leftLocation;
+        return { location, parent: null, entries: demoEntries[token as keyof typeof demoEntries] ?? [] };
+      }
+      case "files_conflicts":
+        return [];
       case "folders_load":
         return folders;
       case "sessions_load":
@@ -133,6 +183,25 @@ const root = document.querySelector<HTMLDivElement>("#app")!;
 const app = new App(root);
 await app.mount();
 markCaptureStage("app-mounted");
+
+if (scene === "files") await renderFileManagerShowcase();
+else await renderTerminalShowcase();
+
+async function renderFileManagerShowcase(): Promise<void> {
+  app.newFileManager([leftLocation.path, rightLocation.path]);
+  markCaptureStage("file-manager-opened");
+  for (let attempt = 0; attempt < 80; attempt += 1) {
+    if (document.querySelectorAll(".fm-row").length >= 12) break;
+    await new Promise<void>((resolve) => setTimeout(resolve, 25));
+  }
+  const firstSource = document.querySelector<HTMLElement>('.fm-panel[data-panel="0"] .fm-row:nth-child(3)');
+  firstSource?.click();
+  await new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
+  markCaptureStage("file-manager-ready");
+  document.documentElement.dataset.showcaseReady = "true";
+}
+
+async function renderTerminalShowcase(): Promise<void> {
 
 // A background local tab makes the tab strip visibly useful; the active SSH
 // tab matches the saved connection highlighted by the terminal content.
@@ -202,6 +271,28 @@ active.term.refresh(0, active.term.rows - 1);
 // fit/repaint before the headless browser takes its screenshot.
 await new Promise<void>((resolve) => setTimeout(resolve, 350));
 document.documentElement.dataset.showcaseReady = "true";
+}
+
+function demoEntry(
+  name: string,
+  kind: "directory" | "file",
+  isDirectory: boolean,
+  size: number | null,
+  modified: number,
+  parent = "demo:left"
+) {
+  return {
+    name,
+    path: `${parent === "demo:left" ? leftLocation.path : rightLocation.path}\\${name}`,
+    token: `${parent}:${name}`,
+    kind,
+    isDirectory,
+    size,
+    modified,
+    hidden: name.startsWith("."),
+    readonly: false,
+  };
+}
 
 function showcaseOutput(): string {
   const e = "\x1b[";

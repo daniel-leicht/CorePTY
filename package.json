@@ -3,7 +3,7 @@
   "private": true,
   "version": "0.3.8",
   "type": "module",
-  "description": "CorePTY — a modern multi-terminal client (local shells, SSH, Telnet)",
+  "description": "CorePTY — a modern terminal workspace with SSH, Telnet, and dual-pane file management",
   "license": "GPL-3.0-or-later",
   "engines": {
     "node": ">=20"

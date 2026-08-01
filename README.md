@@ -3,7 +3,7 @@
 
   <h1>CorePTY</h1>
 
-  <p><strong>A cross-platform terminal client for local shells, SSH, and Telnet.</strong></p>
+  <p><strong>A cross-platform terminal workspace with local shells, SSH, Telnet, and dual-pane file management.</strong></p>
 
   <p>
     <a href="https://github.com/daniel-leicht/CorePTY/actions/workflows/ci.yml"><img src="https://github.com/daniel-leicht/CorePTY/actions/workflows/ci.yml/badge.svg" alt="Continuous integration status" /></a>
@@ -18,10 +18,10 @@
 
 ## Overview
 
-CorePTY is a tabbed desktop terminal built with [Tauri 2](https://tauri.app/),
+CorePTY is a tabbed desktop terminal workspace built with [Tauri 2](https://tauri.app/),
 [xterm.js](https://xtermjs.org/), and Rust. It provides local pseudo-terminal
-sessions, SSH connections, and Telnet connections in one interface without
-bundling a Chromium runtime.
+sessions, SSH connections, Telnet connections, and local file management in one
+interface without bundling a Chromium runtime.
 
 Connection profiles can be organized into nested folders. Saved passwords and
 private-key passphrases are stored in the operating system keychain rather than
@@ -41,9 +41,28 @@ in the profile file.
   connection colors.
 - Dynamic terminal titles, tab duplication, reconnect support, search, and
   configurable right-click behavior.
+- A modern Commander-style file-manager tab with two independently navigable
+  panels, sortable columns, history, path entry, filtering, and hidden-file
+  controls.
+- Mouse and keyboard file workflows: multi-selection, contextual menus,
+  cross-panel drag and drop, clipboard operations, text/image preview, and
+  cancellable copy or move progress.
+- Cross-platform file operations including rename, folder creation, conflict
+  policies, operating-system Trash/Recycle Bin, and explicit permanent delete.
 - Eight built-in application and terminal themes.
 - Configurable fonts, cursor styles, scrollback, bell behavior, minimum
   contrast, and copy-on-select.
+
+### File manager
+
+The file manager keeps the speed and two-panel structure of classic Commander
+tools while using CorePTY's current theme and modern desktop conventions. It is
+local-only today; each panel already uses an independent provider/location model
+so a later SFTP provider can support local-to-remote and remote-to-remote tabs.
+
+<div align="center">
+  <img src="docs/file-manager.png" alt="CorePTY dual-pane file manager" width="840" />
+</div>
 
 ## Downloads
 
@@ -75,6 +94,10 @@ a security prompt on first launch.
 - Windows administrator tabs use an elevated broker connected through named
   pipes restricted to Administrators and SYSTEM. The main CorePTY process can
   send input to that elevated shell by design.
+- Local file-manager commands run with the normal CorePTY process permissions.
+  Native paths remain in the Rust backend as opaque tokens instead of being
+  assembled in the webview, and file-manager tabs do not inherit terminal
+  elevation.
 - Telnet provides no transport encryption or server authentication. Use it only
   with systems and networks where cleartext access is acceptable.
 
@@ -86,9 +109,10 @@ On macOS, use Command in place of Control for shortcuts that use `Ctrl`.
 |---|---|
 | `Ctrl+Shift+T` | Open the default local shell |
 | `Ctrl+Shift+N` | Open the connection dialog |
+| `Ctrl+Shift+E` | Open a local file-manager tab |
 | `Ctrl+Shift+W` | Close the active tab |
-| `Ctrl+Shift+R` | Reconnect the active session |
-| `Ctrl+Shift+F` | Search the terminal buffer |
+| `Ctrl+Shift+R` | Reconnect the active terminal session |
+| `Ctrl+Shift+F` | Search the active terminal buffer |
 | `Ctrl+Shift+C` | Copy the current selection |
 | `Ctrl+Shift+V` | Paste through the terminal input handler |
 | `Ctrl+,` | Open settings |
@@ -96,6 +120,29 @@ On macOS, use Command in place of Control for shortcuts that use `Ctrl`.
 | `Ctrl+PageUp` / `Ctrl+PageDown` | Select the previous or next tab |
 | Double-tap `Shift` | Open the tab switcher |
 | Double-click a tab | Set a custom tab title |
+
+Within a file-manager panel:
+
+| Shortcut | Action |
+|---|---|
+| `Tab` | Switch active panel |
+| Arrow keys, `Page Up` / `Page Down`, `Home` / `End` | Move through files |
+| `Enter` / double-click | Open a folder or file |
+| `Backspace` / `Alt+Up` | Open the parent folder |
+| `Alt+Left` / `Alt+Right` | Navigate folder history |
+| `Insert` / `Space` | Toggle selection (`Insert` advances to the next item) |
+| `Ctrl+A` | Select all visible items |
+| `Ctrl+F` | Filter the current folder |
+| `Ctrl+C` / `Ctrl+X` / `Ctrl+V` | Copy, cut, or paste selected files |
+| `F2` | Rename one selected item |
+| `F3` | Preview a text file or image |
+| `F5` / `F6` | Copy or move to the opposite panel |
+| `F7` | Create a folder |
+| `F8` / `Delete` | Move selected items to Trash or Recycle Bin |
+| `Shift+F8` / `Shift+Delete` | Permanently delete selected items after confirmation |
+
+Dragging between panels copies by default; hold `Shift` while dropping to move.
+Ctrl/Command-click and Shift-click provide conventional mouse multi-selection.
 
 ## Themes
 
@@ -132,11 +179,12 @@ the terminal palette.
 | SSH | `russh` with the `ring` cryptography backend |
 | Telnet | CorePTY's bounded IAC parser over Tokio TCP |
 | Credentials | `keyring` with native platform backends |
+| File manager | Provider-neutral Rust filesystem API with opaque native paths, streamed operation progress, and OS Trash/Recycle Bin integration |
 | Profiles and settings | Atomically replaced TOML and JSON files in the application config directory |
 
 The frontend and native session drivers communicate through Tauri commands and
-binary-safe events. Local, SSH, Telnet, and elevated sessions share one lifecycle
-and input abstraction.
+binary-safe events. Terminal sessions and file managers implement a shared tab
+lifecycle while keeping PTY and filesystem capabilities separated.
 
 ## Build from source
 

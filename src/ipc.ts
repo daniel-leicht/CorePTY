@@ -1,5 +1,5 @@
 // Thin, typed wrappers over the Tauri IPC bridge.
-import { invoke } from "@tauri-apps/api/core";
+import { Channel, invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 
@@ -79,6 +79,98 @@ export interface Folder {
   parentId?: string | null;
 }
 
+// ---- provider-neutral file manager ---------------------------------------
+
+export interface FileLocation {
+  provider: "local" | string;
+  /** Human-readable native path. Never use this value for path concatenation. */
+  path: string;
+  /** Opaque provider path passed back to the backend for every operation. */
+  token: string;
+}
+
+export interface FileRoot {
+  label: string;
+  location: FileLocation;
+}
+
+export type FileEntryKind = "directory" | "file" | "symlink" | "other";
+
+export interface FileEntry {
+  name: string;
+  path: string;
+  token: string;
+  kind: FileEntryKind;
+  isDirectory: boolean;
+  size: number | null;
+  /** Milliseconds since the Unix epoch. */
+  modified: number | null;
+  hidden: boolean;
+  readonly: boolean;
+}
+
+export interface DirectoryListing {
+  location: FileLocation;
+  parent: FileLocation | null;
+  entries: FileEntry[];
+}
+
+export interface FileConflict {
+  name: string;
+  path: string;
+  sameSource: boolean;
+}
+
+export interface FilePreview {
+  name: string;
+  path: string;
+  kind: "text" | "image" | "unavailable";
+  mime: string | null;
+  content: string | null;
+  size: number;
+  truncated: boolean;
+  message: string | null;
+}
+
+export type FileOperationKind = "copy" | "move";
+export type ConflictPolicy = "error" | "replace" | "skip" | "keep_both";
+
+export interface FileOperationRequest {
+  id: string;
+  kind: FileOperationKind;
+  sources: string[];
+  destination: string;
+  conflictPolicy: ConflictPolicy;
+}
+
+export type FileOperationEvent =
+  | { event: "started"; id: string }
+  | { event: "planned"; id: string; totalItems: number; totalBytes: number }
+  | {
+      event: "progress";
+      id: string;
+      current: string;
+      completedItems: number;
+      completedBytes: number;
+      totalItems: number;
+      totalBytes: number;
+    }
+  | {
+      event: "finished";
+      id: string;
+      completedItems: number;
+      completedBytes: number;
+      skippedItems: number;
+    }
+  | { event: "failed"; id: string; message: string };
+
+export interface FileOperationResult {
+  id: string;
+  completedItems: number;
+  completedBytes: number;
+  skippedItems: number;
+}
+
 export const api = {
   ping: () => invoke<string>("ping"),
 
@@ -101,6 +193,28 @@ export const api = {
   listShells: () => invoke<ShellInfo[]>("list_local_shells"),
   /** Host OS: "windows" | "macos" | "linux" | … */
   hostOs: () => invoke<string>("host_os"),
+
+  filesHome: () => invoke<FileLocation>("files_home"),
+  filesRoots: () => invoke<FileRoot[]>("files_roots"),
+  filesResolve: (path: string, baseToken?: string) =>
+    invoke<FileLocation>("files_resolve", { path, baseToken }),
+  filesList: (token: string) => invoke<DirectoryListing>("files_list", { token }),
+  filesConflicts: (sources: string[], destination: string) =>
+    invoke<FileConflict[]>("files_conflicts", { sources, destination }),
+  filesCreateDirectory: (parent: string, name: string) =>
+    invoke<FileLocation>("files_create_directory", { parent, name }),
+  filesRename: (token: string, name: string) =>
+    invoke<FileLocation>("files_rename", { token, name }),
+  filesTrash: (tokens: string[]) => invoke<void>("files_trash", { tokens }),
+  filesDelete: (tokens: string[]) => invoke<void>("files_delete", { tokens }),
+  filesOpen: (token: string) => invoke<void>("files_open", { token }),
+  filesPreview: (token: string) => invoke<FilePreview>("files_preview", { token }),
+  filesOperate: (request: FileOperationRequest, onMessage: (event: FileOperationEvent) => void) => {
+    const onEvent = new Channel<FileOperationEvent>();
+    onEvent.onmessage = onMessage;
+    return invoke<FileOperationResult>("files_operate", { request, onEvent });
+  },
+  filesCancel: (id: string) => invoke<boolean>("files_cancel", { id }),
 
   secretSet: (id: string, secret: string) => invoke<void>("secret_set", { id, secret }),
   secretGet: (id: string) => invoke<string | null>("secret_get", { id }),
@@ -127,6 +241,17 @@ export async function pickKeyFile(): Promise<string | null> {
     multiple: false,
     directory: false,
     title: "Select SSH private key",
+  });
+  return typeof selected === "string" ? selected : null;
+}
+
+/** Native cross-platform folder picker used by either file-manager panel. */
+export async function pickDirectory(defaultPath?: string): Promise<string | null> {
+  const selected = await open({
+    multiple: false,
+    directory: true,
+    title: "Choose folder",
+    defaultPath,
   });
   return typeof selected === "string" ? selected : null;
 }
