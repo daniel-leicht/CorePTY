@@ -581,6 +581,7 @@ export class App {
       session.onReconnect = () => void this.relaunch(session);
     }
     session.onClose = () => void this.closeTab(session);
+    this.closeTabList(); // its snapshot of the tabs is now stale
     this.tabs.push(session);
     this.stageEl.appendChild(session.element);
     this.renderTabs();
@@ -649,6 +650,7 @@ export class App {
     }
     session.dispose();
     this.tabs.splice(idx, 1);
+    this.closeTabList(); // its snapshot of the tabs is now stale
 
     const wasActive = this.active === session;
     if (wasActive) this.active = null;
@@ -816,7 +818,12 @@ export class App {
   private updateTabOverflow(): void {
     const strip = this.tabsListEl;
     const max = strip.scrollWidth - strip.clientWidth;
-    const overflowing = max > 1;
+    // While shown, the controls take room from the strip. Judge whether the
+    // tabs would fit once they're gone, or they'd never go away.
+    const controls = this.tabbarEl.classList.contains("is-overflowing")
+      ? this.overflowControlsWidth()
+      : 0;
+    const overflowing = max - controls > 1;
     const left = overflowing && strip.scrollLeft > 1;
     const right = overflowing && strip.scrollLeft < max - 1;
     this.tabbarEl.classList.toggle("is-overflowing", overflowing);
@@ -824,6 +831,16 @@ export class App {
     this.tabbarEl.classList.toggle("is-overflow-right", right);
     this.tabbarEl.querySelector<HTMLButtonElement>("#tab-scroll-left")!.disabled = !left;
     this.tabbarEl.querySelector<HTMLButtonElement>("#tab-scroll-right")!.disabled = !right;
+  }
+
+  /** Width the visible overflow controls (and their gaps) take from the strip. */
+  private overflowControlsWidth(): number {
+    const gap = parseFloat(getComputedStyle(this.tabbarEl).columnGap) || 0;
+    let width = 0;
+    this.tabbarEl.querySelectorAll<HTMLElement>(".tab-scroll, .tab-list-btn").forEach((el) => {
+      width += el.offsetWidth + gap;
+    });
+    return width;
   }
 
   /** Scroll the strip just enough to show `tab` whole, clear of the edge fades. */
@@ -843,7 +860,7 @@ export class App {
   /** The "all tabs" dropdown: every tab, reachable however far the strip scrolls. */
   private toggleTabList(anchor: HTMLElement): void {
     if (document.querySelector(".tab-list")) {
-      this.closeTabList();
+      this.closeTabList(true);
       return;
     }
     const menu = document.createElement("div");
@@ -871,19 +888,36 @@ export class App {
     const r = anchor.getBoundingClientRect();
     menu.style.top = `${r.bottom + 6}px`;
     menu.style.left = `${Math.max(8, r.right - menu.offsetWidth)}px`;
-    menu.querySelector(".is-current")?.scrollIntoView({ block: "nearest" });
+    // Keyboard users land on the current tab; focusing also scrolls it into view.
+    const buttons = Array.from(menu.querySelectorAll<HTMLButtonElement>(".tab-list__item"));
+    (menu.querySelector<HTMLButtonElement>(".is-current") ?? buttons[0])?.focus();
 
     const onDown = (e: MouseEvent) => {
       // Clicks on the anchor fall through to its own toggle handler.
       if (!menu.contains(e.target as Node) && !anchor.contains(e.target as Node)) {
-        this.closeTabList();
+        this.closeTabList(true);
       }
     };
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") {
+      const at = buttons.indexOf(document.activeElement as HTMLButtonElement);
+      const target =
+        e.key === "ArrowDown"
+          ? buttons[(at + 1) % buttons.length]
+          : e.key === "ArrowUp"
+            ? buttons[(at - 1 + buttons.length) % buttons.length]
+            : e.key === "Home"
+              ? buttons[0]
+              : e.key === "End"
+                ? buttons[buttons.length - 1]
+                : null;
+      if (target) {
         e.preventDefault();
         e.stopPropagation();
-        this.closeTabList();
+        target.focus();
+      } else if (e.key === "Escape" || e.key === "Tab") {
+        e.preventDefault();
+        e.stopPropagation();
+        this.closeTabList(true);
       }
     };
     this.tabListCleanup = () => {
@@ -894,10 +928,13 @@ export class App {
     document.addEventListener("keydown", onKey, true);
   }
 
-  private closeTabList(): void {
+  /** `restoreFocus`: hand the keyboard back to the active tab (Esc, click-away). */
+  private closeTabList(restoreFocus = false): void {
+    const wasOpen = this.tabListCleanup !== null;
     this.tabListCleanup?.();
     this.tabListCleanup = null;
     document.querySelectorAll(".tab-list").forEach((m) => m.remove());
+    if (wasOpen && restoreFocus) this.active?.focus();
   }
 
   /** Clear any in-progress drag state + drop indicators. */

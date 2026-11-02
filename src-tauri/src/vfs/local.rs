@@ -335,11 +335,31 @@ fn rename(from: &Path, to: &Path, overwrite: bool) -> io::Result<()> {
         ));
     }
     if existing.is_dir() || is_directory_link(&existing) {
-        // Nothing can be renamed over a folder; it has to go first.
-        remove(to, true)?;
-        return fs::rename(from, to);
+        return replace_folder(from, to);
     }
     rename_over(from, to, &existing)
+}
+
+/// Nothing can be renamed over a folder. Move it aside, put the new entry in
+/// its place, then delete the old one: both renames are single steps, so a
+/// failure (a file held open inside, say) leaves the old folder whole rather
+/// than half-deleted.
+fn replace_folder(from: &Path, to: &Path) -> io::Result<()> {
+    let mut aside_name = to
+        .file_name()
+        .unwrap_or_else(|| OsStr::new("item"))
+        .to_os_string();
+    aside_name.push(format!(".corepty-{}.old", uuid::Uuid::new_v4().simple()));
+    let aside = to.with_file_name(aside_name);
+    fs::rename(to, &aside)?;
+    if let Err(e) = fs::rename(from, to) {
+        let _ = fs::rename(&aside, to);
+        return Err(e);
+    }
+    // The new entry is in place; removing the old folder is cleanup. Whatever
+    // can't be deleted (a file still open) stays behind under the aside name.
+    let _ = remove(&aside, true);
+    Ok(())
 }
 
 /// Replace a file in one step, so the old one survives if anything fails.
@@ -553,6 +573,61 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(fs::read(&folder).unwrap(), b"file");
+        assert_eq!(
+            fs::read_dir(temp.path()).unwrap().count(),
+            1,
+            "the old folder should be gone, not left aside"
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_folder_with_a_locked_file_is_never_half_replaced() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let temp = tempdir().unwrap();
+        let (file, folder) = (temp.path().join("item.txt"), temp.path().join("item"));
+        fs::write(&file, b"file").unwrap();
+        fs::create_dir(&folder).unwrap();
+        for name in ["a.txt", "locked.txt", "z.txt"] {
+            fs::write(folder.join(name), name).unwrap();
+        }
+        let lock = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(folder.join("locked.txt"))
+            .unwrap();
+        let result = LocalFs.rename(&vpath(&file), &vpath(&folder), true).await;
+        drop(lock);
+        match result {
+            Err(_) => {
+                for name in ["a.txt", "locked.txt", "z.txt"] {
+                    assert_eq!(fs::read(folder.join(name)).unwrap(), name.as_bytes());
+                }
+                assert_eq!(fs::read(&file).unwrap(), b"file");
+            }
+            Ok(()) => assert_eq!(fs::read(&folder).unwrap(), b"file"),
+        }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn removing_a_junction_leaves_its_target_alone() {
+        let temp = tempdir().unwrap();
+        let real = temp.path().join("real");
+        fs::create_dir(&real).unwrap();
+        fs::write(real.join("keep.txt"), b"keep").unwrap();
+        let junction = temp.path().join("link");
+        let made = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&junction)
+            .arg(&real)
+            .output()
+            .unwrap();
+        assert!(made.status.success(), "mklink /J failed");
+
+        LocalFs.remove(&vpath(&junction), true).await.unwrap();
+        assert!(!junction.exists());
+        assert_eq!(fs::read(real.join("keep.txt")).unwrap(), b"keep");
     }
 
     #[cfg(windows)]

@@ -1161,7 +1161,7 @@ fn commit_temporary_file(
         };
         return match replace_strategy(&metadata) {
             ReplaceStrategy::RenameOver => rename_over(temporary, target, &metadata),
-            ReplaceStrategy::RemoveFirst => remove_then_commit(temporary, target),
+            ReplaceStrategy::MoveAside => replace_folder(temporary, target),
         };
     }
     fs::rename(temporary, target)
@@ -1177,13 +1177,14 @@ enum ReplaceStrategy {
     /// Rename the new copy straight over the old entry. It is a single step, so
     /// the old contents survive untouched if anything fails.
     RenameOver,
-    /// A folder can't be renamed over, so it has to be removed first.
-    RemoveFirst,
+    /// A folder can't be renamed over, so it is moved aside first and deleted
+    /// once the new copy is in place.
+    MoveAside,
 }
 
 fn replace_strategy(target: &Metadata) -> ReplaceStrategy {
     if target.is_dir() || is_directory_link(target) {
-        ReplaceStrategy::RemoveFirst
+        ReplaceStrategy::MoveAside
     } else {
         ReplaceStrategy::RenameOver
     }
@@ -1228,20 +1229,35 @@ fn rename_over(
         })
 }
 
-fn remove_then_commit(temporary: &Path, target: &Path) -> Result<Option<PathBuf>, String> {
-    if let Err(error) = remove_path(target) {
+/// Replace a folder (or directory link): move it aside, put the new copy in
+/// its place, then delete the old one. Both renames are single steps, so a
+/// failure (say, a file held open inside the folder) leaves the old folder
+/// whole instead of half-deleted.
+fn replace_folder(temporary: &Path, target: &Path) -> Result<Option<PathBuf>, String> {
+    let aside = aside_path(target);
+    let failed = |e: std::io::Error| {
         let _ = fs::remove_file(temporary);
-        return Err(error);
+        format!("could not replace {}: {e}", target.to_string_lossy())
+    };
+    fs::rename(target, &aside).map_err(failed)?;
+    if let Err(e) = fs::rename(temporary, target) {
+        let _ = fs::rename(&aside, target);
+        return Err(failed(e));
     }
-    fs::rename(temporary, target)
-        .map(|()| Some(target.to_path_buf()))
-        .map_err(|e| {
-            let _ = fs::remove_file(temporary);
-            format!(
-                "removed {} but could not put the new copy in its place: {e}",
-                target.to_string_lossy()
-            )
-        })
+    // The new copy is in place; removing the old folder is cleanup. Whatever
+    // can't be deleted (a file still open) stays behind under the aside name.
+    let _ = remove_path(&aside);
+    Ok(Some(target.to_path_buf()))
+}
+
+/// `name.corepty-<uuid>.old` beside `target` (same folder, so same volume).
+fn aside_path(target: &Path) -> PathBuf {
+    let mut name = target
+        .file_name()
+        .unwrap_or_else(|| OsStr::new("item"))
+        .to_os_string();
+    name.push(format!(".corepty-{}.old", Uuid::new_v4().simple()));
+    target.with_file_name(name)
 }
 
 fn unique_target(path: &Path) -> PathBuf {
@@ -1312,6 +1328,10 @@ fn remove_path(path: &Path) -> Result<(), String> {
     make_writable_for_deletion(path, &metadata)?;
     let result = if metadata.is_dir() && !metadata.file_type().is_symlink() {
         fs::remove_dir_all(path)
+    } else if is_directory_link(&metadata) {
+        // Windows junctions and directory symlinks refuse DeleteFile; they're
+        // removed like an empty folder, which never touches their target.
+        fs::remove_dir(path)
     } else {
         fs::remove_file(path)
     };
@@ -1547,7 +1567,7 @@ mod tests {
     }
 
     #[test]
-    fn files_are_replaced_by_renaming_over_and_folders_by_removing_first() {
+    fn files_are_replaced_by_renaming_over_and_folders_by_moving_aside() {
         let temp = tempdir().unwrap();
         let file = temp.path().join("file.txt");
         let folder = temp.path().join("folder");
@@ -1559,7 +1579,7 @@ mod tests {
         );
         assert_eq!(
             replace_strategy(&fs::symlink_metadata(&folder).unwrap()),
-            ReplaceStrategy::RemoveFirst
+            ReplaceStrategy::MoveAside
         );
     }
 
@@ -1581,7 +1601,7 @@ mod tests {
     }
 
     #[test]
-    fn replacing_a_folder_with_a_file_removes_the_folder_first() {
+    fn replacing_a_folder_with_a_file_leaves_nothing_behind() {
         let source_root = tempdir().unwrap();
         let destination_root = tempdir().unwrap();
         let source = source_root.path().join("item");
@@ -1593,6 +1613,71 @@ mod tests {
 
         copy_path(&source, &target, ConflictPolicy::Replace, &mut context).unwrap();
         assert_eq!(fs::read(&target).unwrap(), b"file now");
+        assert_eq!(
+            fs::read_dir(destination_root.path()).unwrap().count(),
+            1,
+            "the old folder should be gone, not left aside"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_junction_can_be_replaced_without_touching_its_target() {
+        let root = tempdir().unwrap();
+        let real = root.path().join("real");
+        fs::create_dir(&real).unwrap();
+        fs::write(real.join("keep.txt"), b"keep").unwrap();
+        let destination = root.path().join("dest");
+        fs::create_dir(&destination).unwrap();
+        let junction = destination.join("report.txt");
+        let made = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&junction)
+            .arg(&real)
+            .output()
+            .unwrap();
+        assert!(made.status.success(), "mklink /J failed");
+        let source = root.path().join("report.txt");
+        fs::write(&source, b"report").unwrap();
+        let mut context = test_context(measure(&source).unwrap());
+
+        copy_path(&source, &junction, ConflictPolicy::Replace, &mut context).unwrap();
+        assert_eq!(fs::read(&junction).unwrap(), b"report");
+        assert_eq!(fs::read(real.join("keep.txt")).unwrap(), b"keep");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_folder_with_a_locked_file_is_never_half_replaced() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let source_root = tempdir().unwrap();
+        let destination_root = tempdir().unwrap();
+        let source = source_root.path().join("item");
+        let target = destination_root.path().join("item");
+        fs::write(&source, b"file now").unwrap();
+        fs::create_dir(&target).unwrap();
+        for name in ["a.txt", "locked.txt", "z.txt"] {
+            fs::write(target.join(name), name).unwrap();
+        }
+        let lock = OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(target.join("locked.txt"))
+            .unwrap();
+        let mut context = test_context(measure(&source).unwrap());
+
+        let result = copy_path(&source, &target, ConflictPolicy::Replace, &mut context);
+        drop(lock);
+        match result {
+            // Either the old folder is untouched…
+            Err(_) => {
+                for name in ["a.txt", "locked.txt", "z.txt"] {
+                    assert_eq!(fs::read(target.join(name)).unwrap(), name.as_bytes());
+                }
+            }
+            // …or the new file fully replaced it.
+            Ok(_) => assert_eq!(fs::read(&target).unwrap(), b"file now"),
+        }
     }
 
     #[cfg(windows)]

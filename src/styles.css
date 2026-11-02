@@ -565,6 +565,11 @@ button {
   color: var(--text-0);
   box-shadow: inset 0 0 0 1px var(--accent-ring);
 }
+.tab-list__item:focus-visible {
+  outline: none;
+  background: var(--bg-4);
+  box-shadow: inset 0 0 0 1px var(--accent);
+}
 
 /* ---- Terminal stage ---- */
 .stage {
