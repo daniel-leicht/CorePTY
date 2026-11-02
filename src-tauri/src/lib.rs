@@ -7,12 +7,16 @@
 #[cfg(windows)]
 mod broker;
 mod commands;
+mod connections;
 mod session;
 mod store;
 mod transfer;
 mod vfs;
 
+use connections::ConnectionRegistry;
 use session::SessionManager;
+use std::sync::Arc;
+use tauri::{Emitter, Manager};
 use transfer::queue::TransferManager;
 use vfs::FsRegistry;
 
@@ -35,7 +39,18 @@ pub fn run() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .setup(|app| {
+            // A connection the server dropped is reported to the UI, which
+            // marks the tabs and panels using it.
+            let handle = app.handle().clone();
+            app.state::<ConnectionRegistry>()
+                .set_events(Arc::new(move |event| {
+                    let _ = handle.emit("ssh://connection", event);
+                }));
+            Ok(())
+        })
         .manage(SessionManager::default())
+        .manage(ConnectionRegistry::default())
         .manage(FsRegistry::default())
         .manage(TransferManager::default())
         .invoke_handler(tauri::generate_handler![
@@ -51,6 +66,7 @@ pub fn run() {
             commands::session_list,
             commands::list_local_shells,
             commands::host_os,
+            connections::ssh_connections,
             vfs::commands::fs_capabilities,
             vfs::commands::fs_home,
             vfs::commands::fs_roots,

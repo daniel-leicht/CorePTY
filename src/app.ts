@@ -474,13 +474,14 @@ export class App {
     this.updateStatus();
   }
 
-  async newSsh(form: ConnForm): Promise<void> {
+  /** `connectionId`: reuse that live connection (duplicate / reconnect) instead of logging in again. */
+  async newSsh(form: ConnForm, connectionId?: string): Promise<void> {
     const title = form.name || `${form.username}@${form.host}`;
     const session = new TerminalSession("ssh", title, "ssh");
     session.spec = { kind: "ssh", form };
     const { id, cols, rows } = this.beginSession(session);
     try {
-      const info = await api.createSsh(this.sshOptions(form, id, cols, rows));
+      const info = await api.createSsh(this.sshOptions(form, id, cols, rows, connectionId));
       session.attach(info);
     } catch (err) {
       this.byId.delete(id);
@@ -514,7 +515,13 @@ export class App {
     this.addTab(tab);
   }
 
-  private sshOptions(form: ConnForm, id: string, cols: number, rows: number): SshConnectOptions {
+  private sshOptions(
+    form: ConnForm,
+    id: string,
+    cols: number,
+    rows: number,
+    connectionId?: string
+  ): SshConnectOptions {
     const auth =
       form.authType === "key"
         ? { type: "key" as const, keyPath: form.keyPath, passphrase: form.passphrase || undefined }
@@ -528,6 +535,7 @@ export class App {
       cols,
       rows,
       title: form.name || `${form.username}@${form.host}`,
+      connectionId,
     };
   }
 
@@ -538,6 +546,9 @@ export class App {
   private async relaunch(session: TerminalSession): Promise<void> {
     const spec = session.spec;
     if (!spec) return;
+    // Reattach to the same SSH connection if something else (another tab, a
+    // file panel) kept it up; the backend logs in afresh when it's gone.
+    const connectionId = session.info?.connectionId;
     if (session.info) {
       // Await teardown so the old backend session is gone before we spin up its
       // replacement — otherwise the close races the new create().
@@ -557,7 +568,9 @@ export class App {
           session.attach(await api.createLocal({ id, shell: spec.shell, cols, rows }));
         }
       } else if (spec.kind === "ssh") {
-        session.attach(await api.createSsh(this.sshOptions(spec.form, id, cols, rows)));
+        session.attach(
+          await api.createSsh(this.sshOptions(spec.form, id, cols, rows, connectionId))
+        );
       } else {
         session.attach(await api.createTelnet(this.telnetOptions(spec.form, id, cols, rows)));
       }
@@ -1000,7 +1013,7 @@ export class App {
     if (spec.kind === "local") {
       if (spec.elevated) void this.newLocalElevated(spec.shell);
       else void this.newLocal(spec.shell);
-    } else if (spec.kind === "ssh") void this.newSsh(spec.form);
+    } else if (spec.kind === "ssh") void this.newSsh(spec.form, session.info?.connectionId);
     else void this.newTelnet(spec.form);
   }
 

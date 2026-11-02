@@ -9,6 +9,8 @@ export interface SessionInfo {
   id: string;
   kind: SessionKind;
   title: string;
+  /** SSH: the shared connection the shell runs on (valid once connected). */
+  connectionId?: string;
 }
 
 /** A local shell id — dynamic per OS (see `api.listShells`); "custom" runs an arbitrary command. */
@@ -46,6 +48,20 @@ export interface SshConnectOptions {
   cols: number;
   rows: number;
   title?: string;
+  /** Open the shell on this connection (no new login) while it is still up. */
+  connectionId?: string;
+}
+
+/** A live SSH connection, shared by terminal tabs and file panels. */
+export interface SshConnectionView {
+  id: string;
+  /** `user@host` (with `:port` when not 22). */
+  label: string;
+  host: string;
+  port: number;
+  username: string;
+  /** Shells and file panels currently using it. */
+  users: number;
 }
 
 export interface TelnetConnectOptions {
@@ -296,6 +312,8 @@ export const api = {
 
   /** Local shells available on this OS. */
   listShells: () => invoke<ShellInfo[]>("list_local_shells"),
+  /** Live SSH connections (shared by terminal tabs and file panels). */
+  sshConnections: () => invoke<SshConnectionView[]>("ssh_connections"),
   /** Host OS: "windows" | "macos" | "linux" | … */
   hostOs: () => invoke<string>("host_os"),
 
