@@ -37,6 +37,7 @@ type Hook = Arc<dyn Fn() + Send + Sync>;
 pub struct MemFs {
     nodes: Arc<Mutex<BTreeMap<Vec<u8>, Node>>>,
     reads: AtomicU64,
+    lstats: AtomicU64,
     first_read_hook: Mutex<Option<Hook>>,
 }
 
@@ -100,6 +101,20 @@ impl MemFs {
     /// How many times file contents were opened for reading.
     pub fn reads(&self) -> u64 {
         self.reads.load(Ordering::SeqCst)
+    }
+
+    /// How many `lstat` calls were made (one per remote round trip on SFTP).
+    pub fn lstats(&self) -> u64 {
+        self.lstats.load(Ordering::SeqCst)
+    }
+
+    fn meta_at(&self, path: &VPath) -> io::Result<Meta> {
+        let key = key(path)?;
+        let nodes = self.nodes.lock().unwrap();
+        nodes
+            .get(&key)
+            .map(|node| meta_of(&key, node))
+            .ok_or_else(|| not_found(&key))
     }
 
     /// Run `hook` right after the next reader hands out its first chunk, e.g.
@@ -265,16 +280,12 @@ impl Vfs for MemFs {
     }
 
     async fn stat(&self, path: &VPath) -> io::Result<Meta> {
-        self.lstat(path).await
+        self.meta_at(path)
     }
 
     async fn lstat(&self, path: &VPath) -> io::Result<Meta> {
-        let key = key(path)?;
-        let nodes = self.nodes.lock().unwrap();
-        nodes
-            .get(&key)
-            .map(|node| meta_of(&key, node))
-            .ok_or_else(|| not_found(&key))
+        self.lstats.fetch_add(1, Ordering::SeqCst);
+        self.meta_at(path)
     }
 
     async fn mkdir(&self, path: &VPath) -> io::Result<()> {

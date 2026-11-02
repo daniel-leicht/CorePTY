@@ -353,8 +353,17 @@ fn replace_folder(from: &Path, to: &Path) -> io::Result<()> {
     let aside = to.with_file_name(aside_name);
     fs::rename(to, &aside)?;
     if let Err(e) = fs::rename(from, to) {
-        let _ = fs::rename(&aside, to);
-        return Err(e);
+        return Err(match fs::rename(&aside, to) {
+            Ok(()) => e,
+            // Couldn't put it back either: say where the old folder is.
+            Err(_) => io::Error::new(
+                e.kind(),
+                format!(
+                    "{e}; the original folder is now at {}",
+                    aside.to_string_lossy()
+                ),
+            ),
+        });
     }
     // The new entry is in place; removing the old folder is cleanup. Whatever
     // can't be deleted (a file still open) stays behind under the aside name.

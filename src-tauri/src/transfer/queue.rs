@@ -361,6 +361,7 @@ async fn run_job(
         permits = reserve(&inner, running, &job, &source.id) => permits,
         _ = cancelled.wait_for(|cancelled| *cancelled) => {
             finish(&job, &sink, Err(TransferError::Cancelled));
+            prune_finished(&mut lock(&inner.jobs));
             return;
         }
     };
@@ -401,18 +402,25 @@ async fn run_job(
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut meter = SpeedMeter::default();
         let mut last_sent: Option<Snapshot> = None;
+        let mut last_speed = 0.0;
         loop {
             tokio::select! {
                 result = &mut run => break result,
                 _ = ticker.tick() => {
                     let snapshot = job.counters.snapshot();
-                    // Nothing new (e.g. while a conflict waits for the user).
-                    if last_sent.as_ref() == Some(&snapshot) {
+                    // Sample every tick, so the speed decays while a transfer stalls.
+                    let speed = meter.sample(snapshot.done.bytes, Instant::now());
+                    // Skip when nothing moved and the speed shown has settled
+                    // (or a conflict is waiting for the user).
+                    let settled = (last_speed - speed).abs() < 1.0 + last_speed * 0.05;
+                    if last_sent.as_ref() == Some(&snapshot)
+                        && (settled || job.state() == JobState::WaitingForUser)
+                    {
                         continue;
                     }
-                    let speed = meter.sample(snapshot.done.bytes, Instant::now());
                     sink(progress_event(&id, &snapshot, totals, speed));
                     last_sent = Some(snapshot);
+                    last_speed = speed;
                 }
             }
         }

@@ -7,7 +7,7 @@
 //! is merged into an existing one. Every name clash, including those deep
 //! inside a merged folder, goes to the [`ConflictResolver`].
 
-use crate::vfs::{epoch_millis, EntryKind, FsId, Meta, VName, VPath, Vfs, WriteMode};
+use crate::vfs::{epoch_millis, Entry, EntryKind, FsId, Meta, VName, VPath, Vfs, WriteMode};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -206,6 +206,61 @@ enum Decision {
     RenameTo(VName),
 }
 
+/// How one source entry is handled.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Handling {
+    /// A real folder: walk into it.
+    Folder,
+    /// A link to a folder, followed: walk into its target, copying only.
+    /// `trail` extends the link-loop guard for the walk below it.
+    FollowedFolder { trail: Vec<VPath> },
+    /// Recreate the link itself (same filesystem).
+    Link,
+    /// Copy the contents (files, and file links being followed).
+    File,
+    /// Leave it out: a broken link, a link loop, an unreadable entry, or a
+    /// device / pipe / socket (reading a pipe would hang the transfer).
+    Skip,
+}
+
+impl Handling {
+    fn walks(&self) -> bool {
+        matches!(self, Self::Folder | Self::FollowedFolder { .. })
+    }
+}
+
+/// State carried down the folder walk.
+#[derive(Debug, Clone, Default)]
+struct Walk {
+    /// Below a followed link: copy only. Moving or deleting there would take
+    /// the files out of the link's target, which the user never selected.
+    copy_only: bool,
+    /// Canonical folders where links were followed on the way down. A link
+    /// whose target contains one of them (or the folder holding the link)
+    /// leads back into the walk: a loop.
+    trail: Vec<VPath>,
+    /// 0 for the items the user picked.
+    depth: usize,
+}
+
+impl Walk {
+    fn child(&self) -> Self {
+        Self {
+            copy_only: self.copy_only,
+            trail: self.trail.clone(),
+            depth: self.depth + 1,
+        }
+    }
+
+    fn followed(&self, trail: Vec<VPath>) -> Self {
+        Self {
+            copy_only: true,
+            trail,
+            depth: self.depth + 1,
+        }
+    }
+}
+
 type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 pub struct Engine {
@@ -215,10 +270,12 @@ pub struct Engine {
     counters: Arc<Counters>,
     cancel: watch::Receiver<bool>,
     resolver: Arc<dyn ConflictResolver>,
-    /// An "apply to all" answer, reused for every later conflict.
+    /// An "apply to all" answer, reused for later conflicts of the same kind.
     sticky: Option<Resolution>,
-    /// Planned totals of every source folder, for counting renamed subtrees.
+    /// Planned totals of every walked folder, for counting renamed subtrees.
     folder_stats: HashMap<VPath, WorkStats>,
+    /// Copy buffer, allocated once per job.
+    buffer: Vec<u8>,
 }
 
 impl Engine {
@@ -239,6 +296,7 @@ impl Engine {
             resolver,
             sticky: None,
             folder_stats: HashMap::new(),
+            buffer: Vec::new(),
         }
     }
 
@@ -246,7 +304,7 @@ impl Engine {
     pub async fn plan(&mut self, sources: &[VPath]) -> Result<WorkStats, TransferError> {
         let mut total = WorkStats::default();
         for source in sources {
-            total += self.measure(source).await?;
+            total += self.measure(source, None, Walk::default()).await?;
         }
         Ok(total)
     }
@@ -269,13 +327,19 @@ impl Engine {
             )));
         }
         for source in sources {
-            self.transfer(source, destination, None).await?;
+            self.transfer(source, destination, None, None, Walk::default())
+                .await?;
         }
         Ok(())
     }
 
     fn same_fs(&self) -> bool {
         self.source.id == self.target.id
+    }
+
+    /// Whether this level of the walk moves (rather than copies) its items.
+    fn moves(&self, walk: &Walk) -> bool {
+        self.kind == TransferKind::Move && !walk.copy_only
     }
 
     fn check_cancelled(&self) -> Result<(), TransferError> {
@@ -286,30 +350,66 @@ impl Engine {
         }
     }
 
-    /// Metadata of a source entry. Links are recreated within one filesystem
-    /// but followed (their target copied) across filesystems.
-    async fn source_meta(&self, path: &VPath) -> Result<Meta, TransferError> {
-        let meta = self
-            .source
+    async fn lstat(&self, path: &VPath) -> Result<Meta, TransferError> {
+        self.source
             .fs
             .lstat(path)
             .await
-            .map_err(|e| failed("inspect", path, e))?;
-        if meta.kind == EntryKind::Symlink && !self.same_fs() {
-            return self
-                .source
-                .fs
-                .stat(path)
-                .await
-                .map_err(|e| failed("follow the link", path, e));
-        }
-        Ok(meta)
+            .map_err(|e| failed("inspect", path, e))
     }
 
-    /// Whether the transfer walks into this entry rather than copying it whole.
-    fn descends(&self, meta: &Meta) -> bool {
-        meta.kind == EntryKind::Directory
-            || (meta.kind == EntryKind::Symlink && meta.is_directory && !self.same_fs())
+    /// Decide how to handle an entry, given its own (not followed) metadata.
+    /// Links are recreated within one filesystem and followed across them.
+    async fn classify(
+        &self,
+        path: &VPath,
+        meta: Meta,
+        walk: &Walk,
+    ) -> Result<(Handling, Meta), TransferError> {
+        Ok(match meta.kind {
+            EntryKind::Directory => (Handling::Folder, meta),
+            EntryKind::File => (Handling::File, meta),
+            EntryKind::Other => (Handling::Skip, meta),
+            EntryKind::Symlink if self.same_fs() => (Handling::Link, meta),
+            EntryKind::Symlink => self.follow(path, meta, walk).await?,
+        })
+    }
+
+    /// Follow a link: its target's metadata, or Skip for a broken link or a
+    /// link back into the walk.
+    async fn follow(
+        &self,
+        path: &VPath,
+        link_meta: Meta,
+        walk: &Walk,
+    ) -> Result<(Handling, Meta), TransferError> {
+        let meta = match self.source.fs.stat(path).await {
+            Ok(meta) => meta,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                return Ok((Handling::Skip, link_meta))
+            }
+            Err(e) => return Err(failed("follow the link", path, e)),
+        };
+        if !meta.is_directory {
+            return Ok((Handling::File, meta));
+        }
+        let canonical = |path: VPath| {
+            let fs = self.source.fs.clone();
+            async move { fs.canonicalize(&path).await }
+        };
+        let target = canonical(path.clone())
+            .await
+            .map_err(|e| failed("follow the link", path, e))?;
+        let here = match path.parent() {
+            Some(parent) => canonical(parent).await.ok(),
+            None => None,
+        };
+        let mut trail = walk.trail.clone();
+        trail.extend(here);
+        if trail.iter().any(|folder| folder.starts_with(&target)) {
+            return Ok((Handling::Skip, meta));
+        }
+        Ok((Handling::FollowedFolder { trail }, meta))
     }
 
     async fn target_meta(&self, path: &VPath) -> Result<Option<Meta>, TransferError> {
@@ -320,29 +420,45 @@ impl Engine {
         }
     }
 
+    /// Plan one entry. `known` is metadata the folder listing already returned.
     fn measure<'a>(
         &'a mut self,
         path: &'a VPath,
+        known: Option<Meta>,
+        walk: Walk,
     ) -> BoxFuture<'a, Result<WorkStats, TransferError>> {
         Box::pin(async move {
             self.check_cancelled()?;
-            let meta = self.source_meta(path).await?;
+            let meta = match known {
+                Some(meta) => meta,
+                None => self.lstat(path).await?,
+            };
+            let (handling, meta) = self.classify(path, meta, &walk).await?;
             let mut stats = WorkStats {
                 items: 1,
-                bytes: meta.size.unwrap_or(0),
+                bytes: if handling == Handling::File {
+                    meta.size.unwrap_or(0)
+                } else {
+                    0
+                },
             };
-            if self.descends(&meta) {
-                let children = self
-                    .source
-                    .fs
-                    .list(path)
-                    .await
-                    .map_err(|e| failed("read", path, e))?;
-                for child in children {
-                    stats += self.measure(&child.path).await?;
-                }
-                self.folder_stats.insert(path.clone(), stats);
+            let below = match handling {
+                Handling::Folder => walk.child(),
+                Handling::FollowedFolder { trail } => walk.followed(trail),
+                _ => return Ok(stats),
+            };
+            let children = self
+                .source
+                .fs
+                .list(path)
+                .await
+                .map_err(|e| failed("read", path, e))?;
+            for child in children {
+                stats += self
+                    .measure(&child.path, Some(listed_meta(&child)), below.clone())
+                    .await?;
             }
+            self.folder_stats.insert(path.clone(), stats);
             Ok(stats)
         })
     }
@@ -355,11 +471,19 @@ impl Engine {
         })
     }
 
+    fn skip(&self, path: &VPath, meta: &Meta) -> Outcome {
+        self.counters.skipped.fetch_add(1, Ordering::Relaxed);
+        self.counters.add(self.stats_of(path, meta));
+        Outcome::Skipped
+    }
+
     fn transfer<'a>(
         &'a mut self,
         source: &'a VPath,
         destination: &'a VPath,
         name: Option<VName>,
+        known: Option<Meta>,
+        walk: Walk,
     ) -> BoxFuture<'a, Result<Outcome, TransferError>> {
         Box::pin(async move {
             self.check_cancelled()?;
@@ -373,22 +497,39 @@ impl Engine {
                 }
             };
             self.counters.set_current(&name);
-            let meta = self.source_meta(source).await?;
-            if self.same_fs() && self.descends(&meta) && self.is_inside(destination, source).await {
+            let meta = match known {
+                Some(meta) => meta,
+                None => self.lstat(source).await?,
+            };
+            let (mut handling, mut meta) = self.classify(source, meta, &walk).await?;
+            if handling == Handling::Skip {
+                return Ok(self.skip(source, &meta));
+            }
+            // Only the picked items can contain the destination: below them,
+            // the walk never leaves the folder being transferred.
+            if walk.depth == 0
+                && self.same_fs()
+                && handling.walks()
+                && self.is_inside(destination, source).await
+            {
                 return Err(TransferError::Failed(format!(
                     "{} can't be copied or moved into itself",
                     source.display()
                 )));
             }
 
-            let Some((target, placement)) = self.place(source, &meta, destination, &name).await?
+            let Some((target, placement)) = self
+                .place(source, &meta, handling.walks(), destination, &name)
+                .await?
             else {
-                self.counters.skipped.fetch_add(1, Ordering::Relaxed);
-                self.counters.add(self.stats_of(source, &meta));
-                return Ok(Outcome::Skipped);
+                return Ok(self.skip(source, &meta));
             };
 
-            if self.kind == TransferKind::Move && self.same_fs() && placement != Placement::Merge {
+            if self.moves(&walk)
+                && self.same_fs()
+                && placement != Placement::Merge
+                && !matches!(handling, Handling::FollowedFolder { .. })
+            {
                 let overwrite = placement == Placement::Overwrite;
                 // Fails across volumes (and for some type mismatches); copying
                 // and then deleting the source covers those.
@@ -404,17 +545,39 @@ impl Engine {
                 }
             }
 
-            if self.descends(&meta) {
-                return self.transfer_folder(source, &target, placement).await;
+            if handling == Handling::Link {
+                if self.copy_link(source, &target, &meta, placement).await? {
+                    return self.finish_move(source, &walk).await;
+                }
+                // This filesystem can't create the link (e.g. no symlink
+                // privilege on Windows): copy what it points to instead, as
+                // Explorer does for junctions.
+                (handling, meta) = self.follow(source, meta, &walk).await?;
+                if handling == Handling::Skip {
+                    return Ok(self.skip(source, &meta));
+                }
             }
-            if meta.kind == EntryKind::Symlink
-                && self.copy_link(source, &meta, &target, placement).await?
-            {
-                return self.finish_move(source).await;
+
+            match handling {
+                Handling::Folder => {
+                    let below = walk.child();
+                    self.transfer_folder(source, &target, placement, below, self.moves(&walk))
+                        .await
+                }
+                Handling::FollowedFolder { trail } => {
+                    // The contents are only copied; a move then removes just
+                    // the link (transfer_folder's non-recursive remove).
+                    let below = walk.followed(trail);
+                    self.transfer_folder(source, &target, placement, below, self.moves(&walk))
+                        .await
+                }
+                Handling::File => {
+                    self.copy_file(source, &meta, &target, placement == Placement::Overwrite)
+                        .await?;
+                    self.finish_move(source, &walk).await
+                }
+                Handling::Link | Handling::Skip => unreachable!("handled above"),
             }
-            self.copy_file(source, &meta, &target, placement == Placement::Overwrite)
-                .await?;
-            self.finish_move(source).await
         })
     }
 
@@ -424,6 +587,7 @@ impl Engine {
         &mut self,
         source: &VPath,
         meta: &Meta,
+        walks: bool,
         destination: &VPath,
         name: &VName,
     ) -> Result<Option<(VPath, Placement)>, TransferError> {
@@ -443,16 +607,17 @@ impl Engine {
                 target = self.unique_target(destination, name).await?;
                 continue;
             }
-            if self.descends(meta) && existing.is_real_directory() {
+            if walks && existing.is_real_directory() {
                 return Ok(Some((target, Placement::Merge)));
             }
             match self.decide(name, source, meta, &target, &existing).await? {
                 Decision::Overwrite => return Ok(Some((target, Placement::Overwrite))),
                 Decision::Skip => return Ok(None),
+                // A typed name that isn't valid here: ask again.
                 Decision::RenameTo(new_name) => {
-                    target = destination
-                        .join(&new_name)
-                        .map_err(|e| TransferError::Failed(e.to_string()))?;
+                    if let Ok(renamed) = destination.join(&new_name) {
+                        target = renamed;
+                    }
                 }
             }
         }
@@ -466,9 +631,12 @@ impl Engine {
         target: &VPath,
         existing: &Meta,
     ) -> Result<Decision, TransferError> {
+        // "Apply to all" covers clashes of the same kind only: an answer given
+        // for files must not silently replace a whole folder.
+        let same_kind = meta.is_directory == existing.is_directory;
         let resolution = match &self.sticky {
-            Some(resolution) => resolution.clone(),
-            None => {
+            Some(resolution) if same_kind => resolution.clone(),
+            _ => {
                 let answer = self
                     .resolver
                     .resolve(Conflict {
@@ -553,11 +721,15 @@ impl Engine {
             .starts_with(&canonical(folder).await)
     }
 
+    /// Copy (or move) a folder's contents into `target`. With `remove_source`,
+    /// the emptied source folder (or the followed link) is removed afterwards.
     async fn transfer_folder(
         &mut self,
         source: &VPath,
         target: &VPath,
         placement: Placement,
+        below: Walk,
+        remove_source: bool,
     ) -> Result<Outcome, TransferError> {
         if placement == Placement::Overwrite {
             // A file (or link) is in the way of the folder.
@@ -583,17 +755,27 @@ impl Engine {
             .map_err(|e| failed("read", source, e))?;
         let mut complete = true;
         for child in children {
-            if self.transfer(&child.path, target, Some(child.name)).await? == Outcome::Skipped {
+            let meta = listed_meta(&child);
+            let outcome = self
+                .transfer(
+                    &child.path,
+                    target,
+                    Some(child.name),
+                    Some(meta),
+                    below.clone(),
+                )
+                .await?;
+            if outcome == Outcome::Skipped {
                 complete = false;
             }
         }
-        if self.kind == TransferKind::Move {
+        if remove_source {
             if !complete {
                 // Some children stayed behind; so does their folder.
                 return Ok(Outcome::Skipped);
             }
-            // Not recursive: only an emptied folder can go, so nothing that
-            // wasn't moved is ever deleted.
+            // Not recursive: only an emptied folder (or the link itself) can
+            // go, so nothing that wasn't moved is ever deleted.
             self.source
                 .fs
                 .remove(source, false)
@@ -603,14 +785,14 @@ impl Engine {
         Ok(Outcome::Done)
     }
 
-    /// Recreate a link (same filesystem only). Returns false when the link
-    /// can't be created here (e.g. no symlink privilege on Windows) and it's a
-    /// file link, so the caller copies its contents instead.
+    /// Recreate a link (same filesystem only), under a temporary name first so
+    /// whatever is at the target survives a failure. Returns false when links
+    /// can't be created here at all; the caller then copies the contents.
     async fn copy_link(
         &mut self,
         source: &VPath,
-        meta: &Meta,
         target: &VPath,
+        meta: &Meta,
         placement: Placement,
     ) -> Result<bool, TransferError> {
         let link = self
@@ -619,26 +801,27 @@ impl Engine {
             .read_link(source)
             .await
             .map_err(|e| failed("read the link", source, e))?;
-        if placement == Placement::Overwrite {
-            self.target
-                .fs
-                .remove(target, true)
-                .await
-                .map_err(|e| failed("replace", target, e))?;
-        }
-        match self
+        let temporary = temporary_beside(target, "link")?;
+        if self
             .target
             .fs
-            .symlink(&link, target, meta.is_directory)
+            .symlink(&link, &temporary, meta.is_directory)
+            .await
+            .is_err()
+        {
+            return Ok(false);
+        }
+        if let Err(e) = self
+            .target
+            .fs
+            .rename(&temporary, target, placement == Placement::Overwrite)
             .await
         {
-            Ok(()) => {
-                self.counters.add(WorkStats { items: 1, bytes: 0 });
-                Ok(true)
-            }
-            Err(_) if !meta.is_directory => Ok(false),
-            Err(e) => Err(failed("create the link", target, e)),
+            let _ = self.target.fs.remove(&temporary, false).await;
+            return Err(failed("finish", target, e));
         }
+        self.counters.add(WorkStats { items: 1, bytes: 0 });
+        Ok(true)
     }
 
     async fn copy_file(
@@ -648,14 +831,12 @@ impl Engine {
         target: &VPath,
         overwrite: bool,
     ) -> Result<(), TransferError> {
-        let folder = target.parent().unwrap_or_else(|| target.clone());
-        let temporary_name = format!(".corepty-{}.part", Uuid::new_v4().simple());
-        let temporary = folder
-            .join(&VName::for_path(&folder, &temporary_name))
-            .map_err(|e| TransferError::Failed(e.to_string()))?;
-
-        let result = self.stream(source, &temporary).await;
-        let result = match result {
+        let temporary = temporary_beside(target, "part")?;
+        let mut buffer = std::mem::take(&mut self.buffer);
+        buffer.resize(CHUNK_SIZE, 0);
+        let streamed = self.stream(source, &temporary, &mut buffer).await;
+        self.buffer = buffer;
+        let result = match streamed {
             Ok(()) => {
                 if let Some(modified) = meta.modified {
                     // Best effort: some servers refuse it, and the copy is fine anyway.
@@ -693,7 +874,12 @@ impl Engine {
         Ok(())
     }
 
-    async fn stream(&self, source: &VPath, temporary: &VPath) -> Result<(), TransferError> {
+    async fn stream(
+        &self,
+        source: &VPath,
+        temporary: &VPath,
+        buffer: &mut [u8],
+    ) -> Result<(), TransferError> {
         let mut reader = self
             .source
             .fs
@@ -706,11 +892,10 @@ impl Engine {
             .open_write(temporary, WriteMode::CreateNew)
             .await
             .map_err(|e| failed("create", temporary, e))?;
-        let mut buffer = vec![0_u8; CHUNK_SIZE];
         loop {
             self.check_cancelled()?;
             let read = reader
-                .read(&mut buffer)
+                .read(buffer)
                 .await
                 .map_err(|e| failed("read", source, e))?;
             if read == 0 {
@@ -731,8 +916,8 @@ impl Engine {
             .map_err(|e| failed("finish", temporary, e))
     }
 
-    async fn finish_move(&self, source: &VPath) -> Result<Outcome, TransferError> {
-        if self.kind == TransferKind::Move {
+    async fn finish_move(&self, source: &VPath, walk: &Walk) -> Result<Outcome, TransferError> {
+        if self.moves(walk) {
             self.source
                 .fs
                 .remove(source, false)
@@ -741,6 +926,22 @@ impl Engine {
         }
         Ok(Outcome::Done)
     }
+}
+
+/// A listing entry's own metadata; entries that couldn't be inspected are
+/// skipped (their kind is Other).
+fn listed_meta(entry: &Entry) -> Meta {
+    entry.meta.clone()
+}
+
+/// `.corepty-<uuid>.<what>` in the target's folder (same volume, so the final
+/// rename is a single step).
+fn temporary_beside(target: &VPath, what: &str) -> Result<VPath, TransferError> {
+    let folder = target.parent().unwrap_or_else(|| target.clone());
+    let name = format!(".corepty-{}.{what}", Uuid::new_v4().simple());
+    folder
+        .join(&VName::for_path(&folder, &name))
+        .map_err(|e| TransferError::Failed(e.to_string()))
 }
 
 #[cfg(test)]
@@ -1309,5 +1510,265 @@ pub(crate) mod tests {
             permissions.set_readonly(false);
             fs::set_permissions(path, permissions).unwrap();
         }
+    }
+
+    /// A link to a folder: a junction on Windows (no privilege needed), a
+    /// symlink elsewhere.
+    fn dir_link(link: &Path, target: &Path) {
+        #[cfg(windows)]
+        {
+            let made = std::process::Command::new("cmd")
+                .args(["/C", "mklink", "/J"])
+                .arg(link)
+                .arg(target)
+                .output()
+                .unwrap();
+            assert!(made.status.success(), "mklink /J failed");
+        }
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(target, link).unwrap();
+    }
+
+    #[tokio::test]
+    async fn moving_a_folder_link_across_filesystems_keeps_the_linked_files() {
+        // Review finding: the move used to delete the files *inside* the
+        // link's target while "moving" them through the link.
+        let temp = tempdir().unwrap();
+        let important = temp.path().join("important");
+        fs::create_dir(&important).unwrap();
+        fs::write(important.join("keep.txt"), b"keep").unwrap();
+        let link = temp.path().join("link");
+        dir_link(&link, &important);
+        let remote = Arc::new(MemFs::new());
+        remote.add_dir("/srv");
+
+        let run = run(
+            TransferKind::Move,
+            local(),
+            memory(&remote, "ssh-1"),
+            &[native(&link)],
+            &MemFs::path("/srv"),
+            no_conflicts(),
+        )
+        .await;
+        run.result.unwrap();
+        assert_eq!(remote.read("/srv/link/keep.txt").unwrap(), b"keep");
+        assert_eq!(
+            fs::read(important.join("keep.txt")).unwrap(),
+            b"keep",
+            "the target is untouched"
+        );
+        assert!(
+            fs::symlink_metadata(&link).is_err(),
+            "the moved link itself is gone"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_link_loop_is_skipped_instead_of_failing_the_transfer() {
+        let temp = tempdir().unwrap();
+        let folder = temp.path().join("a");
+        fs::create_dir(&folder).unwrap();
+        fs::write(folder.join("file.txt"), b"x").unwrap();
+        dir_link(&folder.join("loop"), &folder);
+        let remote = Arc::new(MemFs::new());
+        remote.add_dir("/srv");
+
+        let run = run(
+            TransferKind::Copy,
+            local(),
+            memory(&remote, "ssh-1"),
+            &[native(&folder)],
+            &MemFs::path("/srv"),
+            no_conflicts(),
+        )
+        .await;
+        run.result.unwrap();
+        assert_eq!(remote.read("/srv/a/file.txt").unwrap(), b"x");
+        assert!(!remote.exists("/srv/a/loop"));
+        assert_eq!(run.counters.snapshot().skipped, 1);
+    }
+
+    #[tokio::test]
+    async fn a_broken_link_is_skipped_instead_of_failing_the_transfer() {
+        let temp = tempdir().unwrap();
+        let folder = temp.path().join("a");
+        let gone = temp.path().join("gone");
+        fs::create_dir(&folder).unwrap();
+        fs::create_dir(&gone).unwrap();
+        fs::write(folder.join("file.txt"), b"x").unwrap();
+        dir_link(&folder.join("dangling"), &gone);
+        fs::remove_dir(&gone).unwrap();
+        let remote = Arc::new(MemFs::new());
+        remote.add_dir("/srv");
+
+        let run = run(
+            TransferKind::Copy,
+            local(),
+            memory(&remote, "ssh-1"),
+            &[native(&folder)],
+            &MemFs::path("/srv"),
+            no_conflicts(),
+        )
+        .await;
+        run.result.unwrap();
+        assert_eq!(remote.read("/srv/a/file.txt").unwrap(), b"x");
+        assert_eq!(run.counters.snapshot().skipped, 1);
+    }
+
+    #[tokio::test]
+    async fn a_folder_link_is_copied_within_one_filesystem() {
+        // Recreated where the OS allows it; otherwise (Windows without symlink
+        // privilege) its contents are copied, as Explorer does for junctions.
+        let temp = tempdir().unwrap();
+        let real = temp.path().join("real");
+        fs::create_dir(&real).unwrap();
+        fs::write(real.join("data.txt"), b"data").unwrap();
+        let source = temp.path().join("src");
+        fs::create_dir(&source).unwrap();
+        dir_link(&source.join("j"), &real);
+        let destination = temp.path().join("dst");
+        fs::create_dir(&destination).unwrap();
+
+        let run = run(
+            TransferKind::Copy,
+            local(),
+            local(),
+            &[native(&source)],
+            &native(&destination),
+            no_conflicts(),
+        )
+        .await;
+        run.result.unwrap();
+        assert_eq!(
+            fs::read(destination.join("src/j/data.txt")).unwrap(),
+            b"data"
+        );
+        assert!(
+            leftovers(&destination.join("src")).is_empty(),
+            "no temporary link left behind"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_to_all_does_not_cross_file_and_folder_clashes() {
+        let fs = Arc::new(MemFs::new());
+        fs.add_dir("/src");
+        fs.add_dir("/dst");
+        fs.add_file("/src/x", b"new");
+        fs.add_dir("/src/y");
+        fs.add_file("/src/y/inner", b"i");
+        fs.add_file("/dst/x", b"old");
+        fs.add_file("/dst/y", b"a file where a folder arrives");
+        let resolver = Scripted::new(&[(Resolution::Overwrite, true), (Resolution::Skip, false)]);
+        let sources = [MemFs::path("/src/x"), MemFs::path("/src/y")];
+
+        run(
+            TransferKind::Copy,
+            memory(&fs, "m"),
+            memory(&fs, "m"),
+            &sources,
+            &MemFs::path("/dst"),
+            resolver.clone(),
+        )
+        .await
+        .result
+        .unwrap();
+        assert_eq!(
+            resolver.asked_names(),
+            ["x", "y"],
+            "the folder clash is asked separately"
+        );
+        assert_eq!(fs.read("/dst/x").unwrap(), b"new");
+        assert_eq!(fs.read("/dst/y").unwrap(), b"a file where a folder arrives");
+    }
+
+    #[tokio::test]
+    async fn an_invalid_typed_name_asks_again() {
+        let fs = Arc::new(MemFs::new());
+        fs.add_dir("/src");
+        fs.add_dir("/dst");
+        fs.add_file("/src/a", b"new");
+        fs.add_file("/dst/a", b"old");
+        let resolver = Scripted::new(&[
+            (
+                Resolution::Rename {
+                    name: Some("bad/name".into()),
+                },
+                false,
+            ),
+            (Resolution::Skip, false),
+        ]);
+        run(
+            TransferKind::Copy,
+            memory(&fs, "m"),
+            memory(&fs, "m"),
+            &[MemFs::path("/src/a")],
+            &MemFs::path("/dst"),
+            resolver.clone(),
+        )
+        .await
+        .result
+        .unwrap();
+        assert_eq!(resolver.asked_names().len(), 2);
+        assert_eq!(fs.read("/dst/a").unwrap(), b"old");
+    }
+
+    #[tokio::test]
+    async fn children_reuse_the_listing_metadata() {
+        // One lstat per entry would be one SFTP round trip each; the folder
+        // listing already carries what the engine needs.
+        let fs = Arc::new(MemFs::new());
+        fs.add_dir("/src");
+        fs.add_dir("/src/d");
+        for index in 0..10 {
+            fs.add_file(&format!("/src/d/{index}"), b"x");
+        }
+        fs.add_dir("/dst");
+        run(
+            TransferKind::Copy,
+            memory(&fs, "m"),
+            memory(&fs, "m"),
+            &[MemFs::path("/src/d")],
+            &MemFs::path("/dst"),
+            no_conflicts(),
+        )
+        .await
+        .result
+        .unwrap();
+        // Planning and running each look at the picked folder once; then one
+        // target check per copied entry (1 folder + 10 files).
+        assert!(fs.lstats() <= 13, "{} lstat calls", fs.lstats());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn replacing_an_entry_with_a_link_leaves_no_temporary_files() {
+        let temp = tempdir().unwrap();
+        let source = temp.path().join("src");
+        let destination = temp.path().join("dst");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&destination).unwrap();
+        fs::write(source.join("real.txt"), b"real").unwrap();
+        std::os::unix::fs::symlink("real.txt", source.join("link.txt")).unwrap();
+        fs::write(destination.join("link.txt"), b"old").unwrap();
+        let resolver = Scripted::new(&[(Resolution::Overwrite, false)]);
+
+        run(
+            TransferKind::Copy,
+            local(),
+            local(),
+            &[native(&source.join("link.txt"))],
+            &native(&destination),
+            resolver,
+        )
+        .await
+        .result
+        .unwrap();
+        assert_eq!(
+            fs::read_link(destination.join("link.txt")).unwrap(),
+            Path::new("real.txt")
+        );
+        assert!(leftovers(&destination).is_empty());
     }
 }

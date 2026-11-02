@@ -236,7 +236,8 @@ pub trait Vfs: Send + Sync {
 
     /// Move `from` to `to` on this filesystem. With `overwrite`, whatever is at
     /// `to` is replaced — a file in one step, so the old one survives a failure;
-    /// a folder is removed first. Without it, an existing `to` is an
+    /// a folder is moved aside, replaced, then deleted (restored if the
+    /// replacement fails). Without it, an existing `to` is an
     /// `AlreadyExists` error.
     async fn rename(&self, from: &VPath, to: &VPath, overwrite: bool) -> io::Result<()>;
 
