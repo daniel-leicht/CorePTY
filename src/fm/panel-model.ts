@@ -21,6 +21,8 @@ export interface ApplyOptions {
   keepState?: boolean;
   /** Put the cursor on this name, e.g. the folder we just came up from. */
   focusName?: string;
+  /** Put the cursor on the entry with this path token (more exact than a name). */
+  focusPath?: string;
 }
 
 const PARENT_NAME = "..";
@@ -54,6 +56,10 @@ export class PanelModel {
   showHidden = false;
   filter = "";
 
+  private visible: FsEntry[] = [];
+  private byPath = new Map<string, FsEntry>();
+  private counts = { folders: 0, files: 0, bytes: 0 };
+
   /** Where a Shift-extended range started, and the marks it started from. */
   private anchor: number | null = null;
   private rangeBase: Set<string> = new Set();
@@ -73,8 +79,9 @@ export class PanelModel {
     for (const path of previousMarks) if (present.has(path)) this.marks.add(path);
     this.rebuild();
 
+    const byPath = options.focusPath ? this.indexOfPath(options.focusPath) : -1;
     const focus = options.focusName ?? previousName;
-    const found = focus === null ? -1 : this.indexOfName(focus);
+    const found = byPath >= 0 ? byPath : focus === null ? -1 : this.indexOfName(focus);
     this.cursor = this.clamp(found >= 0 ? found : keep ? previousIndex : 0);
     this.resetRange();
   }
@@ -239,12 +246,22 @@ export class PanelModel {
   markedSummary(): { count: number; bytes: number } {
     let count = 0;
     let bytes = 0;
-    for (const entry of this.visibleEntries()) {
-      if (!this.marks.has(entry.path)) continue;
+    for (const path of this.marks) {
+      const entry = this.byPath.get(path);
+      if (!entry) continue;
       count += 1;
       bytes += entry.isDirectory ? (this.folderSizes.get(entry.path) ?? 0) : (entry.size ?? 0);
     }
     return { count, bytes };
+  }
+
+  /** Folders, files and file bytes shown (computed once per rebuild). */
+  get totals(): { folders: number; files: number; bytes: number } {
+    return this.counts;
+  }
+
+  indexOfPath(path: string): number {
+    return this.rows.findIndex((row) => row.kind === "entry" && row.entry.path === path);
   }
 
   /** Index of the first row whose name starts with `prefix` (case-insensitive), or -1. */
@@ -262,10 +279,9 @@ export class PanelModel {
     return this.rows.findIndex((_, index) => this.rowName(index)?.toLocaleLowerCase() === lower);
   }
 
-  visibleEntries(): FsEntry[] {
-    const entries: FsEntry[] = [];
-    for (const row of this.rows) if (row.kind === "entry") entries.push(row.entry);
-    return entries;
+  /** The entries shown, in row order. Cached per rebuild: don't modify it. */
+  visibleEntries(): readonly FsEntry[] {
+    return this.visible;
   }
 
   private entryAt(index: number): FsEntry | null {
@@ -288,8 +304,21 @@ export class PanelModel {
         (!needle || entry.name.toLocaleLowerCase().includes(needle))
     );
     const rows: Row[] = this.parent ? [{ kind: "parent" }] : [];
-    for (const entry of sortEntries(visible, this.sort)) rows.push({ kind: "entry", entry });
+    const sorted = sortEntries(visible, this.sort);
+    for (const entry of sorted) rows.push({ kind: "entry", entry });
     this.rows = rows;
+    // Cached so per-keypress work (status line, marked totals) stays O(marks).
+    this.visible = sorted;
+    this.byPath = new Map(sorted.map((entry) => [entry.path, entry]));
+    const counts = { folders: 0, files: 0, bytes: 0 };
+    for (const entry of sorted) {
+      if (entry.isDirectory) counts.folders += 1;
+      else {
+        counts.files += 1;
+        counts.bytes += entry.size ?? 0;
+      }
+    }
+    this.counts = counts;
     // Marks on entries that are no longer shown would be acted on invisibly.
     const shown = new Set(visible.map((entry) => entry.path));
     for (const path of [...this.marks]) if (!shown.has(path)) this.marks.delete(path);

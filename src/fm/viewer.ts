@@ -2,7 +2,7 @@
 // filesystem layer in raw chunks (works the same for local and remote files).
 
 import { fsApi, type FsEntry, type FsLocation } from "../ipc";
-import { modal } from "./dialogs";
+import { modal, type DialogContext } from "./dialogs";
 import { formatFileSize } from "./format";
 
 const TEXT_LIMIT = 512 * 1024;
@@ -30,10 +30,16 @@ export function looksBinary(bytes: Uint8Array): boolean {
   return bytes.subarray(0, 8192).includes(0);
 }
 
-export async function openViewer(fs: string, entry: FsEntry): Promise<void> {
+export async function openViewer(
+  fs: string,
+  entry: FsEntry,
+  context: DialogContext = {}
+): Promise<void> {
   const location: FsLocation = { fs, path: entry.path };
   const body = document.createElement("div");
   body.className = "fm-preview__body";
+  // Focused, so arrows / PgUp / PgDn / Space scroll the content.
+  body.tabIndex = 0;
   body.innerHTML = `<div class="fm-loading">Loading…</div>`;
   const head = document.createElement("div");
   head.className = "fm-preview__path";
@@ -48,6 +54,8 @@ export async function openViewer(fs: string, entry: FsEntry): Promise<void> {
   let objectUrl: string | null = null;
   let closed = false;
   const closing = modal({
+    ...context,
+    focus: body,
     title: entry.name,
     className: "modal--wide fm-preview-dialog",
     body: wrapper,
@@ -59,7 +67,16 @@ export async function openViewer(fs: string, entry: FsEntry): Promise<void> {
     if (objectUrl) URL.revokeObjectURL(objectUrl);
   });
 
-  const size = entry.size ?? 0;
+  // Links (and some remote entries) carry no size; ask for the target's.
+  let size = entry.size;
+  if (size === null) {
+    try {
+      size = (await fsApi.stat(location)).size;
+    } catch {
+      size = null;
+    }
+  }
+  size ??= 0;
   const type = imageType(entry.name);
   try {
     if (type && size <= IMAGE_LIMIT) {

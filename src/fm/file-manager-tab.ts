@@ -15,7 +15,15 @@ import {
 import { contextMenu, type MenuItem } from "../menu";
 import type { AppTab, TabStatus, TabStatusInfo } from "../tab";
 import { uuid } from "../util";
-import { confirmAction, copyMoveDialog, maskDialog, modalOpen, promptText } from "./dialogs";
+import {
+  confirmAction,
+  copyMoveDialog,
+  isBrowserAccelerator,
+  maskDialog,
+  modalOpen,
+  promptText,
+  type DialogContext,
+} from "./dialogs";
 import { formatFileSize } from "./format";
 import { commandFor, FUNCTION_KEYS, isQuickSearchKey, type FmCommand } from "./keymap";
 import { DRAG_TYPE, PanelView, type PanelHost } from "./panel-view";
@@ -72,6 +80,16 @@ export class FileManagerTab implements AppTab, PanelHost {
   private readonly initialLocations?: FileManagerOptions["initialLocations"];
   /** Source folder of each queued transfer, refreshed when it ends. */
   private readonly transferSources = new WeakMap<TransferRequest, FsLocationView | null>();
+  /** Aborted on dispose: dismisses this tab's dialogs. */
+  private readonly lifetime = new AbortController();
+  private readonly dialogs: DialogContext = {
+    signal: this.lifetime.signal,
+    fallbackFocus: () => this.focus(),
+  };
+  /** Window listeners to remove on dispose (they would keep the tab alive). */
+  private readonly windowListeners: Array<[string, () => void]> = [];
+  /** Last persisted folder per side, so moving the cursor doesn't rewrite it. */
+  private readonly savedLocations: [string | null, string | null] = [null, null];
 
   constructor(options: FileManagerOptions) {
     this.toast = options.toast;
@@ -81,6 +99,9 @@ export class FileManagerTab implements AppTab, PanelHost {
       toast: (message, kind) => this.toast(message, kind),
       finished: (request) => this.afterTransfer(request),
       changed: () => this.onStatusChange?.(),
+      isActive: () => !this.disposed && this.element.classList.contains("is-active"),
+      dialogContext: () => this.dialogs,
+      focus: () => this.focus(),
     });
     this.element = document.createElement("div");
     this.element.className = "file-manager";
@@ -122,7 +143,8 @@ export class FileManagerTab implements AppTab, PanelHost {
     const panel = this.active;
     const fs = panel.fs === "local" ? "LOCAL" : panel.fs.toUpperCase();
     const marked = panel.model.markedSummary();
-    const items = panel.model.visibleEntries().length;
+    const { folders, files } = panel.model.totals;
+    const items = folders + files;
     const parts = [
       marked.count ? `${marked.count} marked · ${formatFileSize(marked.bytes)}` : `${items} items`,
       this.queue.summary(),
@@ -141,7 +163,9 @@ export class FileManagerTab implements AppTab, PanelHost {
   }
 
   focus(): void {
+    if (this.disposed) return;
     this.active.focus();
+    this.queue.resume(); // a question that came in while another tab was in front
   }
 
   applySettings(): void {
@@ -150,7 +174,10 @@ export class FileManagerTab implements AppTab, PanelHost {
 
   dispose(): void {
     this.disposed = true;
+    this.lifetime.abort();
     this.queue.cancelAll();
+    for (const [type, listener] of this.windowListeners) window.removeEventListener(type, listener);
+    this.windowListeners.length = 0;
     for (const panel of this.panels) panel.dispose();
     this.element.remove();
   }
@@ -181,8 +208,13 @@ export class FileManagerTab implements AppTab, PanelHost {
   changed(panel: PanelView): void {
     const location = panel.location;
     if (location) {
-      writeStorage(`${LOCATION_KEY}${panel.side}`, JSON.stringify(location));
-      writeStorage(`${LOCATION_KEY}${panel.side}.${location.fs}`, JSON.stringify(location));
+      // Persist only when the folder changes, not on every cursor move.
+      const saved = JSON.stringify(location);
+      if (this.savedLocations[panel.side] !== saved) {
+        this.savedLocations[panel.side] = saved;
+        writeStorage(`${LOCATION_KEY}${panel.side}`, saved);
+        writeStorage(`${LOCATION_KEY}${panel.side}.${location.fs}`, saved);
+      }
     }
     this.onStatusChange?.();
   }
@@ -192,13 +224,15 @@ export class FileManagerTab implements AppTab, PanelHost {
     const one = targets.length === 1 ? targets[0] : null;
     const items: MenuItem[] = [];
     if (one) {
+      // Act on the entry the menu was opened for, which may be a marked row
+      // rather than the one under the cursor.
       items.push({
         label: one.isDirectory ? "Open" : "Open with default app",
         icon: one.isDirectory ? "folder" : "file",
-        action: () => void this.openCursor(panel),
+        action: () => void this.openEntry(panel, one),
       });
       if (!one.isDirectory) {
-        items.push({ label: "View (F3)", icon: "eye", action: () => void this.run("view") });
+        items.push({ label: "View (F3)", icon: "eye", action: () => void this.view(panel, one) });
       }
     }
     if (targets.length) {
@@ -211,7 +245,7 @@ export class FileManagerTab implements AppTab, PanelHost {
       );
     }
     if (clipboard) items.push({ label: "Paste (Ctrl+V)", icon: "copy", action: () => void this.run("clipPaste") });
-    if (one) items.push({ label: "Rename (F2)", icon: "pencil", action: () => void this.run("rename") });
+    if (one) items.push({ label: "Rename (F2)", icon: "pencil", action: () => void this.rename(panel, one) });
     if (targets.some((entry) => entry.isDirectory)) {
       items.push({ label: "Calculate size", icon: "refresh", action: () => void this.measure(panel, targets) });
     }
@@ -334,29 +368,31 @@ export class FileManagerTab implements AppTab, PanelHost {
   }
 
   private async initialize(): Promise<void> {
-    let home: FsLocationView | null = null;
-    const homeFor = async () => (home ??= await fsApi.home("local"));
-    let opened = 0;
-    for (const panel of this.panels) {
-      const wanted = this.initialLocations?.[panel.side] ?? readLocation(panel.side);
-      if (wanted && (await panel.navigate(wanted, { quiet: true }))) {
-        opened += 1;
-        continue;
-      }
-      try {
-        if (await panel.navigate(await homeFor())) opened += 1;
-      } catch (error) {
-        this.toast(`Couldn't open the file manager: ${error}`, "error");
-      }
-    }
+    let home: Promise<FsLocationView> | null = null;
+    const homeFor = () => (home ??= fsApi.home("local"));
+    // Both panels at once: an offline remembered share mustn't hold up the other.
+    const results = await Promise.all(
+      this.panels.map(async (panel) => {
+        const wanted = this.initialLocations?.[panel.side] ?? readLocation(panel.side);
+        if (wanted && (await panel.navigate(wanted, { quiet: true }))) return true;
+        if (this.disposed) return false;
+        try {
+          return await panel.navigate(await homeFor());
+        } catch (error) {
+          if (!this.disposed) this.toast(`Couldn't open the file manager: ${error}`, "error");
+          return false;
+        }
+      })
+    );
     if (this.disposed) return;
-    this.status = opened ? "connected" : "error";
+    this.status = results.some(Boolean) ? "connected" : "error";
     this.onStatusChange?.();
-    this.active.focus();
+    this.focus();
   }
 
   private onKeyDown(event: KeyboardEvent): void {
-    if (event.defaultPrevented || modalOpen()) return;
+    // A context menu handles its own keys; the panel underneath stays put.
+    if (event.defaultPrevented || modalOpen() || document.querySelector(".ctx-menu")) return;
     const target = event.target as HTMLElement;
     if (target.matches("input, textarea")) {
       // Inputs keep their keys, but never let F-keys/Ctrl+R reach the webview
@@ -369,6 +405,13 @@ export class FileManagerTab implements AppTab, PanelHost {
     // Keys act on the panel that has keyboard focus, whatever was last clicked.
     const focused = this.panels.find((panel) => panel.element.contains(target));
     if (focused) this.activate(focused);
+    const plain = !event.ctrlKey && !event.metaKey && !event.altKey && !event.shiftKey;
+    if (event.key === "Backspace" && plain && this.active.quickSearchActive) {
+      // While typing a quick search, Backspace edits it instead of going up.
+      event.preventDefault();
+      this.active.quickSearchBackspace();
+      return;
+    }
     const command = commandFor(event);
     if (command) {
       event.preventDefault();
@@ -378,6 +421,8 @@ export class FileManagerTab implements AppTab, PanelHost {
     } else if (isQuickSearchKey(event)) {
       event.preventDefault();
       this.active.quickSearch(event.key);
+    } else if (isBrowserAccelerator(event)) {
+      event.preventDefault(); // e.g. Ctrl+F5: never reload the app
     }
   }
 
@@ -440,7 +485,8 @@ export class FileManagerTab implements AppTab, PanelHost {
       case "markMask":
       case "unmarkMask": {
         const mark = command === "markMask";
-        const mask = await maskDialog(mark);
+        const mask = await maskDialog(mark, this.dialogs);
+        if (this.disposed) return;
         if (mask) model.markByMask(mask, mark);
         break;
       }
@@ -486,6 +532,7 @@ export class FileManagerTab implements AppTab, PanelHost {
       case "locationRight": {
         const target = this.panels[command === "locationLeft" ? 0 : 1];
         this.activate(target);
+        target.focus(); // where the keyboard returns if the menu is dismissed
         this.locationMenu(target, target.element.querySelector<HTMLElement>('.fm-tool[data-act="roots"]')!);
         return;
       }
@@ -497,7 +544,7 @@ export class FileManagerTab implements AppTab, PanelHost {
       case "move":
         return this.transferToOther(command);
       case "rename":
-        return this.rename(panel);
+        return this.rename(panel, model.cursorEntry());
       case "mkdir":
         return this.mkdir(panel);
       case "delete":
@@ -515,7 +562,10 @@ export class FileManagerTab implements AppTab, PanelHost {
     const { model } = panel;
     if (model.isParentRow(model.cursor)) return panel.goUp();
     const entry = model.cursorEntry();
-    if (!entry) return;
+    if (entry) await this.openEntry(panel, entry);
+  }
+
+  private async openEntry(panel: PanelView, entry: FsEntry): Promise<void> {
     if (entry.isDirectory) {
       await panel.navigate({ fs: panel.fs, path: entry.path, display: entry.display });
       return;
@@ -523,13 +573,12 @@ export class FileManagerTab implements AppTab, PanelHost {
     return this.edit(panel, entry);
   }
 
-  private async view(panel: PanelView): Promise<void> {
-    const entry = panel.model.cursorEntry();
+  private async view(panel: PanelView, entry = panel.model.cursorEntry()): Promise<void> {
     if (!entry || entry.isDirectory) {
       this.toast("Put the cursor on a file to view it", "warn");
       return;
     }
-    await openViewer(panel.fs, entry);
+    await openViewer(panel.fs, entry, this.dialogs);
   }
 
   /** F4 / Enter on a file: open it with the OS default application. */
@@ -555,12 +604,11 @@ export class FileManagerTab implements AppTab, PanelHost {
       return;
     }
     if (!destination) return;
-    const typed = await copyMoveDialog({
-      kind,
-      what: describe(entries),
-      destination: destination.display,
-    });
-    if (typed === null) return;
+    const typed = await copyMoveDialog(
+      { kind, what: describe(entries), destination: destination.display },
+      this.dialogs
+    );
+    if (typed === null || this.disposed) return;
     let target = destination;
     if (typed !== destination.display) {
       try {
@@ -569,10 +617,12 @@ export class FileManagerTab implements AppTab, PanelHost {
         this.toast(`Couldn't use ${typed}: ${error}`, "error");
         return;
       }
+      if (this.disposed) return;
     }
     await this.startTransfer(kind, panel.fs, entries, panel.location, target);
     panel.model.clearMarks();
     panel.renderStates();
+    this.changed(panel);
   }
 
   private async startTransfer(
@@ -606,21 +656,23 @@ export class FileManagerTab implements AppTab, PanelHost {
     }
   }
 
-  private async rename(panel: PanelView): Promise<void> {
-    const targets = panel.model.targets();
-    if (targets.length !== 1) {
-      this.toast("Rename works on one item at a time", "warn");
+  /** F2 / Shift+F6: rename the entry under the cursor (marks don't matter, as in Far / TC). */
+  private async rename(panel: PanelView, entry: FsEntry | null): Promise<void> {
+    if (!entry) {
+      this.toast("Put the cursor on the item to rename", "warn");
       return;
     }
-    const entry = targets[0];
-    const name = await promptText({
-      title: "Rename",
-      label: "New name",
-      value: entry.name,
-      action: "Rename",
-      selectStem: !entry.isDirectory,
-    });
-    if (!name || name === entry.name) return;
+    const name = await promptText(
+      {
+        title: "Rename",
+        label: "New name",
+        value: entry.name,
+        action: "Rename",
+        selectStem: !entry.isDirectory,
+      },
+      this.dialogs
+    );
+    if (!name || name === entry.name || this.disposed) return;
     try {
       await fsApi.rename({ fs: panel.fs, path: entry.path }, name);
       await this.refreshShowing(panel, name);
@@ -632,8 +684,11 @@ export class FileManagerTab implements AppTab, PanelHost {
   private async mkdir(panel: PanelView): Promise<void> {
     const location = panel.location;
     if (!location) return;
-    const name = await promptText({ title: "New folder", label: "Name", value: "", action: "Create" });
-    if (!name) return;
+    const name = await promptText(
+      { title: "New folder", label: "Name", value: "", action: "Create" },
+      this.dialogs
+    );
+    if (!name || this.disposed) return;
     try {
       await fsApi.mkdir(location, name);
       await this.refreshShowing(panel, name);
@@ -656,16 +711,19 @@ export class FileManagerTab implements AppTab, PanelHost {
       0
     );
     const unmeasured = folders.some((entry) => !panel.model.folderSizes.has(entry.path));
-    const confirmed = await confirmAction({
-      title: toTrash ? "Move to Trash?" : "Delete permanently?",
-      message: `${describe(targets)} (${formatFileSize(bytes)}${unmeasured ? " plus folder contents" : ""}) will be ${
-        toTrash ? "moved to the Trash" : "deleted. This can't be undone"
-      }.`,
-      detail: folders.length ? `Includes ${folders.length} ${folders.length === 1 ? "folder" : "folders"} and everything in them.` : undefined,
-      action: toTrash ? "Move to Trash" : "Delete",
-      danger: !toTrash,
-    });
-    if (!confirmed) return;
+    const confirmed = await confirmAction(
+      {
+        title: toTrash ? "Move to Trash?" : "Delete permanently?",
+        message: `${describe(targets)} (${formatFileSize(bytes)}${unmeasured ? " plus folder contents" : ""}) will be ${
+          toTrash ? "moved to the Trash" : "deleted. This can't be undone"
+        }.`,
+        detail: folders.length ? `Includes ${folders.length} ${folders.length === 1 ? "folder" : "folders"} and everything in them.` : undefined,
+        action: toTrash ? "Move to Trash" : "Delete",
+        danger: !toTrash,
+      },
+      this.dialogs
+    );
+    if (!confirmed || this.disposed) return;
     const locations = targets.map((entry) => ({ fs: panel.fs, path: entry.path }));
     try {
       if (toTrash) await fsApi.trash(locations);
@@ -673,7 +731,7 @@ export class FileManagerTab implements AppTab, PanelHost {
     } catch (error) {
       this.toast(`${toTrash ? "Trash" : "Delete"} failed: ${error}`, "error");
     }
-    await this.refreshShowing(panel);
+    if (!this.disposed) await this.refreshShowing(panel);
   }
 
   /** Refresh `panel` (optionally landing on `focusName`) and the other panel if it shows the same folder. */
@@ -691,6 +749,7 @@ export class FileManagerTab implements AppTab, PanelHost {
     for (const entry of entries.filter((each) => each.isDirectory)) {
       try {
         const size = await fsApi.folderSize({ fs: panel.fs, path: entry.path });
+        if (this.disposed) return;
         panel.model.folderSizes.set(entry.path, size.bytes);
         panel.renderStates();
         this.onStatusChange?.();
@@ -782,7 +841,9 @@ export class FileManagerTab implements AppTab, PanelHost {
     this.element.addEventListener("keyup", (event) => {
       if (event.key === "Shift") setShift(false);
     });
-    window.addEventListener("blur", () => setShift(false));
+    const onBlur = () => setShift(false);
+    window.addEventListener("blur", onBlur);
+    this.windowListeners.push(["blur", onBlur]);
   }
 
   private wireSplitter(): void {
@@ -795,24 +856,26 @@ export class FileManagerTab implements AppTab, PanelHost {
       return clamped;
     };
     const stored = Number(readStorage(SPLIT_KEY));
-    setSplit(Number.isFinite(stored) && stored >= 25 && stored <= 75 ? stored : 50);
-    let current = 50;
+    let current = setSplit(Number.isFinite(stored) && stored >= 25 && stored <= 75 ? stored : 50);
+    let moved = false;
     splitter.addEventListener("pointerdown", (event) => {
       if (event.button !== 0) return;
       event.preventDefault();
       splitter.setPointerCapture(event.pointerId);
       splitter.classList.add("is-dragging");
+      moved = false;
     });
     splitter.addEventListener("pointermove", (event) => {
       if (!splitter.hasPointerCapture(event.pointerId)) return;
       const bounds = panels.getBoundingClientRect();
       current = setSplit(((event.clientX - bounds.left) / bounds.width) * 100);
+      moved = true;
     });
     const finish = (event: PointerEvent) => {
       if (!splitter.hasPointerCapture(event.pointerId)) return;
       splitter.releasePointerCapture(event.pointerId);
       splitter.classList.remove("is-dragging");
-      writeStorage(SPLIT_KEY, String(current));
+      if (moved) writeStorage(SPLIT_KEY, String(current)); // a plain click changes nothing
     };
     splitter.addEventListener("pointerup", finish);
     splitter.addEventListener("pointercancel", finish);

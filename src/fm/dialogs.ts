@@ -11,7 +11,15 @@ export interface ModalButton {
   kind?: "primary" | "ghost" | "danger";
 }
 
-interface ModalOptions {
+/** Ties a dialog to the tab that opened it. */
+export interface DialogContext {
+  /** Aborted when the tab closes: the dialog is dismissed. */
+  signal?: AbortSignal;
+  /** Where keyboard focus goes when the element that opened the dialog is gone. */
+  fallbackFocus?: () => void;
+}
+
+interface ModalOptions extends DialogContext {
   title: string;
   className?: string;
   body: Node;
@@ -30,6 +38,13 @@ export function modalOpen(): boolean {
   return document.querySelector(".modal-backdrop") !== null;
 }
 
+/** Browser accelerators that must never fire inside the app (reload, find, caret browsing). */
+export function isBrowserAccelerator(event: KeyboardEvent): boolean {
+  if (event.altKey && event.key === "F4") return false; // close window: leave it to the OS
+  const ctrl = event.ctrlKey || event.metaKey;
+  return ["F3", "F5", "F7"].includes(event.key) || (ctrl && event.key.toLowerCase() === "r");
+}
+
 /** Show a modal; resolves with the chosen button's value, or null if dismissed. */
 export function modal(options: ModalOptions): Promise<string | null> {
   const previous = document.activeElement as HTMLElement | null;
@@ -39,6 +54,7 @@ export function modal(options: ModalOptions): Promise<string | null> {
   dialog.className = `modal ${options.className ?? ""}`;
   dialog.setAttribute("role", options.role ?? "dialog");
   dialog.setAttribute("aria-modal", "true");
+  dialog.setAttribute("aria-label", options.title);
   dialog.innerHTML = `
     <div class="modal__head"><div class="modal__title"></div><button class="modal__close" type="button" title="Close (Esc)">${icon("close")}</button></div>
     <div class="modal__body"></div>
@@ -55,16 +71,27 @@ export function modal(options: ModalOptions): Promise<string | null> {
     foot.appendChild(button);
     return button;
   });
-  dialog.setAttribute("aria-label", options.title);
   backdrop.appendChild(dialog);
   document.body.appendChild(backdrop);
 
   return new Promise((resolve) => {
+    let done = false;
     const finish = (value: string | null) => {
+      if (done) return;
+      done = true;
+      options.signal?.removeEventListener("abort", onAbort);
       backdrop.remove();
-      previous?.focus({ preventScroll: true });
+      // The opener may be gone (a context-menu item, a dismissed job row).
+      if (previous?.isConnected && previous !== document.body) previous.focus({ preventScroll: true });
+      else options.fallbackFocus?.();
       resolve(value);
     };
+    const onAbort = () => finish(null);
+    if (options.signal?.aborted) {
+      finish(null);
+      return;
+    }
+    options.signal?.addEventListener("abort", onAbort);
     for (const button of buttons) button.addEventListener("click", () => finish(button.dataset.value!));
     dialog.querySelector(".modal__close")!.addEventListener("click", () => finish(null));
     backdrop.addEventListener("mousedown", (event) => {
@@ -88,6 +115,8 @@ export function modal(options: ModalOptions): Promise<string | null> {
         }
       } else if (event.key === "Tab") {
         trapFocus(dialog, event);
+      } else if (isBrowserAccelerator(event)) {
+        event.preventDefault();
       }
     });
     // The action is the default (Enter confirms, as in Commander), danger included.
@@ -128,15 +157,18 @@ function field(label: string, value: string, hint?: string): { root: HTMLElement
   return { root, input };
 }
 
-export async function promptText(options: {
-  title: string;
-  label: string;
-  value: string;
-  action: string;
-  hint?: string;
-  /** Select the name without its extension, as file managers do on rename. */
-  selectStem?: boolean;
-}): Promise<string | null> {
+export async function promptText(
+  options: {
+    title: string;
+    label: string;
+    value: string;
+    action: string;
+    hint?: string;
+    /** Select the name without its extension, as file managers do on rename. */
+    selectStem?: boolean;
+  },
+  context: DialogContext = {}
+): Promise<string | null> {
   const { root, input } = field(options.label, options.value, options.hint);
   const body = document.createElement("div");
   body.appendChild(root);
@@ -146,6 +178,7 @@ export async function promptText(options: {
     else input.select();
   });
   const result = await modal({
+    ...context,
     title: options.title,
     className: "fm-prompt",
     body,
@@ -160,13 +193,16 @@ export async function promptText(options: {
   return result === "ok" && value ? value : null;
 }
 
-export async function confirmAction(options: {
-  title: string;
-  message: string;
-  detail?: string;
-  action: string;
-  danger?: boolean;
-}): Promise<boolean> {
+export async function confirmAction(
+  options: {
+    title: string;
+    message: string;
+    detail?: string;
+    action: string;
+    danger?: boolean;
+  },
+  context: DialogContext = {}
+): Promise<boolean> {
   const body = document.createElement("div");
   body.innerHTML = `<p class="fm-confirm__message"></p>`;
   body.querySelector("p")!.textContent = options.message;
@@ -177,6 +213,7 @@ export async function confirmAction(options: {
     body.appendChild(detail);
   }
   const result = await modal({
+    ...context,
     title: options.title,
     className: "fm-confirm",
     role: "alertdialog",
@@ -191,33 +228,46 @@ export async function confirmAction(options: {
 }
 
 /** F5/F6: confirm the destination, which can be edited (NC/WinSCP style). */
-export function copyMoveDialog(options: {
-  kind: "copy" | "move";
-  what: string;
-  destination: string;
-}): Promise<string | null> {
+export function copyMoveDialog(
+  options: { kind: "copy" | "move"; what: string; destination: string },
+  context: DialogContext = {}
+): Promise<string | null> {
   const verb = options.kind === "copy" ? "Copy" : "Move";
-  return promptText({
-    title: `${verb} ${options.what}`,
-    label: "To folder",
-    value: options.destination,
-    action: verb,
-    hint: "Edit the path to choose another folder.",
-  });
+  return promptText(
+    {
+      title: `${verb} ${options.what}`,
+      label: "To folder",
+      value: options.destination,
+      action: verb,
+      hint: "Edit the path to choose another folder.",
+    },
+    context
+  );
 }
 
-export function maskDialog(mark: boolean): Promise<string | null> {
-  return promptText({
-    title: mark ? "Mark files" : "Unmark files",
-    label: "File mask",
-    value: "*",
-    action: mark ? "Mark" : "Unmark",
-    hint: "Wildcards * and ?, several masks separated by ; — folders are not affected.",
-  });
+export function maskDialog(mark: boolean, context: DialogContext = {}): Promise<string | null> {
+  return promptText(
+    {
+      title: mark ? "Mark files" : "Unmark files",
+      label: "File mask",
+      value: "*",
+      action: mark ? "Mark" : "Unmark",
+      hint: "Wildcards * and ?, several masks separated by ; — folders are not affected.",
+    },
+    context
+  );
 }
 
-/** B6: ask what to do about one name clash. Dismissing cancels the transfer. */
-export async function conflictDialog(conflict: TransferConflict): Promise<ConflictAnswer> {
+/**
+ * B6: ask what to do about one name clash. The question can pop up while the
+ * user is busy with something else, so it starts on the harmless choice (Skip)
+ * and dismissing it (Esc, click outside) answers nothing: the transfer keeps
+ * waiting and can be answered later. Returns null when dismissed.
+ */
+export async function conflictDialog(
+  conflict: TransferConflict,
+  context: DialogContext = {}
+): Promise<ConflictAnswer | null> {
   const body = document.createElement("div");
   body.className = "fm-conflict";
   const newer = isNewer(conflict.source, conflict.target);
@@ -235,7 +285,8 @@ export async function conflictDialog(conflict: TransferConflict): Promise<Confli
   });
   const applyToAll = body.querySelector<HTMLInputElement>(".fm-conflict__all")!;
 
-  const choice = await modal({
+  const pending = modal({
+    ...context,
     title: "Replace or skip?",
     className: "fm-confirm fm-conflict-dialog",
     body,
@@ -246,7 +297,11 @@ export async function conflictDialog(conflict: TransferConflict): Promise<Confli
       { value: "newer", label: "Newer only" },
       { value: "overwrite", label: "Overwrite", kind: "primary" },
     ],
+    focus: null,
   });
+  // Focus the harmless choice, not the primary action.
+  document.querySelector<HTMLButtonElement>('.fm-conflict-dialog [data-value="skip"]')?.focus();
+  const choice = await pending;
   let resolution: ConflictResolution;
   switch (choice) {
     case "overwrite":
@@ -262,8 +317,11 @@ export async function conflictDialog(conflict: TransferConflict): Promise<Confli
       // Keep both: the backend picks a free "name (copy N)".
       resolution = { action: "rename" };
       break;
-    default:
+    case "cancel":
       resolution = { action: "cancel" };
+      break;
+    default:
+      return null;
   }
   return { resolution, applyToAll: applyToAll.checked && resolution.action !== "cancel" };
 }

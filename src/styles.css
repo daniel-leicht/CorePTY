@@ -897,8 +897,15 @@ button {
   color: var(--accent-2);
   font-size: 12px;
 }
-.fm-header .fm-col-size,
-.fm-header .fm-col-modified {
+.fm-header > [role="columnheader"] {
+  min-width: 0;
+  display: flex;
+}
+.fm-header > [role="columnheader"] > button {
+  flex: 1;
+}
+.fm-header .fm-col-size button,
+.fm-header .fm-col-modified button {
   justify-content: flex-end;
 }
 .fm-grid {
@@ -1282,10 +1289,10 @@ button {
   transition: width 0.12s linear;
 }
 
-.fm-prompt {
+.modal.fm-prompt {
   width: 410px;
 }
-.fm-confirm {
+.modal.fm-confirm {
   width: 500px;
 }
 .fm-confirm__message {
@@ -1303,7 +1310,7 @@ button {
   color: var(--text-3);
   font-size: 11px;
 }
-.fm-conflict-dialog {
+.modal.fm-conflict-dialog {
   width: 660px;
 }
 .fm-conflict-dialog .modal__foot .btn {
@@ -1358,7 +1365,7 @@ button {
   filter: brightness(1.08);
   box-shadow: 0 6px 18px rgba(248, 113, 113, 0.25);
 }
-.fm-preview-dialog {
+.modal.fm-preview-dialog {
   width: min(900px, calc(100vw - 48px));
   height: min(720px, calc(100vh - 48px));
 }

@@ -1,10 +1,16 @@
 // The transfer strip at the bottom of a file manager tab: one row per job with
 // progress, speed and time left. Conflict questions from the backend are shown
-// one at a time and answered back with transfer_resolve.
+// one at a time, only while their tab is in front, and can be put off: a job
+// whose question was dismissed keeps waiting with an "Answer…" button.
 
 import { icon } from "../icons";
-import { transferApi, type TransferEvent, type TransferRequest } from "../ipc";
-import { conflictDialog } from "./dialogs";
+import {
+  transferApi,
+  type TransferConflict,
+  type TransferEvent,
+  type TransferRequest,
+} from "../ipc";
+import { conflictDialog, type DialogContext } from "./dialogs";
 import { formatDuration, formatFileSize, formatSpeed } from "./format";
 
 type JobState = "queued" | "planning" | "running" | "waiting" | "done" | "failed" | "cancelled";
@@ -24,6 +30,10 @@ interface Job {
   eta: number | null;
   current: string;
   message: string;
+  /** The unanswered conflict question, if any. */
+  question: { conflictId: number; conflict: TransferConflict } | null;
+  /** The user dismissed the question: don't pop it up again by itself. */
+  deferred: boolean;
 }
 
 export interface QueueHost {
@@ -32,6 +42,12 @@ export interface QueueHost {
   finished(request: TransferRequest): void;
   /** Something changed that the status bar shows. */
   changed(): void;
+  /** Whether this tab is in front (questions only pop up then). */
+  isActive(): boolean;
+  /** Dialog ownership: dismissed when the tab closes; where focus returns. */
+  dialogContext(): DialogContext;
+  /** Give the keyboard back to the active panel. */
+  focus(): void;
 }
 
 const DONE_ROW_MS = 5000;
@@ -40,8 +56,8 @@ export class TransferQueue {
   readonly element: HTMLElement;
   private readonly list: HTMLElement;
   private readonly jobs = new Set<Job>();
-  /** Conflict dialogs, one after another. */
-  private dialogs: Promise<void> = Promise.resolve();
+  /** The job whose question is on screen. */
+  private asking: Job | null = null;
   private collapsed = false;
 
   constructor(private readonly host: QueueHost) {
@@ -75,20 +91,28 @@ export class TransferQueue {
     }
   }
 
+  /** The tab came to the front: ask any question that has been waiting. */
+  resume(): void {
+    this.askNext(false);
+  }
+
   /** "2 transfers · 45%", or null when idle. */
   summary(): string | null {
     let active = 0;
     let done = 0;
     let total = 0;
+    let waiting = 0;
     for (const job of this.jobs) {
       if (!isActive(job.state)) continue;
       active += 1;
       done += job.completedBytes;
       total += job.totalBytes;
+      if (job.question) waiting += 1;
     }
     if (!active) return null;
     const percent = total ? ` · ${Math.floor((done / total) * 100)}%` : "";
-    return `${active} ${active === 1 ? "transfer" : "transfers"}${percent}`;
+    const question = waiting ? ` · ${waiting} waiting for you` : "";
+    return `${active} ${active === 1 ? "transfer" : "transfers"}${percent}${question}`;
   }
 
   /** Cancel everything still running (the tab is closing). */
@@ -104,9 +128,11 @@ export class TransferQueue {
     element.innerHTML = `
       <span class="fm-job__icon">${icon(request.kind === "copy" ? "copy" : "move")}</span>
       <div class="fm-job__text"><div class="fm-job__title"></div><div class="fm-job__detail"></div></div>
-      <div class="fm-progress"><span></span></div>
+      <div class="fm-progress" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><span></span></div>
+      <button type="button" class="btn ghost fm-job__answer" hidden>Answer…</button>
       <button type="button" class="fm-job__action" title="Cancel">${icon("close")}</button>`;
     element.querySelector(".fm-job__title")!.textContent = label;
+    element.querySelector(".fm-progress")!.setAttribute("aria-label", label);
     const job: Job = {
       id: null,
       request,
@@ -122,6 +148,8 @@ export class TransferQueue {
       eta: null,
       current: "",
       message: "",
+      question: null,
+      deferred: false,
     };
     element.querySelector(".fm-job__action")!.addEventListener("click", () => {
       if (isActive(job.state)) {
@@ -129,6 +157,10 @@ export class TransferQueue {
       } else {
         this.remove(job);
       }
+    });
+    element.querySelector(".fm-job__answer")!.addEventListener("click", () => {
+      job.deferred = false;
+      this.ask(job);
     });
     this.jobs.add(job);
     this.list.prepend(element);
@@ -152,7 +184,7 @@ export class TransferQueue {
         job.totalBytes = event.totalBytes;
         break;
       case "progress":
-        job.state = "running";
+        if (!job.question) job.state = "running";
         job.completedItems = event.completedItems;
         job.completedBytes = event.completedBytes;
         job.totalItems = event.totalItems;
@@ -162,19 +194,12 @@ export class TransferQueue {
         job.eta = event.etaSeconds;
         job.current = event.current;
         break;
-      case "conflict": {
+      case "conflict":
         job.state = "waiting";
-        const { id, conflictId, conflict } = event;
-        this.dialogs = this.dialogs.then(async () => {
-          // The job may have been cancelled while an earlier dialog was open.
-          if (!isActive(job.state)) return;
-          const answer = await conflictDialog(conflict);
-          if (isActive(job.state)) job.state = "running";
-          this.update(job);
-          await transferApi.resolve(id, conflictId, answer).catch(() => undefined);
-        });
+        job.question = { conflictId: event.conflictId, conflict: event.conflict };
+        job.deferred = false;
+        this.askNext(false);
         break;
-      }
       case "finished":
         job.state = "done";
         job.completedItems = event.completedItems;
@@ -196,15 +221,48 @@ export class TransferQueue {
     this.update(job);
   }
 
+  /** Show the next waiting question, if this tab is in front and none is open. */
+  private askNext(includeDeferred: boolean): void {
+    if (this.asking || !this.host.isActive()) return;
+    for (const job of this.jobs) {
+      if (job.question && (includeDeferred || !job.deferred)) {
+        this.ask(job);
+        return;
+      }
+    }
+  }
+
+  private ask(job: Job): void {
+    const question = job.question;
+    if (!question || this.asking || !job.id) return;
+    this.asking = job;
+    void (async () => {
+      const answer = await conflictDialog(question.conflict, this.host.dialogContext());
+      this.asking = null;
+      if (answer && job.question === question && job.id) {
+        job.question = null;
+        job.state = "running";
+        await transferApi.resolve(job.id, question.conflictId, answer).catch(() => undefined);
+      } else if (!answer && job.question === question) {
+        job.deferred = true; // answer later, from the job row
+      }
+      this.update(job);
+      this.askNext(false);
+    })();
+  }
+
   private ended(job: Job): void {
+    job.question = null;
     this.host.finished(job.request);
     if (job.state !== "failed") window.setTimeout(() => this.remove(job), DONE_ROW_MS);
   }
 
   private remove(job: Job): void {
     if (!this.jobs.delete(job)) return;
+    const hadFocus = job.element.contains(document.activeElement);
     job.element.remove();
     this.element.hidden = this.jobs.size === 0;
+    if (hadFocus) this.host.focus();
     this.renderSummary();
     this.host.changed();
   }
@@ -217,10 +275,11 @@ export class TransferQueue {
       : job.totalItems
         ? job.completedItems / job.totalItems
         : 0;
-    const done = job.state === "done";
-    element.querySelector<HTMLElement>(".fm-progress span")!.style.width =
-      `${Math.round(Math.min(1, done ? 1 : ratio) * 100)}%`;
+    const percent = Math.round(Math.min(1, job.state === "done" ? 1 : ratio) * 100);
+    element.querySelector<HTMLElement>(".fm-progress span")!.style.width = `${percent}%`;
+    element.querySelector(".fm-progress")!.setAttribute("aria-valuenow", String(percent));
     element.querySelector(".fm-job__detail")!.textContent = detail(job);
+    element.querySelector<HTMLButtonElement>(".fm-job__answer")!.hidden = !job.question;
     const action = element.querySelector<HTMLButtonElement>(".fm-job__action")!;
     action.title = isActive(job.state) ? "Cancel" : "Dismiss";
     this.renderSummary();
@@ -244,7 +303,9 @@ function detail(job: Job): string {
     case "planning":
       return "Counting files…";
     case "waiting":
-      return "Waiting for your answer…";
+      return job.question
+        ? `“${job.question.conflict.name}” already exists — waiting for your answer`
+        : "Waiting for your answer…";
     case "done":
       return `Done · ${job.completedItems} ${job.completedItems === 1 ? "item" : "items"}${skipped}`;
     case "failed":

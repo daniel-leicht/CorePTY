@@ -29,6 +29,8 @@ export interface PanelHost {
 
 export interface NavigateOptions {
   focusName?: string;
+  /** Put the cursor on the entry with this path token (preferred over the name). */
+  focusPath?: string;
   /** "push" records history (default), "none" is for back/forward/refresh. */
   history?: "push" | "none";
   /** Refresh: keep cursor, marks and scroll position. */
@@ -60,6 +62,8 @@ export class PanelView {
   private readonly rendered = new Map<number, HTMLElement>();
   private drawnRows: unknown = null;
   private loadSequence = 0;
+  /** A navigation the user started is in flight (a refresh must not cancel it). */
+  private navigating = false;
   private quickText = "";
   private quickTimer: number | null = null;
 
@@ -94,9 +98,9 @@ export class PanelView {
       </div>
       <div class="fm-grid" role="grid" aria-multiselectable="true" tabindex="0">
         <div class="fm-header" role="row">
-          <button role="columnheader" data-sort="name" class="fm-col-name">Name <span></span></button>
-          <button role="columnheader" data-sort="size" class="fm-col-size">Size <span></span></button>
-          <button role="columnheader" data-sort="modified" class="fm-col-modified">Modified <span></span></button>
+          <span role="columnheader" class="fm-col-name"><button type="button" data-sort="name">Name <span></span></button></span>
+          <span role="columnheader" class="fm-col-size"><button type="button" data-sort="size">Size <span></span></button></span>
+          <span role="columnheader" class="fm-col-modified"><button type="button" data-sort="modified">Modified <span></span></button></span>
           <span role="columnheader" class="fm-col-perms">Rights</span>
         </div>
         <div class="fm-list" role="rowgroup"><div class="fm-spacer"></div></div>
@@ -134,6 +138,7 @@ export class PanelView {
   /** List `location` and show it. Resolves false (after a toast) on failure. */
   async navigate(location: FsLocationView, options: NavigateOptions = {}): Promise<boolean> {
     const sequence = ++this.loadSequence;
+    this.navigating = !options.keepState;
     this.element.classList.add("is-loading");
     try {
       const [listing, capabilities] = await Promise.all([
@@ -145,9 +150,17 @@ export class PanelView {
       if (sequence !== this.loadSequence) return false;
       const scrollTop = this.list.scrollTop;
       this.capabilities = capabilities;
+      const moved = listing.location.path !== this.model.location?.path;
+      if (moved && this.model.filter) {
+        // A filter belongs to the folder it was typed in.
+        this.model.filter = "";
+        this.filterBar.hidden = true;
+        this.filterInput.value = "";
+      }
       this.model.applyListing(listing, {
         keepState: options.keepState,
         focusName: options.focusName,
+        focusPath: options.focusPath,
       });
       if ((options.history ?? "push") === "push") this.history.visit(listing.location);
       this.render();
@@ -162,15 +175,19 @@ export class PanelView {
       }
       return false;
     } finally {
-      if (sequence === this.loadSequence) this.element.classList.remove("is-loading");
+      if (sequence === this.loadSequence) {
+        this.navigating = false;
+        this.element.classList.remove("is-loading");
+      }
     }
   }
 
+  /** Re-list the folder shown, keeping cursor, marks and scroll. Skipped while
+   *  the user is navigating elsewhere (the new folder is fresh anyway). */
   refresh(): Promise<boolean> {
     const location = this.model.location;
-    return location
-      ? this.navigate(location, { keepState: true, history: "none" })
-      : Promise.resolve(false);
+    if (!location || this.navigating) return Promise.resolve(false);
+    return this.navigate(location, { keepState: true, history: "none" });
   }
 
   /** Up one level, landing on the folder we came from. */
@@ -178,7 +195,7 @@ export class PanelView {
     const { parent, location } = this.model;
     if (!parent || !location) return;
     const from = location.display.replace(/[\\/]+$/, "").split(/[\\/]/).pop();
-    await this.navigate(parent, { focusName: from });
+    await this.navigate(parent, { focusPath: location.path, focusName: from });
   }
 
   async goHistory(step: -1 | 1): Promise<void> {
@@ -212,9 +229,13 @@ export class PanelView {
       this.spacer.style.height = `${rows.length * ROW_HEIGHT}px`;
     }
     this.element.querySelector(".fm-empty")?.remove();
-    if (!rows.length) {
+    const entryRows = rows.length - (this.model.parent ? 1 : 0);
+    this.grid.setAttribute("aria-rowcount", String(rows.length + 1));
+    if (!entryRows) {
       const empty = document.createElement("div");
       empty.className = "fm-empty";
+      // Below the ".." row, which stays usable.
+      empty.style.top = `${(rows.length - entryRows) * ROW_HEIGHT}px`;
       empty.innerHTML = `${icon(this.model.filter ? "search" : "folder")}<span></span>`;
       empty.querySelector("span")!.textContent = this.model.filter
         ? `No names contain “${this.model.filter}”`
@@ -258,11 +279,15 @@ export class PanelView {
   }
 
   ensureCursorVisible(): void {
+    // Rows start below the list's top padding and must clear the bottom one.
+    const style = getComputedStyle(this.list);
+    const padTop = parseFloat(style.paddingTop) || 0;
+    const padBottom = parseFloat(style.paddingBottom) || 0;
     const top = this.model.cursor * ROW_HEIGHT;
     const view = this.list.clientHeight;
     if (top < this.list.scrollTop) this.list.scrollTop = top;
-    else if (top + ROW_HEIGHT > this.list.scrollTop + view) {
-      this.list.scrollTop = top + ROW_HEIGHT - view;
+    else if (top + ROW_HEIGHT + padTop + padBottom > this.list.scrollTop + view) {
+      this.list.scrollTop = top + ROW_HEIGHT + padTop + padBottom - view;
     }
     this.renderRows();
   }
@@ -311,6 +336,17 @@ export class PanelView {
     this.quickTimer = window.setTimeout(() => this.clearQuickSearch(), QUICK_SEARCH_RESET_MS);
   }
 
+  get quickSearchActive(): boolean {
+    return this.quickText !== "";
+  }
+
+  /** Backspace during a quick search: drop the last character. */
+  quickSearchBackspace(): void {
+    const text = this.quickText.slice(0, -1);
+    this.clearQuickSearch();
+    for (const char of text) this.quickSearch(char);
+  }
+
   /** Returns whether there was a quick search to clear. */
   clearQuickSearch(): boolean {
     const had = this.quickText !== "";
@@ -344,6 +380,7 @@ export class PanelView {
     row.id = `fm-${this.uid}-${this.side}-${index}`;
     row.role = "row";
     row.dataset.index = String(index);
+    row.setAttribute("aria-rowindex", String(index + 2));
     row.style.top = `${index * ROW_HEIGHT}px`;
     const data = this.model.rows[index];
     if (data.kind === "parent") {
@@ -389,16 +426,7 @@ export class PanelView {
 
   private renderStatus(): void {
     const { model } = this;
-    let folders = 0;
-    let files = 0;
-    let bytes = 0;
-    for (const entry of model.visibleEntries()) {
-      if (entry.isDirectory) folders += 1;
-      else {
-        files += 1;
-        bytes += entry.size ?? 0;
-      }
-    }
+    const { folders, files, bytes } = model.totals;
     const marked = model.markedSummary();
     this.status.innerHTML = "";
     const totals = document.createElement("span");
@@ -436,7 +464,7 @@ export class PanelView {
       const active = button.dataset.sort === sort.key;
       button.classList.toggle("is-sorted", active);
       button.querySelector("span")!.textContent = active ? (sort.direction === "asc" ? "↑" : "↓") : "";
-      button.setAttribute(
+      button.parentElement!.setAttribute(
         "aria-sort",
         active ? (sort.direction === "asc" ? "ascending" : "descending") : "none"
       );
@@ -444,10 +472,19 @@ export class PanelView {
   }
 
   private wire(): void {
-    this.element.addEventListener("pointerdown", () => this.host.activate(this));
+    this.element.addEventListener("pointerdown", (event) => {
+      this.host.activate(this);
+      // Clicks on non-focusable chrome (status line, badge, padding) would
+      // leave keyboard focus on <body>, where no key reaches the panel.
+      const target = event.target as Element;
+      if (!target.closest("input, button, select, textarea, [tabindex]")) {
+        requestAnimationFrame(() => this.focus());
+      }
+    });
     this.grid.addEventListener("focus", () => this.host.activate(this));
     this.list.addEventListener("scroll", () => this.renderRows(), { passive: true });
-    new ResizeObserver(() => this.renderRows()).observe(this.list);
+    // A resize (window, splitter, the transfer strip appearing) keeps the cursor in view.
+    new ResizeObserver(() => this.ensureCursorVisible()).observe(this.list);
 
     this.element.querySelectorAll<HTMLButtonElement>(".fm-tool").forEach((button) => {
       button.addEventListener("click", (event) => {
@@ -534,8 +571,11 @@ export class PanelView {
       event.preventDefault();
       this.host.activate(this);
       const index = this.rowIndexAt(event.target);
-      if (index !== null && !this.model.isMarked(index)) {
-        this.model.clickRow(index);
+      if (index !== null) {
+        // The menu acts on what was right-clicked: move the cursor there, and
+        // keep the marks only if that row is one of them.
+        if (this.model.isMarked(index)) this.model.setCursor(index);
+        else this.model.clickRow(index);
         this.renderStates();
       }
       this.host.contextMenu(this, event.clientX, event.clientY);
