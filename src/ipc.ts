@@ -79,74 +79,128 @@ export interface Folder {
   parentId?: string | null;
 }
 
-// ---- provider-neutral file manager ---------------------------------------
+// ---- filesystems (src-tauri/src/vfs) + transfers (src-tauri/src/transfer) ----
 
-export interface FileLocation {
-  provider: "local" | string;
-  /** Human-readable native path. Never use this value for path concatenation. */
+/** A path on a filesystem. `path` is an opaque token: never build or edit it. */
+export interface FsLocation {
+  /** "local", or a remote connection id. */
+  fs: string;
   path: string;
-  /** Opaque provider path passed back to the backend for every operation. */
-  token: string;
 }
 
-export interface FileRoot {
-  label: string;
-  location: FileLocation;
+/** A location plus its human-readable path. Can be passed wherever an FsLocation goes. */
+export interface FsLocationView extends FsLocation {
+  display: string;
 }
 
-export type FileEntryKind = "directory" | "file" | "symlink" | "other";
+export type FsEntryKind = "directory" | "file" | "symlink" | "other";
 
-export interface FileEntry {
+export interface FsEntry {
   name: string;
+  /** Opaque token of this entry's path (pair with the listing's `fs`). */
   path: string;
-  token: string;
-  kind: FileEntryKind;
+  display: string;
+  kind: FsEntryKind;
+  /** True for folders and for links that resolve to a folder. */
   isDirectory: boolean;
   size: number | null;
   /** Milliseconds since the Unix epoch. */
   modified: number | null;
-  hidden: boolean;
+  /** POSIX permission bits, where the filesystem has them. */
+  mode: number | null;
   readonly: boolean;
+  hidden: boolean;
+  owner: string | null;
+  group: string | null;
   /** Set when the entry was listed but could not be inspected. */
   error: string | null;
 }
 
-export interface DirectoryListing {
-  location: FileLocation;
-  parent: FileLocation | null;
-  entries: FileEntry[];
+export interface FsListing {
+  location: FsLocationView;
+  parent: FsLocationView | null;
+  entries: FsEntry[];
 }
 
-export interface FileConflict {
-  name: string;
-  path: string;
-  sameSource: boolean;
+export interface FsRoot {
+  label: string;
+  location: FsLocationView;
 }
 
-export interface FilePreview {
-  name: string;
-  path: string;
-  kind: "text" | "image" | "unavailable";
-  mime: string | null;
-  content: string | null;
-  size: number;
-  truncated: boolean;
-  message: string | null;
+export interface FsCapabilities {
+  trash: boolean;
+  openNative: boolean;
+  posixPermissions: boolean;
+  symlinks: boolean;
 }
 
-export type FileOperationKind = "copy" | "move";
-export type ConflictPolicy = "error" | "replace" | "skip" | "keep_both";
+export interface FsFolderSize {
+  items: number;
+  bytes: number;
+}
 
-export interface FileOperationRequest {
+export type TransferKind = "copy" | "move";
+
+export interface TransferRequest {
+  kind: TransferKind;
+  sources: FsLocation[];
+  /** The folder the sources go into. */
+  destination: FsLocation;
+}
+
+export type TransferState =
+  | "queued"
+  | "planning"
+  | "running"
+  | "waiting_for_user"
+  | "done"
+  | "failed"
+  | "cancelled";
+
+export interface TransferJob {
   id: string;
-  kind: FileOperationKind;
-  sources: string[];
-  destination: string;
-  conflictPolicy: ConflictPolicy;
+  kind: TransferKind;
+  state: TransferState;
+  message: string | null;
+  source: FsLocationView;
+  sourceCount: number;
+  destination: FsLocationView;
+  totalItems: number;
+  totalBytes: number;
+  completedItems: number;
+  completedBytes: number;
+  skippedItems: number;
 }
 
-export type FileOperationEvent =
-  | { event: "started"; id: string }
+export interface ConflictSide {
+  path: string;
+  isDirectory: boolean;
+  size: number | null;
+  modified: number | null;
+}
+
+export interface TransferConflict {
+  name: string;
+  source: ConflictSide;
+  target: ConflictSide;
+}
+
+export type ConflictResolution =
+  | { action: "overwrite" }
+  | { action: "skip" }
+  | { action: "rename"; name?: string }
+  | { action: "overwrite_if_newer" }
+  | { action: "overwrite_if_different_size" }
+  | { action: "cancel" };
+
+export interface ConflictAnswer {
+  resolution: ConflictResolution;
+  applyToAll: boolean;
+}
+
+export type TransferEvent =
+  | { event: "queued"; id: string }
+  | { event: "planning"; id: string }
   | { event: "planned"; id: string; totalItems: number; totalBytes: number }
   | {
       event: "progress";
@@ -156,7 +210,11 @@ export type FileOperationEvent =
       completedBytes: number;
       totalItems: number;
       totalBytes: number;
+      skippedItems: number;
+      bytesPerSecond: number;
+      etaSeconds: number | null;
     }
+  | { event: "conflict"; id: string; conflictId: number; conflict: TransferConflict }
   | {
       event: "finished";
       id: string;
@@ -164,13 +222,58 @@ export type FileOperationEvent =
       completedBytes: number;
       skippedItems: number;
     }
-  | { event: "failed"; id: string; message: string };
+  | { event: "failed"; id: string; message: string }
+  | { event: "cancelled"; id: string };
 
-export interface FileOperationResult {
-  id: string;
-  completedItems: number;
-  completedBytes: number;
-  skippedItems: number;
+export const fsApi = {
+  capabilities: (fs: string) => invoke<FsCapabilities>("fs_capabilities", { fs }),
+  home: (fs: string) => invoke<FsLocationView>("fs_home", { fs }),
+  roots: (fs: string) => invoke<FsRoot[]>("fs_roots", { fs }),
+  /** Typed input (absolute, `~`, or relative to `base`) → an existing folder. */
+  resolve: (fs: string, input: string, base?: FsLocation) =>
+    invoke<FsLocationView>("fs_resolve", { fs, input, base: base ?? null }),
+  list: (location: FsLocation) => invoke<FsListing>("fs_list", { location: plain(location) }),
+  stat: (location: FsLocation) => invoke<FsEntry>("fs_stat", { location: plain(location) }),
+  mkdir: (parent: FsLocation, name: string) =>
+    invoke<FsLocationView>("fs_mkdir", { parent: plain(parent), name }),
+  /** Rename in place; never replaces an existing entry. */
+  rename: (location: FsLocation, name: string) =>
+    invoke<FsLocationView>("fs_rename", { location: plain(location), name }),
+  /** Permanently delete, folders included. */
+  remove: (locations: FsLocation[]) =>
+    invoke<void>("fs_delete", { locations: locations.map(plain) }),
+  trash: (locations: FsLocation[]) => invoke<void>("fs_trash", { locations: locations.map(plain) }),
+  openNative: (location: FsLocation) => invoke<void>("fs_open_native", { location: plain(location) }),
+  /** Raw bytes `[offset, offset + length)` (at most 4 MiB per call). */
+  read: (location: FsLocation, offset: number, length: number) =>
+    invoke<ArrayBuffer>("fs_read", { location: plain(location), offset, length }),
+  folderSize: (location: FsLocation) =>
+    invoke<FsFolderSize>("fs_dir_size", { location: plain(location) }),
+};
+
+export const transferApi = {
+  /** Queue a copy/move; returns at once. Progress and questions arrive on `onEvent`. */
+  start: (request: TransferRequest, onEvent: (event: TransferEvent) => void) => {
+    const channel = new Channel<TransferEvent>();
+    channel.onmessage = onEvent;
+    return invoke<TransferJob>("transfer_start", {
+      request: {
+        kind: request.kind,
+        sources: request.sources.map(plain),
+        destination: plain(request.destination),
+      },
+      onEvent: channel,
+    });
+  },
+  cancel: (id: string) => invoke<boolean>("transfer_cancel", { id }),
+  list: () => invoke<TransferJob[]>("transfer_list"),
+  resolve: (id: string, conflictId: number, answer: ConflictAnswer) =>
+    invoke<void>("transfer_resolve", { id, conflictId, answer }),
+};
+
+/** Just the addressing fields — views and entries carry extra display data. */
+function plain(location: FsLocation): FsLocation {
+  return { fs: location.fs, path: location.path };
 }
 
 export const api = {
@@ -195,28 +298,6 @@ export const api = {
   listShells: () => invoke<ShellInfo[]>("list_local_shells"),
   /** Host OS: "windows" | "macos" | "linux" | … */
   hostOs: () => invoke<string>("host_os"),
-
-  filesHome: () => invoke<FileLocation>("files_home"),
-  filesRoots: () => invoke<FileRoot[]>("files_roots"),
-  filesResolve: (path: string, baseToken?: string) =>
-    invoke<FileLocation>("files_resolve", { path, baseToken }),
-  filesList: (token: string) => invoke<DirectoryListing>("files_list", { token }),
-  filesConflicts: (sources: string[], destination: string) =>
-    invoke<FileConflict[]>("files_conflicts", { sources, destination }),
-  filesCreateDirectory: (parent: string, name: string) =>
-    invoke<FileLocation>("files_create_directory", { parent, name }),
-  filesRename: (token: string, name: string) =>
-    invoke<FileLocation>("files_rename", { token, name }),
-  filesTrash: (tokens: string[]) => invoke<void>("files_trash", { tokens }),
-  filesDelete: (tokens: string[]) => invoke<void>("files_delete", { tokens }),
-  filesOpen: (token: string) => invoke<void>("files_open", { token }),
-  filesPreview: (token: string) => invoke<FilePreview>("files_preview", { token }),
-  filesOperate: (request: FileOperationRequest, onMessage: (event: FileOperationEvent) => void) => {
-    const onEvent = new Channel<FileOperationEvent>();
-    onEvent.onmessage = onMessage;
-    return invoke<FileOperationResult>("files_operate", { request, onEvent });
-  },
-  filesCancel: (id: string) => invoke<boolean>("files_cancel", { id }),
 
   secretSet: (id: string, secret: string) => invoke<void>("secret_set", { id, secret }),
   secretGet: (id: string) => invoke<string | null>("secret_get", { id }),

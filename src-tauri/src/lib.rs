@@ -7,13 +7,11 @@
 #[cfg(windows)]
 mod broker;
 mod commands;
-mod file_manager;
 mod session;
 mod store;
 mod transfer;
 mod vfs;
 
-use file_manager::FileOperationManager;
 use session::SessionManager;
 use transfer::queue::TransferManager;
 use vfs::FsRegistry;
@@ -38,7 +36,6 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(SessionManager::default())
-        .manage(FileOperationManager::default())
         .manage(FsRegistry::default())
         .manage(TransferManager::default())
         .invoke_handler(tauri::generate_handler![
@@ -54,19 +51,6 @@ pub fn run() {
             commands::session_list,
             commands::list_local_shells,
             commands::host_os,
-            file_manager::files_home,
-            file_manager::files_roots,
-            file_manager::files_resolve,
-            file_manager::files_list,
-            file_manager::files_conflicts,
-            file_manager::files_create_directory,
-            file_manager::files_rename,
-            file_manager::files_trash,
-            file_manager::files_delete,
-            file_manager::files_open,
-            file_manager::files_preview,
-            file_manager::files_operate,
-            file_manager::files_cancel,
             vfs::commands::fs_capabilities,
             vfs::commands::fs_home,
             vfs::commands::fs_roots,
@@ -78,6 +62,8 @@ pub fn run() {
             vfs::commands::fs_delete,
             vfs::commands::fs_trash,
             vfs::commands::fs_open_native,
+            vfs::commands::fs_read,
+            vfs::commands::fs_dir_size,
             transfer::transfer_start,
             transfer::transfer_cancel,
             transfer::transfer_list,

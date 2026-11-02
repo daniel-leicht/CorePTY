@@ -1,0 +1,868 @@
+// The dual-pane file manager tab (WinSCP / Norton Commander style): two
+// panels, a transfer strip and an F-key bar. Everything goes through the
+// provider-neutral fs_* / transfer_* commands, so a panel can show any
+// registered filesystem.
+
+import {
+  fsApi,
+  pickDirectory,
+  type FsEntry,
+  type FsLocation,
+  type FsLocationView,
+  type TransferKind,
+  type TransferRequest,
+} from "../ipc";
+import { contextMenu, type MenuItem } from "../menu";
+import type { AppTab, TabStatus, TabStatusInfo } from "../tab";
+import { uuid } from "../util";
+import { confirmAction, copyMoveDialog, maskDialog, modalOpen, promptText } from "./dialogs";
+import { formatFileSize } from "./format";
+import { commandFor, FUNCTION_KEYS, isQuickSearchKey, type FmCommand } from "./keymap";
+import { DRAG_TYPE, PanelView, type PanelHost } from "./panel-view";
+import { TransferQueue } from "./transfer-queue";
+import { openViewer } from "./viewer";
+
+const LOCATION_KEY = "corepty.fm.location.";
+const SPLIT_KEY = "corepty.files.split";
+
+export interface FileManagerOptions {
+  toast: (message: string, kind?: "info" | "warn" | "error") => void;
+  /** Start here (duplicating a tab) instead of the remembered folders. */
+  initialLocations?: [FsLocationView | undefined, FsLocationView | undefined];
+}
+
+interface Clipboard {
+  kind: TransferKind;
+  fs: string;
+  entries: Array<Pick<FsEntry, "name" | "path">>;
+  /** The folder they came from, refreshed after a cut-and-paste. */
+  from: FsLocationView | null;
+}
+
+interface DragPayload {
+  tab: string;
+  side: 0 | 1;
+  fs: string;
+  entries: Array<Pick<FsEntry, "name" | "path">>;
+  from: FsLocationView | null;
+}
+
+/** Shared by every file manager tab, like the OS clipboard. */
+let clipboard: Clipboard | null = null;
+
+export class FileManagerTab implements AppTab, PanelHost {
+  readonly tabType = "file-manager" as const;
+  readonly uid = uuid();
+  readonly element: HTMLDivElement;
+  readonly iconName = "files";
+  readonly elevated = false;
+
+  onTitleUpdate?: () => void;
+  onStatusChange?: () => void;
+  onClose?: () => void;
+
+  status: TabStatus = "connecting";
+  readonly toast: FileManagerOptions["toast"];
+  private customTitle: string | null = null;
+  private opened = false;
+  private disposed = false;
+  private activeSide: 0 | 1 = 0;
+  private readonly panels: [PanelView, PanelView];
+  private readonly queue: TransferQueue;
+  private readonly initialLocations?: FileManagerOptions["initialLocations"];
+  /** Source folder of each queued transfer, refreshed when it ends. */
+  private readonly transferSources = new WeakMap<TransferRequest, FsLocationView | null>();
+
+  constructor(options: FileManagerOptions) {
+    this.toast = options.toast;
+    this.initialLocations = options.initialLocations;
+    this.panels = [new PanelView(this, 0, this.uid), new PanelView(this, 1, this.uid)];
+    this.queue = new TransferQueue({
+      toast: (message, kind) => this.toast(message, kind),
+      finished: (request) => this.afterTransfer(request),
+      changed: () => this.onStatusChange?.(),
+    });
+    this.element = document.createElement("div");
+    this.element.className = "file-manager";
+    this.element.innerHTML = `
+      <div class="fm-workspace">
+        <div class="fm-panels"><div class="fm-splitter" role="separator" aria-label="Resize file panels" aria-orientation="vertical" tabindex="0"></div></div>
+        <div class="fm-keys" role="toolbar" aria-label="File commands"></div>
+      </div>`;
+    const panelsEl = this.element.querySelector(".fm-panels")!;
+    panelsEl.prepend(this.panels[0].element);
+    panelsEl.append(this.panels[1].element);
+    this.element.querySelector(".fm-workspace")!.insertBefore(
+      this.queue.element,
+      this.element.querySelector(".fm-keys")
+    );
+    this.panels[0].setActive(true);
+    this.buildKeyBar();
+    this.wireSplitter();
+    this.element.addEventListener("keydown", (event) => this.onKeyDown(event), true);
+  }
+
+  // ---- AppTab --------------------------------------------------------------
+
+  get title(): string {
+    return this.customTitle ?? "File Manager";
+  }
+
+  get pinned(): boolean {
+    return this.customTitle !== null;
+  }
+
+  setCustomTitle(name: string | null): void {
+    const trimmed = name?.trim() ?? "";
+    this.customTitle = trimmed || null;
+    this.onTitleUpdate?.();
+  }
+
+  statusInfo(): TabStatusInfo {
+    const panel = this.active;
+    const fs = panel.fs === "local" ? "LOCAL" : panel.fs.toUpperCase();
+    const marked = panel.model.markedSummary();
+    const items = panel.model.visibleEntries().length;
+    const parts = [
+      marked.count ? `${marked.count} marked · ${formatFileSize(marked.bytes)}` : `${items} items`,
+      this.queue.summary(),
+    ].filter(Boolean);
+    return { kind: `FILES · ${fs}`, context: panel.location?.display, metrics: parts.join(" · ") };
+  }
+
+  open(): void {
+    if (this.opened) return;
+    this.opened = true;
+    void this.initialize();
+  }
+
+  fit(): void {
+    for (const panel of this.panels) panel.renderRows();
+  }
+
+  focus(): void {
+    this.active.focus();
+  }
+
+  applySettings(): void {
+    // Colors and fonts follow the app theme through CSS variables.
+  }
+
+  dispose(): void {
+    this.disposed = true;
+    this.queue.cancelAll();
+    for (const panel of this.panels) panel.dispose();
+    this.element.remove();
+  }
+
+  /** Both panels' folders, for duplicating this tab. */
+  currentLocations(): [FsLocationView | undefined, FsLocationView | undefined] {
+    return [this.panels[0].location ?? undefined, this.panels[1].location ?? undefined];
+  }
+
+  /** Ctrl+Shift+F from the app: filter the active panel. */
+  openSearch(): void {
+    this.active.openFilter();
+  }
+
+  // ---- PanelHost -----------------------------------------------------------
+
+  activate(panel: PanelView): void {
+    if (this.active === panel) return;
+    this.activeSide = panel.side;
+    for (const each of this.panels) each.setActive(each === panel);
+    this.onStatusChange?.();
+  }
+
+  openRow(panel: PanelView): void {
+    void this.openCursor(panel);
+  }
+
+  changed(panel: PanelView): void {
+    const location = panel.location;
+    if (location) {
+      writeStorage(`${LOCATION_KEY}${panel.side}`, JSON.stringify(location));
+      writeStorage(`${LOCATION_KEY}${panel.side}.${location.fs}`, JSON.stringify(location));
+    }
+    this.onStatusChange?.();
+  }
+
+  contextMenu(panel: PanelView, x: number, y: number): void {
+    const targets = panel.model.targets();
+    const one = targets.length === 1 ? targets[0] : null;
+    const items: MenuItem[] = [];
+    if (one) {
+      items.push({
+        label: one.isDirectory ? "Open" : "Open with default app",
+        icon: one.isDirectory ? "folder" : "file",
+        action: () => void this.openCursor(panel),
+      });
+      if (!one.isDirectory) {
+        items.push({ label: "View (F3)", icon: "eye", action: () => void this.run("view") });
+      }
+    }
+    if (targets.length) {
+      items.push(
+        "sep",
+        { label: "Copy to other panel (F5)", icon: "copy", action: () => void this.run("copy") },
+        { label: "Move to other panel (F6)", icon: "move", action: () => void this.run("move") },
+        { label: "Copy (Ctrl+C)", icon: "copy", action: () => void this.run("clipCopy") },
+        { label: "Cut (Ctrl+X)", icon: "move", action: () => void this.run("clipCut") }
+      );
+    }
+    if (clipboard) items.push({ label: "Paste (Ctrl+V)", icon: "copy", action: () => void this.run("clipPaste") });
+    if (one) items.push({ label: "Rename (F2)", icon: "pencil", action: () => void this.run("rename") });
+    if (targets.some((entry) => entry.isDirectory)) {
+      items.push({ label: "Calculate size", icon: "refresh", action: () => void this.measure(panel, targets) });
+    }
+    if (targets.length) {
+      items.push(
+        "sep",
+        {
+          label: panel.capabilities.trash ? "Move to Trash (F8)" : "Delete (F8)",
+          icon: "trash",
+          danger: true,
+          action: () => void this.run("delete"),
+        },
+        {
+          label: "Delete permanently (Shift+F8)",
+          icon: "trash",
+          danger: true,
+          action: () => void this.run("deletePermanent"),
+        }
+      );
+    }
+    items.push(
+      "sep",
+      { label: "New folder (F7)", icon: "folderPlus", action: () => void this.run("mkdir") },
+      { label: "Refresh (Ctrl+R)", icon: "refresh", action: () => void this.run("refresh") }
+    );
+    contextMenu(x, y, items);
+  }
+
+  locationMenu(panel: PanelView, anchor: HTMLElement): void {
+    void (async () => {
+      let roots;
+      try {
+        roots = await fsApi.roots(panel.fs);
+      } catch (error) {
+        this.toast(`Couldn't list locations: ${error}`, "error");
+        return;
+      }
+      const items: MenuItem[] = roots.map((root) => ({
+        label: root.label,
+        icon: root.label === "Home" ? "home" : "server",
+        action: () => void panel.navigate(root.location).then(() => panel.focus()),
+      }));
+      if (panel.fs === "local") {
+        items.push("sep", {
+          label: "Choose folder…",
+          icon: "folder",
+          action: () => void this.chooseFolder(panel),
+        });
+      }
+      const bounds = anchor.getBoundingClientRect();
+      contextMenu(bounds.left, bounds.bottom + 4, items);
+    })();
+  }
+
+  dragStart(panel: PanelView, event: DragEvent): void {
+    const index = panel.rowIndexAt(event.target);
+    if (index === null || panel.model.isParentRow(index) || !event.dataTransfer) {
+      event.preventDefault();
+      return;
+    }
+    if (!panel.model.isMarked(index)) {
+      panel.model.clickRow(index);
+      panel.renderStates();
+    }
+    const entries = panel.model.targets();
+    const payload: DragPayload = {
+      tab: this.uid,
+      side: panel.side,
+      fs: panel.fs,
+      entries: entries.map(({ name, path }) => ({ name, path })),
+      from: panel.location,
+    };
+    event.dataTransfer.setData(DRAG_TYPE, JSON.stringify(payload));
+    event.dataTransfer.setData("text/plain", entries.map((entry) => entry.display).join("\n"));
+    event.dataTransfer.effectAllowed = "copyMove";
+    panel.element.classList.add("is-drag-source");
+    event.target?.addEventListener(
+      "dragend",
+      () => {
+        for (const each of this.panels) {
+          each.element.classList.remove("is-drag-source");
+          each.setDropTarget(null);
+        }
+      },
+      { once: true }
+    );
+  }
+
+  drop(panel: PanelView, folder: FsEntry | null, event: DragEvent): void {
+    let payload: DragPayload;
+    try {
+      payload = JSON.parse(event.dataTransfer?.getData(DRAG_TYPE) ?? "") as DragPayload;
+    } catch {
+      return;
+    }
+    if (!payload.entries?.length) return;
+    const location = panel.location;
+    if (!location) return;
+    const destination: FsLocationView = folder
+      ? { fs: panel.fs, path: folder.path, display: folder.display }
+      : location;
+    const sameFolder =
+      payload.from?.fs === destination.fs && payload.from?.path === destination.path;
+    if (sameFolder) return; // dropped back where it came from
+    if (payload.fs === destination.fs && payload.entries.some((entry) => entry.path === destination.path)) {
+      return; // onto one of the dragged folders
+    }
+    const kind: TransferKind = event.shiftKey ? "move" : "copy";
+    void this.startTransfer(kind, payload.fs, payload.entries, payload.from, destination);
+  }
+
+  // ---- commands ------------------------------------------------------------
+
+  private get active(): PanelView {
+    return this.panels[this.activeSide];
+  }
+
+  private get other(): PanelView {
+    return this.panels[this.activeSide === 0 ? 1 : 0];
+  }
+
+  private async initialize(): Promise<void> {
+    let home: FsLocationView | null = null;
+    const homeFor = async () => (home ??= await fsApi.home("local"));
+    let opened = 0;
+    for (const panel of this.panels) {
+      const wanted = this.initialLocations?.[panel.side] ?? readLocation(panel.side);
+      if (wanted && (await panel.navigate(wanted, { quiet: true }))) {
+        opened += 1;
+        continue;
+      }
+      try {
+        if (await panel.navigate(await homeFor())) opened += 1;
+      } catch (error) {
+        this.toast(`Couldn't open the file manager: ${error}`, "error");
+      }
+    }
+    if (this.disposed) return;
+    this.status = opened ? "connected" : "error";
+    this.onStatusChange?.();
+    this.active.focus();
+  }
+
+  private onKeyDown(event: KeyboardEvent): void {
+    if (event.defaultPrevented || modalOpen()) return;
+    const target = event.target as HTMLElement;
+    if (target.matches("input, textarea")) {
+      // Inputs keep their keys, but never let F-keys/Ctrl+R reach the webview
+      // (F5 / Ctrl+R would reload the whole app, F7 toggles caret browsing).
+      const refresh = (event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "r";
+      if (/^F\d{1,2}$/.test(event.key) || refresh) event.preventDefault();
+      if (refresh) void this.run("refresh");
+      return;
+    }
+    // Keys act on the panel that has keyboard focus, whatever was last clicked.
+    const focused = this.panels.find((panel) => panel.element.contains(target));
+    if (focused) this.activate(focused);
+    const command = commandFor(event);
+    if (command) {
+      event.preventDefault();
+      // Any command key ends a quick search, as in Commander (Esc ends just it).
+      if (command !== "clear") this.active.clearQuickSearch();
+      void this.run(command);
+    } else if (isQuickSearchKey(event)) {
+      event.preventDefault();
+      this.active.quickSearch(event.key);
+    }
+  }
+
+  private async run(command: FmCommand): Promise<void> {
+    const panel = this.active;
+    const { model } = panel;
+    const page = panel.pageSize();
+    let moved = true;
+    switch (command) {
+      case "cursorUp":
+        model.moveCursor(-1);
+        break;
+      case "cursorDown":
+        model.moveCursor(1);
+        break;
+      case "pageUp":
+        model.moveCursor(-page);
+        break;
+      case "pageDown":
+        model.moveCursor(page);
+        break;
+      case "home":
+        model.setCursor(0);
+        break;
+      case "end":
+        model.setCursor(model.rows.length - 1);
+        break;
+      case "extendUp":
+        model.extendTo(model.cursor - 1);
+        break;
+      case "extendDown":
+        model.extendTo(model.cursor + 1);
+        break;
+      case "extendPageUp":
+        model.extendTo(model.cursor - page);
+        break;
+      case "extendPageDown":
+        model.extendTo(model.cursor + page);
+        break;
+      case "extendHome":
+        model.extendTo(0);
+        break;
+      case "extendEnd":
+        model.extendTo(model.rows.length - 1);
+        break;
+      case "toggleMarkAdvance":
+        model.toggleMarkAndAdvance();
+        break;
+      case "toggleMark": {
+        const entry = model.toggleMarkAtCursor();
+        if (entry?.isDirectory && model.marks.has(entry.path)) void this.measure(panel, [entry]);
+        break;
+      }
+      case "markAll":
+        model.markAll();
+        break;
+      case "invertMarks":
+        model.invertMarks();
+        break;
+      case "markMask":
+      case "unmarkMask": {
+        const mark = command === "markMask";
+        const mask = await maskDialog(mark);
+        if (mask) model.markByMask(mask, mark);
+        break;
+      }
+      case "clear":
+        if (!panel.clearQuickSearch()) {
+          if (panel.filterOpen) panel.closeFilter();
+          else model.clearMarks();
+        }
+        break;
+      default:
+        moved = false;
+    }
+    if (moved) {
+      panel.renderStates();
+      panel.ensureCursorVisible();
+      this.changed(panel);
+      return;
+    }
+
+    switch (command) {
+      case "open":
+        return this.openCursor(panel);
+      case "parent":
+        return panel.goUp();
+      case "back":
+        return panel.goHistory(-1);
+      case "forward":
+        return panel.goHistory(1);
+      case "switchPanel":
+        this.activate(this.other);
+        this.active.focus();
+        return;
+      case "swapPanels":
+        return this.swapPanels();
+      case "root":
+        return this.goRoot(panel);
+      case "refresh":
+        await panel.refresh();
+        return;
+      case "filter":
+        return panel.openFilter();
+      case "locationLeft":
+      case "locationRight": {
+        const target = this.panels[command === "locationLeft" ? 0 : 1];
+        this.activate(target);
+        this.locationMenu(target, target.element.querySelector<HTMLElement>('.fm-tool[data-act="roots"]')!);
+        return;
+      }
+      case "view":
+        return this.view(panel);
+      case "edit":
+        return this.edit(panel);
+      case "copy":
+      case "move":
+        return this.transferToOther(command);
+      case "rename":
+        return this.rename(panel);
+      case "mkdir":
+        return this.mkdir(panel);
+      case "delete":
+      case "deletePermanent":
+        return this.remove(panel, command === "deletePermanent");
+      case "clipCopy":
+      case "clipCut":
+        return this.toClipboard(panel, command === "clipCopy" ? "copy" : "move");
+      case "clipPaste":
+        return this.paste(panel);
+    }
+  }
+
+  private async openCursor(panel: PanelView): Promise<void> {
+    const { model } = panel;
+    if (model.isParentRow(model.cursor)) return panel.goUp();
+    const entry = model.cursorEntry();
+    if (!entry) return;
+    if (entry.isDirectory) {
+      await panel.navigate({ fs: panel.fs, path: entry.path, display: entry.display });
+      return;
+    }
+    return this.edit(panel, entry);
+  }
+
+  private async view(panel: PanelView): Promise<void> {
+    const entry = panel.model.cursorEntry();
+    if (!entry || entry.isDirectory) {
+      this.toast("Put the cursor on a file to view it", "warn");
+      return;
+    }
+    await openViewer(panel.fs, entry);
+  }
+
+  /** F4 / Enter on a file: open it with the OS default application. */
+  private async edit(panel: PanelView, entry = panel.model.cursorEntry()): Promise<void> {
+    if (!entry || entry.isDirectory) return;
+    if (!panel.capabilities.openNative) {
+      this.toast("Editing remote files arrives with SFTP support", "info");
+      return;
+    }
+    try {
+      await fsApi.openNative({ fs: panel.fs, path: entry.path });
+    } catch (error) {
+      this.toast(`Couldn't open ${entry.name}: ${error}`, "error");
+    }
+  }
+
+  private async transferToOther(kind: TransferKind): Promise<void> {
+    const panel = this.active;
+    const entries = panel.model.targets();
+    const destination = this.other.location;
+    if (!entries.length) {
+      this.toast("Mark files or put the cursor on one first", "warn");
+      return;
+    }
+    if (!destination) return;
+    const typed = await copyMoveDialog({
+      kind,
+      what: describe(entries),
+      destination: destination.display,
+    });
+    if (typed === null) return;
+    let target = destination;
+    if (typed !== destination.display) {
+      try {
+        target = await fsApi.resolve(destination.fs, typed, destination);
+      } catch (error) {
+        this.toast(`Couldn't use ${typed}: ${error}`, "error");
+        return;
+      }
+    }
+    await this.startTransfer(kind, panel.fs, entries, panel.location, target);
+    panel.model.clearMarks();
+    panel.renderStates();
+  }
+
+  private async startTransfer(
+    kind: TransferKind,
+    fs: string,
+    entries: Array<Pick<FsEntry, "name" | "path">>,
+    from: FsLocationView | null,
+    destination: FsLocationView
+  ): Promise<void> {
+    const request: TransferRequest = {
+      kind,
+      sources: entries.map((entry) => ({ fs, path: entry.path })),
+      destination,
+    };
+    this.transferSources.set(request, from);
+    const verb = kind === "copy" ? "Copy" : "Move";
+    await this.queue.start(request, `${verb} ${describe(entries)} → ${destination.display}`);
+  }
+
+  /** Refresh whichever panels show the folders a finished transfer touched. */
+  private afterTransfer(request: TransferRequest): void {
+    if (this.disposed) return;
+    const touched: FsLocation[] = [request.destination];
+    const from = this.transferSources.get(request);
+    if (from) touched.push(from);
+    for (const panel of this.panels) {
+      const location = panel.location;
+      if (location && touched.some((each) => each.fs === location.fs && each.path === location.path)) {
+        void panel.refresh();
+      }
+    }
+  }
+
+  private async rename(panel: PanelView): Promise<void> {
+    const targets = panel.model.targets();
+    if (targets.length !== 1) {
+      this.toast("Rename works on one item at a time", "warn");
+      return;
+    }
+    const entry = targets[0];
+    const name = await promptText({
+      title: "Rename",
+      label: "New name",
+      value: entry.name,
+      action: "Rename",
+      selectStem: !entry.isDirectory,
+    });
+    if (!name || name === entry.name) return;
+    try {
+      await fsApi.rename({ fs: panel.fs, path: entry.path }, name);
+      await this.refreshShowing(panel, name);
+    } catch (error) {
+      this.toast(`Couldn't rename ${entry.name}: ${error}`, "error");
+    }
+  }
+
+  private async mkdir(panel: PanelView): Promise<void> {
+    const location = panel.location;
+    if (!location) return;
+    const name = await promptText({ title: "New folder", label: "Name", value: "", action: "Create" });
+    if (!name) return;
+    try {
+      await fsApi.mkdir(location, name);
+      await this.refreshShowing(panel, name);
+    } catch (error) {
+      this.toast(`Couldn't create ${name}: ${error}`, "error");
+    }
+  }
+
+  private async remove(panel: PanelView, permanent: boolean): Promise<void> {
+    const targets = panel.model.targets();
+    if (!targets.length) {
+      this.toast("Mark files or put the cursor on one first", "warn");
+      return;
+    }
+    const toTrash = !permanent && panel.capabilities.trash;
+    const folders = targets.filter((entry) => entry.isDirectory);
+    const bytes = targets.reduce(
+      (sum, entry) =>
+        sum + (entry.isDirectory ? (panel.model.folderSizes.get(entry.path) ?? 0) : (entry.size ?? 0)),
+      0
+    );
+    const unmeasured = folders.some((entry) => !panel.model.folderSizes.has(entry.path));
+    const confirmed = await confirmAction({
+      title: toTrash ? "Move to Trash?" : "Delete permanently?",
+      message: `${describe(targets)} (${formatFileSize(bytes)}${unmeasured ? " plus folder contents" : ""}) will be ${
+        toTrash ? "moved to the Trash" : "deleted. This can't be undone"
+      }.`,
+      detail: folders.length ? `Includes ${folders.length} ${folders.length === 1 ? "folder" : "folders"} and everything in them.` : undefined,
+      action: toTrash ? "Move to Trash" : "Delete",
+      danger: !toTrash,
+    });
+    if (!confirmed) return;
+    const locations = targets.map((entry) => ({ fs: panel.fs, path: entry.path }));
+    try {
+      if (toTrash) await fsApi.trash(locations);
+      else await fsApi.remove(locations);
+    } catch (error) {
+      this.toast(`${toTrash ? "Trash" : "Delete"} failed: ${error}`, "error");
+    }
+    await this.refreshShowing(panel);
+  }
+
+  /** Refresh `panel` (optionally landing on `focusName`) and the other panel if it shows the same folder. */
+  private async refreshShowing(panel: PanelView, focusName?: string): Promise<void> {
+    const location = panel.location;
+    if (!location) return;
+    await panel.navigate(location, { keepState: true, history: "none", focusName });
+    const other = panel === this.panels[0] ? this.panels[1] : this.panels[0];
+    if (other.location?.fs === location.fs && other.location.path === location.path) {
+      await other.refresh();
+    }
+  }
+
+  private async measure(panel: PanelView, entries: FsEntry[]): Promise<void> {
+    for (const entry of entries.filter((each) => each.isDirectory)) {
+      try {
+        const size = await fsApi.folderSize({ fs: panel.fs, path: entry.path });
+        panel.model.folderSizes.set(entry.path, size.bytes);
+        panel.renderStates();
+        this.onStatusChange?.();
+      } catch (error) {
+        this.toast(`Couldn't measure ${entry.name}: ${error}`, "error");
+      }
+    }
+  }
+
+  private toClipboard(panel: PanelView, kind: TransferKind): void {
+    const entries = panel.model.targets();
+    if (!entries.length) return;
+    clipboard = {
+      kind,
+      fs: panel.fs,
+      entries: entries.map(({ name, path }) => ({ name, path })),
+      from: panel.location,
+    };
+    this.toast(`${kind === "copy" ? "Copied" : "Cut"} ${describe(entries)}`, "info");
+  }
+
+  private async paste(panel: PanelView): Promise<void> {
+    const location = panel.location;
+    if (!clipboard || !location) return;
+    const { kind, fs, entries, from } = clipboard;
+    if (kind === "move") clipboard = null; // a cut pastes once
+    await this.startTransfer(kind, fs, entries, from, location);
+  }
+
+  private async chooseFolder(panel: PanelView): Promise<void> {
+    const picked = await pickDirectory(panel.location?.display);
+    if (!picked) return;
+    try {
+      await panel.navigate(await fsApi.resolve("local", picked));
+      panel.focus();
+    } catch (error) {
+      this.toast(`Couldn't open ${picked}: ${error}`, "error");
+    }
+  }
+
+  private async goRoot(panel: PanelView): Promise<void> {
+    const location = panel.location;
+    if (!location) return;
+    try {
+      await panel.navigate(await fsApi.resolve(location.fs, rootOf(location.display), location));
+    } catch (error) {
+      this.toast(`Couldn't open the root folder: ${error}`, "error");
+    }
+  }
+
+  private async swapPanels(): Promise<void> {
+    const [left, right] = this.currentLocations();
+    if (!left || !right) return;
+    await Promise.all([this.panels[0].navigate(right), this.panels[1].navigate(left)]);
+  }
+
+  // ---- chrome ----------------------------------------------------------------
+
+  private buildKeyBar(): void {
+    const bar = this.element.querySelector<HTMLElement>(".fm-keys")!;
+    for (const { key, label, command } of FUNCTION_KEYS) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = `fm-key${command === "delete" ? " fm-key--danger" : ""}`;
+      button.dataset.command = command;
+      button.innerHTML = `<kbd>${key}</kbd><span class="fm-key__label"></span>`;
+      button.querySelector(".fm-key__label")!.textContent = label;
+      // Holding Shift shows (and runs) the Shift variants, as in Commander.
+      if (command === "move") button.dataset.shift = "Rename";
+      if (command === "delete") button.dataset.shift = "Delete!";
+      button.dataset.label = label;
+      button.addEventListener("mousedown", (event) => event.preventDefault()); // keep panel focus
+      button.addEventListener("click", (event) => {
+        const shifted =
+          event.shiftKey && command === "move" ? "rename" : event.shiftKey && command === "delete" ? "deletePermanent" : command;
+        void this.run(shifted);
+      });
+      bar.appendChild(button);
+    }
+    const setShift = (shift: boolean) => {
+      bar.querySelectorAll<HTMLElement>(".fm-key").forEach((button) => {
+        const label = button.querySelector(".fm-key__label")!;
+        label.textContent = shift && button.dataset.shift ? button.dataset.shift : button.dataset.label!;
+      });
+    };
+    this.element.addEventListener("keydown", (event) => {
+      if (event.key === "Shift") setShift(true);
+    });
+    this.element.addEventListener("keyup", (event) => {
+      if (event.key === "Shift") setShift(false);
+    });
+    window.addEventListener("blur", () => setShift(false));
+  }
+
+  private wireSplitter(): void {
+    const splitter = this.element.querySelector<HTMLElement>(".fm-splitter")!;
+    const panels = this.element.querySelector<HTMLElement>(".fm-panels")!;
+    const setSplit = (percent: number) => {
+      const clamped = Math.max(25, Math.min(75, percent));
+      panels.style.setProperty("--fm-split", `${clamped}%`);
+      splitter.setAttribute("aria-valuenow", String(Math.round(clamped)));
+      return clamped;
+    };
+    const stored = Number(readStorage(SPLIT_KEY));
+    setSplit(Number.isFinite(stored) && stored >= 25 && stored <= 75 ? stored : 50);
+    let current = 50;
+    splitter.addEventListener("pointerdown", (event) => {
+      if (event.button !== 0) return;
+      event.preventDefault();
+      splitter.setPointerCapture(event.pointerId);
+      splitter.classList.add("is-dragging");
+    });
+    splitter.addEventListener("pointermove", (event) => {
+      if (!splitter.hasPointerCapture(event.pointerId)) return;
+      const bounds = panels.getBoundingClientRect();
+      current = setSplit(((event.clientX - bounds.left) / bounds.width) * 100);
+    });
+    const finish = (event: PointerEvent) => {
+      if (!splitter.hasPointerCapture(event.pointerId)) return;
+      splitter.releasePointerCapture(event.pointerId);
+      splitter.classList.remove("is-dragging");
+      writeStorage(SPLIT_KEY, String(current));
+    };
+    splitter.addEventListener("pointerup", finish);
+    splitter.addEventListener("pointercancel", finish);
+    splitter.addEventListener("dblclick", () => writeStorage(SPLIT_KEY, String((current = setSplit(50)))));
+    splitter.addEventListener("keydown", (event) => {
+      if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
+      event.preventDefault();
+      event.stopPropagation();
+      current = setSplit(current + (event.key === "ArrowRight" ? 2 : -2));
+      writeStorage(SPLIT_KEY, String(current));
+    });
+  }
+}
+
+/** “report.txt” or “3 items”. */
+function describe(entries: ReadonlyArray<Pick<FsEntry, "name">>): string {
+  return entries.length === 1 ? `“${entries[0].name}”` : `${entries.length} items`;
+}
+
+/** The root of a displayed path: `C:\`, `\\server\share\`, or `/`. */
+export function rootOf(display: string): string {
+  const drive = /^[A-Za-z]:[\\/]/.exec(display);
+  if (drive) return `${display.slice(0, 2)}\\`;
+  const unc = /^\\\\[^\\]+\\[^\\]+/.exec(display);
+  if (unc) return `${unc[0]}\\`;
+  return "/";
+}
+
+function readLocation(side: 0 | 1): FsLocationView | null {
+  try {
+    const parsed = JSON.parse(readStorage(`${LOCATION_KEY}${side}`) ?? "null") as FsLocationView | null;
+    return parsed && typeof parsed.fs === "string" && typeof parsed.path === "string" ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function readStorage(key: string): string | undefined {
+  try {
+    return window.localStorage.getItem(key) ?? undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function writeStorage(key: string, value: string): void {
+  try {
+    window.localStorage.setItem(key, value);
+  } catch {
+    // Persistence is a convenience; private webviews may disable localStorage.
+  }
+}
+

@@ -6,6 +6,7 @@ import {
   onData,
   onExit,
   onStatus,
+  type FsLocationView,
   type LocalShell,
   type SavedSession,
   type SshConnectOptions,
@@ -34,7 +35,7 @@ import {
   type SecretMutation,
 } from "./profile";
 import { pasteIntoTerminal } from "./paste";
-import { FileManagerTab } from "./file-manager";
+import { FileManagerTab } from "./fm/file-manager-tab";
 import type { AppTab } from "./tab";
 
 /** App version, injected at build time by Vite (see vite.config.ts). */
@@ -151,7 +152,7 @@ export class App {
               <div class="quick">
                 <button class="quick__btn" id="open-files">
                   <span class="quick__icon">${icon("files")}</span>
-                  <span class="quick__text"><span class="quick__label">File Manager</span><span class="quick__hint">Dual-pane local files</span></span>
+                  <span class="quick__text"><span class="quick__label">File Manager</span><span class="quick__hint">Dual-pane, Commander style</span></span>
                   <span class="quick__go">${icon("plus")}</span>
                 </button>
               </div>
@@ -505,10 +506,10 @@ export class App {
     this.updateStatus();
   }
 
-  newFileManager(initialPaths?: [string | undefined, string | undefined]): void {
+  newFileManager(initialLocations?: [FsLocationView | undefined, FsLocationView | undefined]): void {
     const tab = new FileManagerTab({
       toast: (message, kind) => this.toast(message, kind),
-      initialPaths,
+      initialLocations,
     });
     this.addTab(tab);
   }
@@ -1005,7 +1006,7 @@ export class App {
 
   private duplicateTab(tab: AppTab): void {
     if (tab instanceof TerminalSession) this.duplicateSession(tab);
-    else if (tab instanceof FileManagerTab) this.newFileManager(tab.currentPaths());
+    else if (tab instanceof FileManagerTab) this.newFileManager(tab.currentLocations());
   }
 
   // ---- tab hover tooltip (theme-styled) -----------------------------------
