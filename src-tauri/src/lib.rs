@@ -10,9 +10,13 @@ mod commands;
 mod file_manager;
 mod session;
 mod store;
+mod transfer;
+mod vfs;
 
 use file_manager::FileOperationManager;
 use session::SessionManager;
+use transfer::queue::TransferManager;
+use vfs::FsRegistry;
 
 #[tauri::command]
 fn ping() -> String {
@@ -35,6 +39,8 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .manage(SessionManager::default())
         .manage(FileOperationManager::default())
+        .manage(FsRegistry::default())
+        .manage(TransferManager::default())
         .invoke_handler(tauri::generate_handler![
             ping,
             commands::session_create_local,
@@ -61,6 +67,21 @@ pub fn run() {
             file_manager::files_preview,
             file_manager::files_operate,
             file_manager::files_cancel,
+            vfs::commands::fs_capabilities,
+            vfs::commands::fs_home,
+            vfs::commands::fs_roots,
+            vfs::commands::fs_resolve,
+            vfs::commands::fs_list,
+            vfs::commands::fs_stat,
+            vfs::commands::fs_mkdir,
+            vfs::commands::fs_rename,
+            vfs::commands::fs_delete,
+            vfs::commands::fs_trash,
+            vfs::commands::fs_open_native,
+            transfer::transfer_start,
+            transfer::transfer_cancel,
+            transfer::transfer_list,
+            transfer::transfer_resolve,
             store::secret_set,
             store::secret_get,
             store::secret_delete,

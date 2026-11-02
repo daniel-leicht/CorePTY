@@ -743,6 +743,7 @@ dependencies = [
 name = "corepty"
 version = "0.3.8"
 dependencies = [
+ "async-trait",
  "base64 0.22.1",
  "dirs",
  "dunce",
