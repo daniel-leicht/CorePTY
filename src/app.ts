@@ -68,7 +68,12 @@ export class App {
 
   private stageEl!: HTMLElement;
   private stageEmptyEl!: HTMLElement;
+  private tabbarEl!: HTMLElement;
   private tabsListEl!: HTMLElement;
+  /** Pending rAF that re-measures tab-strip overflow (coalesces bursts). */
+  private tabOverflowRaf = 0;
+  /** Removes the open "all tabs" dropdown's document listeners. */
+  private tabListCleanup: (() => void) | null = null;
   private connectionsEl!: HTMLElement;
   private statusEls!: {
     dot: HTMLElement;
@@ -171,8 +176,11 @@ export class App {
         </aside>
 
         <main class="main">
-          <div class="tabbar">
+          <div class="tabbar" id="tabbar">
+            <button class="tab-scroll" id="tab-scroll-left" data-dir="-1" title="Scroll tabs left" tabindex="-1">${icon("back")}</button>
             <div class="tabs" id="tabs"></div>
+            <button class="tab-scroll" id="tab-scroll-right" data-dir="1" title="Scroll tabs right" tabindex="-1">${icon("forward")}</button>
+            <button class="tab-list-btn" id="tab-list" title="All tabs">${icon("chevronDown")}</button>
             <button class="tab-add" id="tab-add" title="New tab">${icon("plus")}</button>
           </div>
 
@@ -227,6 +235,7 @@ export class App {
 
     this.stageEl = this.root.querySelector("#stage")!;
     this.stageEmptyEl = this.root.querySelector("#stage-empty")!;
+    this.tabbarEl = this.root.querySelector("#tabbar")!;
     this.tabsListEl = this.root.querySelector("#tabs")!;
     this.connectionsEl = this.root.querySelector("#connections")!;
     this.toastEl = this.root.querySelector("#toasts")!;
@@ -293,6 +302,7 @@ export class App {
       .querySelector("#stage-empty-files")!
       .addEventListener("click", () => this.newFileManager());
 
+    this.setupTabStrip();
     this.setupStageInteractions();
     this.setupSearch();
     this.wireWindowChrome();
@@ -583,6 +593,7 @@ export class App {
     // Update the strip highlight in place rather than rebuilding it — keeps tab
     // switches cheap and, crucially, doesn't destroy a tab element mid-drag.
     this.markActiveTab();
+    this.revealTab(session);
     if (!(session instanceof TerminalSession)) this.searchBar.setAttribute("hidden", "");
     this.updateStatus();
     requestAnimationFrame(() => {
@@ -620,6 +631,8 @@ export class App {
     const titleEl = el.querySelector<HTMLElement>(".tab__title");
     if (titleEl && titleEl.textContent !== session.title) {
       titleEl.textContent = session.title;
+      // A tab's width follows its title, so the strip may start/stop overflowing.
+      this.scheduleTabOverflow();
     }
 
     const dotEl = el.querySelector<HTMLElement>(".tab__dot");
@@ -656,6 +669,9 @@ export class App {
     // Never rebuild the strip while an inline-rename input is open (it would
     // destroy the field mid-edit, e.g. if the program fires an OSC title).
     if (this.renamingUid) return;
+    // Emptying the strip snaps it back to scrollLeft 0; restore it afterwards so
+    // a rebuild (status change, close, reorder) doesn't jump to the first tab.
+    const scrollLeft = this.tabsListEl.scrollLeft;
     this.tabsListEl.innerHTML = "";
     for (const t of this.tabs) {
       const el = document.createElement("div");
@@ -731,6 +747,157 @@ export class App {
 
       this.tabsListEl.appendChild(el);
     }
+    this.tabsListEl.scrollLeft = scrollLeft;
+    this.updateTabOverflow();
+  }
+
+  /**
+   * Keep an overflowing strip navigable. Its scrollbar is hidden, so without
+   * this a mouse user had no way to reach tabs past the right edge.
+   */
+  private setupTabStrip(): void {
+    const strip = this.tabsListEl;
+    strip.addEventListener("scroll", () => this.updateTabOverflow(), { passive: true });
+    // Deferred: toggling the chevrons resizes the strip, which would otherwise
+    // re-enter the observer in the same frame ("ResizeObserver loop" warning).
+    new ResizeObserver(() => this.scheduleTabOverflow()).observe(strip);
+
+    // Trackpads already scroll sideways; map a plain vertical wheel onto the strip.
+    strip.addEventListener(
+      "wheel",
+      (e) => {
+        if (strip.scrollWidth <= strip.clientWidth) return;
+        if (Math.abs(e.deltaX) >= Math.abs(e.deltaY)) return;
+        e.preventDefault();
+        const unit =
+          e.deltaMode === WheelEvent.DOM_DELTA_LINE
+            ? 32
+            : e.deltaMode === WheelEvent.DOM_DELTA_PAGE
+              ? strip.clientWidth
+              : 1;
+        strip.scrollLeft += e.deltaY * unit;
+      },
+      { passive: false }
+    );
+
+    this.tabbarEl.querySelectorAll<HTMLButtonElement>(".tab-scroll").forEach((btn) => {
+      const dir = Number(btn.dataset.dir);
+      btn.addEventListener("click", () =>
+        strip.scrollBy({ left: dir * strip.clientWidth * 0.6, behavior: "smooth" })
+      );
+      // Hovering a chevron mid-drag scrolls, so a tab can be dropped past the edge.
+      btn.addEventListener("dragover", () => {
+        if (this.dragTab) strip.scrollLeft += dir * 14;
+      });
+    });
+    this.tabbarEl
+      .querySelector("#tab-list")!
+      .addEventListener("click", (e) => this.toggleTabList(e.currentTarget as HTMLElement));
+
+    // Dragging a tab near either edge of the strip scrolls it the same way.
+    strip.addEventListener("dragover", (e) => {
+      if (!this.dragTab) return;
+      const r = strip.getBoundingClientRect();
+      const edge = 36;
+      if (e.clientX < r.left + edge) strip.scrollLeft -= 14;
+      else if (e.clientX > r.right - edge) strip.scrollLeft += 14;
+    });
+  }
+
+  private scheduleTabOverflow(): void {
+    if (this.tabOverflowRaf) return;
+    this.tabOverflowRaf = requestAnimationFrame(() => {
+      this.tabOverflowRaf = 0;
+      this.updateTabOverflow();
+    });
+  }
+
+  /** Show the chevrons / all-tabs button only while the strip overflows. */
+  private updateTabOverflow(): void {
+    const strip = this.tabsListEl;
+    const max = strip.scrollWidth - strip.clientWidth;
+    const overflowing = max > 1;
+    const left = overflowing && strip.scrollLeft > 1;
+    const right = overflowing && strip.scrollLeft < max - 1;
+    this.tabbarEl.classList.toggle("is-overflowing", overflowing);
+    this.tabbarEl.classList.toggle("is-overflow-left", left);
+    this.tabbarEl.classList.toggle("is-overflow-right", right);
+    this.tabbarEl.querySelector<HTMLButtonElement>("#tab-scroll-left")!.disabled = !left;
+    this.tabbarEl.querySelector<HTMLButtonElement>("#tab-scroll-right")!.disabled = !right;
+  }
+
+  /** Scroll the strip just enough to show `tab` whole, clear of the edge fades. */
+  private revealTab(tab: AppTab): void {
+    const el = this.tabsListEl.querySelector<HTMLElement>(`.tab[data-key="${tab.uid}"]`);
+    if (!el) return;
+    // Settle the chevrons first: showing them narrows the strip.
+    this.updateTabOverflow();
+    const strip = this.tabsListEl;
+    const s = strip.getBoundingClientRect();
+    const r = el.getBoundingClientRect();
+    const margin = 28;
+    if (r.left < s.left + margin) strip.scrollLeft -= s.left + margin - r.left;
+    else if (r.right > s.right - margin) strip.scrollLeft += r.right - (s.right - margin);
+  }
+
+  /** The "all tabs" dropdown: every tab, reachable however far the strip scrolls. */
+  private toggleTabList(anchor: HTMLElement): void {
+    if (document.querySelector(".tab-list")) {
+      this.closeTabList();
+      return;
+    }
+    const menu = document.createElement("div");
+    menu.className = "tab-list pop";
+    menu.setAttribute("role", "menu");
+    menu.innerHTML = `<div class="pop__label">Open tabs · ${this.tabs.length}</div><div class="tab-list__items"></div>`;
+    const items = menu.querySelector(".tab-list__items")!;
+    for (const t of this.tabs) {
+      const item = document.createElement("button");
+      item.className = "pop__item tab-list__item" + (t === this.active ? " is-current" : "");
+      item.setAttribute("role", "menuitem");
+      item.innerHTML = `
+        <span class="switcher__icon">${icon(t.iconName)}</span>
+        <span class="switcher__title">${escapeHtml(t.title)}</span>
+        ${t.elevated ? `<span class="switcher__admin" title="Administrator">${icon("shield")}</span>` : ""}
+        <span class="switcher__dot ${t.status}"></span>`;
+      item.addEventListener("click", () => {
+        this.closeTabList();
+        // The list is a snapshot; the tab may have closed while it was open.
+        if (this.tabs.includes(t)) this.activate(t);
+      });
+      items.appendChild(item);
+    }
+    document.body.appendChild(menu);
+    const r = anchor.getBoundingClientRect();
+    menu.style.top = `${r.bottom + 6}px`;
+    menu.style.left = `${Math.max(8, r.right - menu.offsetWidth)}px`;
+    menu.querySelector(".is-current")?.scrollIntoView({ block: "nearest" });
+
+    const onDown = (e: MouseEvent) => {
+      // Clicks on the anchor fall through to its own toggle handler.
+      if (!menu.contains(e.target as Node) && !anchor.contains(e.target as Node)) {
+        this.closeTabList();
+      }
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        e.stopPropagation();
+        this.closeTabList();
+      }
+    };
+    this.tabListCleanup = () => {
+      document.removeEventListener("mousedown", onDown, true);
+      document.removeEventListener("keydown", onKey, true);
+    };
+    document.addEventListener("mousedown", onDown, true);
+    document.addEventListener("keydown", onKey, true);
+  }
+
+  private closeTabList(): void {
+    this.tabListCleanup?.();
+    this.tabListCleanup = null;
+    document.querySelectorAll(".tab-list").forEach((m) => m.remove());
   }
 
   /** Clear any in-progress drag state + drop indicators. */
