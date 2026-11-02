@@ -1153,7 +1153,10 @@ fn commit_temporary_file(
             Ok(metadata) => metadata,
             Err(e) => {
                 let _ = fs::remove_file(temporary);
-                return Err(format!("could not inspect {}: {e}", target.to_string_lossy()));
+                return Err(format!(
+                    "could not inspect {}: {e}",
+                    target.to_string_lossy()
+                ));
             }
         };
         return match replace_strategy(&metadata) {
