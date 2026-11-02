@@ -13,7 +13,7 @@ use std::{
     collections::HashMap,
     ffi::{OsStr, OsString},
     fs::{self, File, Metadata, OpenOptions},
-    io::{Read, Write},
+    io::{self, Read, Write},
     path::{Component, Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -64,6 +64,8 @@ pub struct FileEntry {
     pub modified: Option<u64>,
     pub hidden: bool,
     pub readonly: bool,
+    /// Set when the entry was listed but could not be inspected.
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -301,39 +303,22 @@ pub async fn files_conflicts(
         .map_err(|e| format!("conflict check failed: {e}"))?
 }
 
+// Commands that do filesystem I/O are async and work inside spawn_blocking:
+// sync Tauri commands run on the main thread, so one call against a stalled
+// network share would freeze the whole UI.
+
 #[tauri::command]
-pub fn files_create_directory(parent: String, name: String) -> Result<FileLocation, String> {
-    validate_name(&name)?;
-    let path = decode_path(&parent)?.join(name);
-    fs::create_dir(&path)
-        .map_err(|e| format!("could not create {}: {e}", path.to_string_lossy()))?;
-    Ok(location(&path))
+pub async fn files_create_directory(parent: String, name: String) -> Result<FileLocation, String> {
+    tauri::async_runtime::spawn_blocking(move || create_directory(&parent, &name))
+        .await
+        .map_err(|e| format!("create folder failed: {e}"))?
 }
 
 #[tauri::command]
-pub fn files_rename(token: String, name: String) -> Result<FileLocation, String> {
-    validate_name(&name)?;
-    let source = decode_path(&token)?;
-    let parent = source
-        .parent()
-        .ok_or_else(|| "the filesystem root cannot be renamed".to_string())?;
-    let destination = parent.join(name);
-    if source == destination {
-        return Ok(location(&source));
-    }
-    if path_exists(&destination) && !same_path(&source, &destination) {
-        return Err(format!("{} already exists", destination.to_string_lossy()));
-    }
-    fs::rename(&source, &destination).map_err(|e| {
-        format!(
-            "could not rename {}: {e}",
-            source
-                .file_name()
-                .unwrap_or(source.as_os_str())
-                .to_string_lossy()
-        )
-    })?;
-    Ok(location(&destination))
+pub async fn files_rename(token: String, name: String) -> Result<FileLocation, String> {
+    tauri::async_runtime::spawn_blocking(move || rename_entry(&token, &name))
+        .await
+        .map_err(|e| format!("rename failed: {e}"))?
 }
 
 #[tauri::command]
@@ -364,10 +349,14 @@ pub async fn files_delete(tokens: Vec<String>) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn files_open(token: String) -> Result<(), String> {
+pub async fn files_open(token: String) -> Result<(), String> {
     let path = decode_path(&token)?;
-    open::that_detached(&path)
-        .map_err(|e| format!("could not open {}: {e}", path.to_string_lossy()))
+    tauri::async_runtime::spawn_blocking(move || {
+        open::that_detached(&path)
+            .map_err(|e| format!("could not open {}: {e}", path.to_string_lossy()))
+    })
+    .await
+    .map_err(|e| format!("open failed: {e}"))?
 }
 
 #[tauri::command]
@@ -435,6 +424,39 @@ fn resolve_location(path: &str, base_token: Option<&str>) -> Result<FileLocation
     Ok(location(&normalized))
 }
 
+fn create_directory(parent_token: &str, name: &str) -> Result<FileLocation, String> {
+    validate_name(name)?;
+    let path = decode_path(parent_token)?.join(name);
+    fs::create_dir(&path)
+        .map_err(|e| format!("could not create {}: {e}", path.to_string_lossy()))?;
+    Ok(location(&path))
+}
+
+fn rename_entry(token: &str, name: &str) -> Result<FileLocation, String> {
+    validate_name(name)?;
+    let source = decode_path(token)?;
+    let parent = source
+        .parent()
+        .ok_or_else(|| "the filesystem root cannot be renamed".to_string())?;
+    let destination = parent.join(name);
+    if source == destination {
+        return Ok(location(&source));
+    }
+    if path_exists(&destination) && !same_path(&source, &destination) {
+        return Err(format!("{} already exists", destination.to_string_lossy()));
+    }
+    fs::rename(&source, &destination).map_err(|e| {
+        format!(
+            "could not rename {}: {e}",
+            source
+                .file_name()
+                .unwrap_or(source.as_os_str())
+                .to_string_lossy()
+        )
+    })?;
+    Ok(location(&destination))
+}
+
 fn find_conflicts(
     source_tokens: &[String],
     destination_token: &str,
@@ -465,7 +487,11 @@ fn list_directory(path: &Path) -> Result<DirectoryListing, String> {
     let mut entries = Vec::new();
     for item in read_dir {
         let item = item.map_err(|e| format!("could not read directory entry: {e}"))?;
-        entries.push(entry_from_path(&item.path())?);
+        // DirEntry::metadata doesn't follow links, and on Windows it comes from
+        // the directory scan itself instead of opening every file again.
+        if let Some(entry) = listing_entry(&item.path(), item.metadata()) {
+            entries.push(entry);
+        }
     }
     Ok(DirectoryListing {
         location: location(path),
@@ -474,9 +500,34 @@ fn list_directory(path: &Path) -> Result<DirectoryListing, String> {
     })
 }
 
-fn entry_from_path(path: &Path) -> Result<FileEntry, String> {
-    let metadata = fs::symlink_metadata(path)
-        .map_err(|e| format!("could not inspect {}: {e}", path.to_string_lossy()))?;
+/// One listing row. Entries can vanish or refuse inspection between the
+/// directory scan and their stat (temp folders churn constantly); a bad entry
+/// must not hide the rest of the folder.
+fn listing_entry(path: &Path, metadata: io::Result<Metadata>) -> Option<FileEntry> {
+    match metadata {
+        Ok(metadata) => Some(entry_from_metadata(path, &metadata)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+        Err(e) => Some(unreadable_entry(path, &e)),
+    }
+}
+
+fn unreadable_entry(path: &Path, error: &io::Error) -> FileEntry {
+    let name_os = path.file_name().unwrap_or(path.as_os_str());
+    FileEntry {
+        name: name_os.to_string_lossy().into_owned(),
+        path: path.to_string_lossy().into_owned(),
+        token: encode_path(path),
+        kind: FileEntryKind::Other,
+        is_directory: false,
+        size: None,
+        modified: None,
+        hidden: name_os.to_string_lossy().starts_with('.'),
+        readonly: false,
+        error: Some(error.to_string()),
+    }
+}
+
+fn entry_from_metadata(path: &Path, metadata: &Metadata) -> FileEntry {
     let file_type = metadata.file_type();
     let kind = if file_type.is_symlink() {
         FileEntryKind::Symlink
@@ -489,7 +540,7 @@ fn entry_from_path(path: &Path) -> Result<FileEntry, String> {
     };
     let is_directory = file_type.is_dir() || (file_type.is_symlink() && path.is_dir());
     let name_os = path.file_name().unwrap_or(path.as_os_str());
-    Ok(FileEntry {
+    FileEntry {
         name: name_os.to_string_lossy().into_owned(),
         path: path.to_string_lossy().into_owned(),
         token: encode_path(path),
@@ -505,9 +556,10 @@ fn entry_from_path(path: &Path) -> Result<FileEntry, String> {
             .ok()
             .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
             .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64),
-        hidden: is_hidden(name_os, &metadata),
+        hidden: is_hidden(name_os, metadata),
         readonly: metadata.permissions().readonly(),
-    })
+        error: None,
+    }
 }
 
 fn location(path: &Path) -> FileLocation {
@@ -1097,30 +1149,95 @@ fn commit_temporary_file(
             }
             ConflictPolicy::Replace => {}
         }
-        #[cfg(unix)]
-        {
-            let target_is_directory = fs::symlink_metadata(target)
-                .map(|metadata| metadata.is_dir())
-                .unwrap_or(false);
-            if !target_is_directory {
-                return fs::rename(temporary, target)
-                    .map(|()| Some(target.to_path_buf()))
-                    .map_err(|e| {
-                        let _ = fs::remove_file(temporary);
-                        format!("could not replace {}: {e}", target.to_string_lossy())
-                    });
+        let metadata = match fs::symlink_metadata(target) {
+            Ok(metadata) => metadata,
+            Err(e) => {
+                let _ = fs::remove_file(temporary);
+                return Err(format!("could not inspect {}: {e}", target.to_string_lossy()));
             }
-        }
-        if let Err(error) = remove_path(target) {
-            let _ = fs::remove_file(temporary);
-            return Err(error);
-        }
+        };
+        return match replace_strategy(&metadata) {
+            ReplaceStrategy::RenameOver => rename_over(temporary, target, &metadata),
+            ReplaceStrategy::RemoveFirst => remove_then_commit(temporary, target),
+        };
     }
     fs::rename(temporary, target)
         .map(|()| Some(target.to_path_buf()))
         .map_err(|e| {
             let _ = fs::remove_file(temporary);
             format!("could not finish {}: {e}", target.to_string_lossy())
+        })
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ReplaceStrategy {
+    /// Rename the new copy straight over the old entry. It is a single step, so
+    /// the old contents survive untouched if anything fails.
+    RenameOver,
+    /// A folder can't be renamed over, so it has to be removed first.
+    RemoveFirst,
+}
+
+fn replace_strategy(target: &Metadata) -> ReplaceStrategy {
+    if target.is_dir() || is_directory_link(target) {
+        ReplaceStrategy::RemoveFirst
+    } else {
+        ReplaceStrategy::RenameOver
+    }
+}
+
+/// Windows directory symlinks and junctions refuse a file renamed over them.
+#[cfg(windows)]
+fn is_directory_link(metadata: &Metadata) -> bool {
+    use std::os::windows::fs::FileTypeExt;
+    metadata.file_type().is_symlink_dir()
+}
+
+#[cfg(not(windows))]
+fn is_directory_link(_metadata: &Metadata) -> bool {
+    false
+}
+
+fn rename_over(
+    temporary: &Path,
+    target: &Path,
+    metadata: &Metadata,
+) -> Result<Option<PathBuf>, String> {
+    // Windows refuses to rename over a read-only file, so lift the flag first.
+    #[cfg(windows)]
+    {
+        if let Err(error) = make_writable_for_deletion(target, metadata) {
+            let _ = fs::remove_file(temporary);
+            return Err(error);
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = metadata;
+    fs::rename(temporary, target)
+        .map(|()| Some(target.to_path_buf()))
+        .map_err(|e| {
+            // The old entry is untouched (its read-only flag is restored here),
+            // and the source still holds the new contents.
+            #[cfg(windows)]
+            let _ = fs::set_permissions(target, metadata.permissions());
+            let _ = fs::remove_file(temporary);
+            format!("could not replace {}: {e}", target.to_string_lossy())
+        })
+}
+
+fn remove_then_commit(temporary: &Path, target: &Path) -> Result<Option<PathBuf>, String> {
+    if let Err(error) = remove_path(target) {
+        let _ = fs::remove_file(temporary);
+        return Err(error);
+    }
+    fs::rename(temporary, target)
+        .map(|()| Some(target.to_path_buf()))
+        .map_err(|e| {
+            let _ = fs::remove_file(temporary);
+            format!(
+                "removed {} but could not put the new copy in its place: {e}",
+                target.to_string_lossy()
+            )
         })
 }
 
@@ -1424,5 +1541,96 @@ mod tests {
             1,
             "temporary copy artifacts should be cleaned up"
         );
+    }
+
+    #[test]
+    fn files_are_replaced_by_renaming_over_and_folders_by_removing_first() {
+        let temp = tempdir().unwrap();
+        let file = temp.path().join("file.txt");
+        let folder = temp.path().join("folder");
+        fs::write(&file, b"x").unwrap();
+        fs::create_dir(&folder).unwrap();
+        assert_eq!(
+            replace_strategy(&fs::symlink_metadata(&file).unwrap()),
+            ReplaceStrategy::RenameOver
+        );
+        assert_eq!(
+            replace_strategy(&fs::symlink_metadata(&folder).unwrap()),
+            ReplaceStrategy::RemoveFirst
+        );
+    }
+
+    #[test]
+    fn replacing_a_read_only_file_succeeds() {
+        let source_root = tempdir().unwrap();
+        let destination_root = tempdir().unwrap();
+        let source = source_root.path().join("config.ini");
+        let target = destination_root.path().join("config.ini");
+        fs::write(&source, b"new").unwrap();
+        fs::write(&target, b"old").unwrap();
+        let mut permissions = fs::metadata(&target).unwrap().permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(&target, permissions).unwrap();
+        let mut context = test_context(measure(&source).unwrap());
+
+        copy_path(&source, &target, ConflictPolicy::Replace, &mut context).unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"new");
+    }
+
+    #[test]
+    fn replacing_a_folder_with_a_file_removes_the_folder_first() {
+        let source_root = tempdir().unwrap();
+        let destination_root = tempdir().unwrap();
+        let source = source_root.path().join("item");
+        let target = destination_root.path().join("item");
+        fs::write(&source, b"file now").unwrap();
+        fs::create_dir(&target).unwrap();
+        fs::write(target.join("old.txt"), b"old").unwrap();
+        let mut context = test_context(measure(&source).unwrap());
+
+        copy_path(&source, &target, ConflictPolicy::Replace, &mut context).unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"file now");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_failed_replace_leaves_the_old_file_intact() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let source_root = tempdir().unwrap();
+        let destination_root = tempdir().unwrap();
+        let source = source_root.path().join("report.txt");
+        let target = destination_root.path().join("report.txt");
+        fs::write(&source, b"new").unwrap();
+        fs::write(&target, b"old").unwrap();
+        // No sharing at all: the old file can be neither replaced nor deleted.
+        let lock = OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&target)
+            .unwrap();
+        let mut context = test_context(measure(&source).unwrap());
+
+        assert!(copy_path(&source, &target, ConflictPolicy::Replace, &mut context).is_err());
+        drop(lock);
+        assert_eq!(fs::read(&target).unwrap(), b"old");
+        assert_eq!(
+            fs::read_dir(destination_root.path()).unwrap().count(),
+            1,
+            "the temporary copy should be cleaned up"
+        );
+    }
+
+    #[test]
+    fn listing_skips_vanished_entries_and_flags_unreadable_ones() {
+        let path = Path::new("gone.txt");
+        let vanished = io::Error::from(io::ErrorKind::NotFound);
+        assert!(listing_entry(path, Err(vanished)).is_none());
+
+        let denied = io::Error::from(io::ErrorKind::PermissionDenied);
+        let entry = listing_entry(path, Err(denied)).unwrap();
+        assert_eq!(entry.name, "gone.txt");
+        assert!(entry.error.is_some());
+        assert!(!entry.is_directory);
+        assert_eq!(entry.size, None);
     }
 }

@@ -291,6 +291,7 @@ function demoEntry(
     modified,
     hidden: name.startsWith("."),
     readonly: false,
+    error: null,
   };
 }
 

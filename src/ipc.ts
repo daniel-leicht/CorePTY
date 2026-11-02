@@ -107,6 +107,8 @@ export interface FileEntry {
   modified: number | null;
   hidden: boolean;
   readonly: boolean;
+  /** Set when the entry was listed but could not be inspected. */
+  error: string | null;
 }
 
 export interface DirectoryListing {

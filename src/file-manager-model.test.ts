@@ -12,6 +12,7 @@ const entry = (name: string, options: Partial<FileEntry> = {}): FileEntry => ({
   modified: 0,
   hidden: false,
   readonly: false,
+  error: null,
   ...options,
 });
 

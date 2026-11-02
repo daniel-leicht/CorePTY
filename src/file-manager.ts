@@ -465,7 +465,7 @@ export class FileManagerTab implements AppTab {
     row.setAttribute("aria-rowindex", String(rowIndex + 2));
     row.dataset.token = entry.token;
     row.draggable = true;
-    row.title = entry.path;
+    row.title = entry.error ? `${entry.path}\n${entry.error}` : entry.path;
     row.innerHTML = `
       <span class="fm-cell fm-col-name" role="gridcell">
         <span class="fm-row__mark">${icon("check")}</span>
@@ -473,6 +473,7 @@ export class FileManagerTab implements AppTab {
         <span class="fm-row__name"></span>
         ${entry.kind === "symlink" ? `<span class="fm-row__badge">LINK</span>` : ""}
         ${entry.readonly ? `<span class="fm-row__badge">READ ONLY</span>` : ""}
+        ${entry.error ? `<span class="fm-row__badge">UNREADABLE</span>` : ""}
       </span>
       <span class="fm-cell fm-col-size" role="gridcell">${entry.isDirectory ? "—" : formatFileSize(entry.size)}</span>
       <span class="fm-cell fm-col-modified" role="gridcell">${formatModified(entry.modified)}</span>`;
@@ -775,12 +776,11 @@ export class FileManagerTab implements AppTab {
       event.preventDefault();
       void this.deleteSelected(event.shiftKey);
     } else if (event.key === "Escape") {
+      // Only clears the selection: Esc is pressed casually, so it must never
+      // cancel a running copy/move — that's what the Cancel button is for.
       event.preventDefault();
-      if (this.operationId) void api.filesCancel(this.operationId);
-      else {
-        panel.selected.clear();
-        this.updateSelectionUI(this.activePanel);
-      }
+      panel.selected.clear();
+      this.updateSelectionUI(this.activePanel);
     } else if (!ctrl && !event.altKey && !event.metaKey && event.key.length === 1) {
       this.typeToJump(event.key);
     }
