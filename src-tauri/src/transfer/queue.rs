@@ -33,6 +33,14 @@ pub struct TransferRequest {
     pub sources: Vec<Location>,
     /// The folder the sources go into.
     pub destination: Location,
+    /// Give copies the source's permissions (POSIX mode bits). On unless
+    /// the request says otherwise.
+    #[serde(default = "keep")]
+    pub preserve_mode: bool,
+}
+
+fn keep() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -126,6 +134,7 @@ pub struct JobView {
 struct Job {
     id: String,
     kind: TransferKind,
+    preserve_mode: bool,
     sources: Vec<Location>,
     destination: Location,
     state: Mutex<JobState>,
@@ -216,6 +225,7 @@ impl TransferManager {
         let job = Arc::new(Job {
             id: Uuid::new_v4().to_string(),
             kind: request.kind,
+            preserve_mode: request.preserve_mode,
             sources: request.sources,
             destination: request.destination,
             state: Mutex::new(JobState::Queued),
@@ -380,6 +390,7 @@ async fn run_job(
         job.cancel.subscribe(),
         resolver,
     );
+    engine.set_preserve_mode(job.preserve_mode);
     let sources: Vec<VPath> = job
         .sources
         .iter()
@@ -577,6 +588,7 @@ mod tests {
             kind: TransferKind::Copy,
             sources: sources.iter().map(|path| location("m", path)).collect(),
             destination: location("m", destination),
+            preserve_mode: true,
         }
     }
 

@@ -281,6 +281,8 @@ pub struct Engine {
     sticky_partial: Option<Resolution>,
     /// The last partial-copy answer was "skip".
     partial_skipped: bool,
+    /// Give copies the source's permissions (POSIX mode bits).
+    preserve_mode: bool,
     /// Planned totals of every walked folder, for counting renamed subtrees.
     folder_stats: HashMap<VPath, WorkStats>,
     /// Copy buffer, allocated once per job.
@@ -306,12 +308,18 @@ impl Engine {
             sticky: None,
             sticky_partial: None,
             partial_skipped: false,
+            preserve_mode: true,
             folder_stats: HashMap::new(),
             buffer: Vec::new(),
         }
     }
 
     /// Count everything the job will touch.
+    /// Whether copies get the source's permissions (on by default).
+    pub fn set_preserve_mode(&mut self, preserve: bool) {
+        self.preserve_mode = preserve;
+    }
+
     pub async fn plan(&mut self, sources: &[VPath]) -> Result<WorkStats, TransferError> {
         let mut total = WorkStats::default();
         for source in sources {
@@ -572,15 +580,29 @@ impl Engine {
             match handling {
                 Handling::Folder => {
                     let below = walk.child();
-                    self.transfer_folder(source, &target, placement, below, self.moves(&walk))
-                        .await
+                    self.transfer_folder(
+                        source,
+                        &meta,
+                        &target,
+                        placement,
+                        below,
+                        self.moves(&walk),
+                    )
+                    .await
                 }
                 Handling::FollowedFolder { trail } => {
                     // The contents are only copied; a move then removes just
                     // the link (transfer_folder's non-recursive remove).
                     let below = walk.followed(trail);
-                    self.transfer_folder(source, &target, placement, below, self.moves(&walk))
-                        .await
+                    self.transfer_folder(
+                        source,
+                        &meta,
+                        &target,
+                        placement,
+                        below,
+                        self.moves(&walk),
+                    )
+                    .await
                 }
                 Handling::File => {
                     let overwrite = placement == Placement::Overwrite;
@@ -752,6 +774,7 @@ impl Engine {
     async fn transfer_folder(
         &mut self,
         source: &VPath,
+        meta: &Meta,
         target: &VPath,
         placement: Placement,
         below: Walk,
@@ -793,6 +816,20 @@ impl Engine {
                 .await?;
             if outcome == Outcome::Skipped {
                 complete = false;
+            }
+        }
+        if placement != Placement::Merge {
+            // A folder we created gets its times (and mode) last: writing
+            // its contents changed them.
+            if let Some(modified) = meta.modified {
+                let _ = self
+                    .target
+                    .fs
+                    .set_times(target, modified, meta.accessed)
+                    .await;
+            }
+            if let Some(mode) = self.mode_to_keep(meta) {
+                let _ = self.target.fs.set_mode(target, mode).await;
             }
         }
         if remove_source {
@@ -974,18 +1011,25 @@ impl Engine {
         }
 
         // Permissions last: a read-only file can't have its times set.
-        let target_posix = self.target.fs.capabilities().posix_permissions;
-        let mode = match meta.mode {
-            Some(mode) if target_posix => Some(mode),
-            // Windows' read-only attribute, between local folders.
-            None if meta.readonly && self.same_fs() => Some(0o444),
-            _ => None,
-        };
-        if let Some(mode) = mode {
+        if let Some(mode) = self.mode_to_keep(meta) {
             let _ = self.target.fs.set_mode(target, mode).await;
         }
         self.counters.add(WorkStats { items: 1, bytes: 0 });
         Ok(Outcome::Done)
+    }
+
+    /// The permissions to give a copy of an entry with `meta`, if any.
+    fn mode_to_keep(&self, meta: &Meta) -> Option<u32> {
+        if !self.preserve_mode {
+            return None;
+        }
+        let target_posix = self.target.fs.capabilities().posix_permissions;
+        match meta.mode {
+            Some(mode) if target_posix => Some(mode),
+            // Windows' read-only attribute, between local folders.
+            None if meta.readonly && self.same_fs() && !meta.is_directory => Some(0o444),
+            _ => None,
+        }
     }
 
     /// Copy `source` into `temporary`, from `offset` on (resuming: the bytes
@@ -2094,5 +2138,64 @@ pub(crate) mod tests {
         .await;
         assert!(outcome.result.is_err());
         assert_eq!(fs::read_dir(local_dir.path()).unwrap().count(), 0);
+    }
+    #[tokio::test]
+    async fn copied_folders_keep_their_times() {
+        let temp = tempdir().unwrap();
+        let source = temp.path().join("project");
+        fs::create_dir_all(source.join("docs")).unwrap();
+        fs::write(source.join("docs/guide.md"), b"read me").unwrap();
+        let old = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_500_000_000);
+        // After the contents: writing them would bump the folder's time.
+        LocalFs
+            .set_times(&native(&source.join("docs")), old, None)
+            .await
+            .unwrap();
+        let destination = temp.path().join("copy");
+        fs::create_dir(&destination).unwrap();
+        let outcome = run(
+            TransferKind::Copy,
+            local(),
+            local(),
+            &[native(&source)],
+            &native(&destination),
+            no_conflicts(),
+        )
+        .await;
+        assert_eq!(outcome.result, Ok(()));
+        let copied = fs::metadata(destination.join("project/docs")).unwrap();
+        assert_eq!(copied.modified().unwrap(), old);
+    }
+
+    #[tokio::test]
+    async fn permissions_are_copied_unless_the_request_says_not_to() {
+        for preserve in [true, false] {
+            let fs = Arc::new(MemFs::new());
+            fs.add_dir("/src");
+            fs.add_dir("/dst");
+            fs.add_file("/src/run.sh", b"#!/bin/sh\n");
+            fs.set_mode(&MemFs::path("/src/run.sh"), 0o755)
+                .await
+                .unwrap();
+            let (_cancel, receiver) = watch::channel(false);
+            let mut engine = Engine::new(
+                TransferKind::Copy,
+                memory(&fs, "a"),
+                memory(&fs, "b"),
+                Arc::new(Counters::default()),
+                receiver,
+                no_conflicts(),
+            );
+            engine.set_preserve_mode(preserve);
+            let sources = [MemFs::path("/src/run.sh")];
+            engine.plan(&sources).await.unwrap();
+            engine.run(&sources, &MemFs::path("/dst")).await.unwrap();
+            let mode = fs.stat(&MemFs::path("/dst/run.sh")).await.unwrap().mode;
+            assert_eq!(
+                mode,
+                Some(if preserve { 0o755 } else { 0o644 }),
+                "preserve={preserve}"
+            );
+        }
     }
 }

@@ -604,11 +604,14 @@ export class FileManagerTab implements AppTab, PanelHost {
       return;
     }
     if (!destination) return;
-    const typed = await copyMoveDialog(
-      { kind, what: describe(entries), destination: destination.display },
+    const permissions =
+      panel.capabilities.posixPermissions || this.other.capabilities.posixPermissions;
+    const answer = await copyMoveDialog(
+      { kind, what: describe(entries), destination: destination.display, permissions },
       this.dialogs
     );
-    if (typed === null || this.disposed) return;
+    if (answer === null || this.disposed) return;
+    const typed = answer.destination;
     let target = destination;
     if (typed !== destination.display) {
       try {
@@ -619,7 +622,7 @@ export class FileManagerTab implements AppTab, PanelHost {
       }
       if (this.disposed) return;
     }
-    await this.startTransfer(kind, panel.fs, entries, panel.location, target);
+    await this.startTransfer(kind, panel.fs, entries, panel.location, target, answer.preserveMode);
     panel.model.clearMarks();
     panel.renderStates();
     this.changed(panel);
@@ -630,12 +633,14 @@ export class FileManagerTab implements AppTab, PanelHost {
     fs: string,
     entries: Array<Pick<FsEntry, "name" | "path">>,
     from: FsLocationView | null,
-    destination: FsLocationView
+    destination: FsLocationView,
+    preserveMode = true
   ): Promise<void> {
     const request: TransferRequest = {
       kind,
       sources: entries.map((entry) => ({ fs, path: entry.path })),
       destination,
+      preserveMode,
     };
     this.transferSources.set(request, from);
     const verb = kind === "copy" ? "Copy" : "Move";

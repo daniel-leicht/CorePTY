@@ -124,7 +124,12 @@ impl Vfs for LocalFs {
             if let Some(accessed) = accessed {
                 times = times.set_accessed(accessed);
             }
-            fs::File::options().write(true).open(path)?.set_times(times)
+            let handle = if path.is_dir() {
+                open_folder(&path)?
+            } else {
+                fs::File::options().write(true).open(&path)?
+            };
+            handle.set_times(times)
         })
         .await
     }
@@ -148,6 +153,25 @@ impl Vfs for LocalFs {
         let paths = paths.iter().map(native).collect::<io::Result<Vec<_>>>()?;
         blocking(move || trash::delete_all(paths).map_err(io::Error::other)).await
     }
+}
+
+/// A handle on a folder that its times can be set through.
+#[cfg(windows)]
+fn open_folder(path: &Path) -> io::Result<fs::File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    // Windows opens folders only with backup semantics.
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    fs::File::options()
+        .write(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)
+}
+
+/// A handle on a folder that its times can be set through (futimens works
+/// on a read-only descriptor; the owner check is on the folder itself).
+#[cfg(not(windows))]
+fn open_folder(path: &Path) -> io::Result<fs::File> {
+    fs::File::open(path)
 }
 
 fn roots() -> Vec<Root> {

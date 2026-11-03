@@ -162,6 +162,8 @@ export interface TransferRequest {
   sources: FsLocation[];
   /** The folder the sources go into. */
   destination: FsLocation;
+  /** Give copies the source's permissions (default: yes). */
+  preserveMode?: boolean;
 }
 
 export type TransferState =
@@ -280,6 +282,7 @@ export const transferApi = {
         kind: request.kind,
         sources: request.sources.map(plain),
         destination: plain(request.destination),
+        preserveMode: request.preserveMode ?? true,
       },
       onEvent: channel,
     });

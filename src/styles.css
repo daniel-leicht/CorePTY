@@ -1337,6 +1337,9 @@ button {
   color: var(--text-3);
   font-size: 11px;
 }
+.fm-dialog__option {
+  margin-top: 12px;
+}
 .modal.fm-conflict-dialog {
   width: 660px;
 }

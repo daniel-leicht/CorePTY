@@ -166,12 +166,15 @@ export async function promptText(
     hint?: string;
     /** Select the name without its extension, as file managers do on rename. */
     selectStem?: boolean;
+    /** More controls under the field (e.g. a checkbox). */
+    extra?: Node;
   },
   context: DialogContext = {}
 ): Promise<string | null> {
   const { root, input } = field(options.label, options.value, options.hint);
   const body = document.createElement("div");
   body.appendChild(root);
+  if (options.extra) body.appendChild(options.extra);
   setTimeout(() => {
     const dot = options.value.lastIndexOf(".");
     if (options.selectStem && dot > 0) input.setSelectionRange(0, dot);
@@ -227,22 +230,36 @@ export async function confirmAction(
   return result === "ok";
 }
 
-/** F5/F6: confirm the destination, which can be edited (NC/WinSCP style). */
-export function copyMoveDialog(
-  options: { kind: "copy" | "move"; what: string; destination: string },
+/**
+ * F5/F6: confirm the destination, which can be edited (NC/WinSCP style).
+ * With `permissions` (a POSIX filesystem on either side) it also asks whether
+ * copies keep the source's permissions.
+ */
+export async function copyMoveDialog(
+  options: { kind: "copy" | "move"; what: string; destination: string; permissions?: boolean },
   context: DialogContext = {}
-): Promise<string | null> {
+): Promise<{ destination: string; preserveMode: boolean } | null> {
   const verb = options.kind === "copy" ? "Copy" : "Move";
-  return promptText(
+  let keep: HTMLInputElement | null = null;
+  let extra: HTMLElement | undefined;
+  if (options.permissions) {
+    extra = document.createElement("label");
+    extra.className = "check fm-dialog__option";
+    extra.innerHTML = `<input type="checkbox" checked /> Keep permissions`;
+    keep = extra.querySelector("input");
+  }
+  const destination = await promptText(
     {
       title: `${verb} ${options.what}`,
       label: "To folder",
       value: options.destination,
       action: verb,
       hint: "Edit the path to choose another folder.",
+      extra,
     },
     context
   );
+  return destination === null ? null : { destination, preserveMode: keep?.checked ?? true };
 }
 
 export function maskDialog(mark: boolean, context: DialogContext = {}): Promise<string | null> {

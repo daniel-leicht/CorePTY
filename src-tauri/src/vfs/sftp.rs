@@ -793,6 +793,12 @@ mod tests {
             .unwrap()
             .set_modified(old)
             .unwrap();
+        // A folder's time too (set after its contents were written).
+        let older = UNIX_EPOCH + Duration::from_secs(1_400_000_000);
+        crate::vfs::local::LocalFs
+            .set_times(&VPath::native(project.join("src")), older, None)
+            .await
+            .unwrap();
         let Some((sftp, _server)) = local_sftp(remote.path()).await else {
             return;
         };
@@ -815,6 +821,8 @@ mod tests {
         // Timestamps survive the trip.
         let uploaded = fs::metadata(remote.path().join("project/README")).unwrap();
         assert_eq!(uploaded.modified().unwrap(), old);
+        let folder = fs::metadata(remote.path().join("project/src")).unwrap();
+        assert_eq!(folder.modified().unwrap(), older);
 
         let back = local.path().join("back");
         fs::create_dir(&back).unwrap();
@@ -835,6 +843,8 @@ mod tests {
         );
         let downloaded = fs::metadata(back.join("project/README")).unwrap();
         assert_eq!(downloaded.modified().unwrap(), old);
+        let folder = fs::metadata(back.join("project/src")).unwrap();
+        assert_eq!(folder.modified().unwrap(), older);
 
         // A move within the server is a rename there.
         sftp.mkdir(&at(&sftp, "archive")).await.unwrap();
