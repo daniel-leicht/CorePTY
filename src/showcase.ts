@@ -144,6 +144,8 @@ try {
 const { App } = await import("./app");
 const root = document.querySelector<HTMLDivElement>("#app")!;
 const app = new App(root);
+// Scripted checks reach the app (its tabs and terminals) through this.
+(window as unknown as { __showcaseApp?: unknown }).__showcaseApp = app;
 await app.mount();
 markCaptureStage("app-mounted");
 

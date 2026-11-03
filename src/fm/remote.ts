@@ -22,6 +22,8 @@ export interface LiveRemote {
   label: string;
   /** The tab(s) using it. */
   title: string;
+  /** The terminal's working folder, if its shell reports it (OSC 7). */
+  folder: string | null;
 }
 
 /** What the app offers the file manager. */
@@ -32,6 +34,8 @@ export interface RemoteSource {
   login(savedId: string): Promise<SftpConnectOptions | null>;
   /** How to log in again to the host of a live connection (from its tab), if known. */
   relogin(connectionId: string): Promise<SftpConnectOptions | null>;
+  /** Follow the working folder of the terminal on a live connection; null when none reports it. */
+  watchFolder(connectionId: string, onFolder: (folder: string) => void): (() => void) | null;
 }
 
 /** Where to open a remote panel. */

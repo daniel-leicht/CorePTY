@@ -107,6 +107,8 @@ export class FileManagerTab implements AppTab, PanelHost {
   private readonly copies: string[] = [];
   /** Remote filesystems this tab holds a reference to (one each, while a panel shows it). */
   private readonly acquired = new Set<string>();
+  /** A panel following its SSH tab's working folder (OSC 7). */
+  private following: { side: 0 | 1; fs: string; connectionId: string; stop: () => void } | null = null;
   /** Remote filesystems being opened: held, but no panel shows them yet. */
   private opening = 0;
   /** Source folder of each queued transfer, refreshed when it ends. */
@@ -223,6 +225,7 @@ export class FileManagerTab implements AppTab, PanelHost {
     for (const [type, listener] of this.windowListeners) window.removeEventListener(type, listener);
     this.windowListeners.length = 0;
     for (const panel of this.panels) panel.dispose();
+    this.stopFollowing();
     for (const fs of this.acquired) void sftpApi.close(fs).catch(() => undefined);
     if (this.copies.length) void fsApi.closeCopies(this.copies.splice(0)).catch(() => undefined);
     this.acquired.clear();
@@ -262,6 +265,9 @@ export class FileManagerTab implements AppTab, PanelHost {
         writeStorage(`${LOCATION_KEY}${panel.side}`, saved);
         writeStorage(`${LOCATION_KEY}${panel.side}.${location.fs}`, saved);
       }
+    }
+    if (this.following && this.panels[this.following.side].fs !== this.following.fs) {
+      this.stopFollowing();
     }
     this.releaseUnused();
     this.onStatusChange?.();
@@ -353,6 +359,15 @@ export class FileManagerTab implements AppTab, PanelHost {
           for (const root of roots) {
             items.push({ label: root.label, icon: root.label === "Home" ? "home" : "server", action: go(root.location) });
           }
+          const tab = this.liveConnectionOf(panel.fs);
+          if (tab) {
+            const on = this.following?.side === panel.side;
+            items.push({
+              label: on ? "Stop following the terminal's folder" : "Follow the terminal's folder",
+              icon: "terminal",
+              action: () => (on ? this.stopFollowing() : this.follow(panel, tab)),
+            });
+          }
         } catch {
           // Disconnected: the banner says so.
         }
@@ -367,7 +382,7 @@ export class FileManagerTab implements AppTab, PanelHost {
           for (const each of live) {
             items.push({
               label: each.label,
-              hint: each.title,
+              hint: each.folder ? `${each.title} · ${each.folder}` : each.title,
               icon: "terminal",
               action: () => void this.openRemote(panel, { kind: "live", connectionId: each.connectionId }),
             });
@@ -445,7 +460,11 @@ export class FileManagerTab implements AppTab, PanelHost {
   }
 
   /** Show a remote filesystem in `panel` (logging in first if it needs to). */
-  private async openRemote(panel: PanelView, target: RemoteTarget): Promise<boolean> {
+  private async openRemote(
+    panel: PanelView,
+    target: RemoteTarget,
+    follow = false
+  ): Promise<boolean> {
     const remote = this.remote;
     if (!remote) return false;
     let options: SftpConnectOptions | null;
@@ -472,13 +491,53 @@ export class FileManagerTab implements AppTab, PanelHost {
     }
     if (view.notice) this.toast(view.notice, "info");
     learn(view, relogin);
+    if (target.kind === "live") this.liveConnections.set(view.fs, target.connectionId);
     this.hold(view.fs);
     if (this.disposed) return false;
+    // An SSH tab's connection opens where its terminal is (when the shell says).
+    let start = view.home;
+    if (target.kind === "live") {
+      const folder = (await remote.live().catch(() => [])).find(
+        (each) => each.connectionId === target.connectionId
+      )?.folder;
+      if (folder) start = (await fsApi.resolve(view.fs, folder).catch(() => null)) ?? view.home;
+    }
     this.opening += 1;
-    const shown = await panel.navigate(view.home).finally(() => (this.opening -= 1));
+    const shown = await panel.navigate(start).finally(() => (this.opening -= 1));
+    if (shown && target.kind === "live" && follow) this.follow(panel, target.connectionId);
     this.releaseUnused();
     if (shown && panel === this.active) panel.focus();
     return shown;
+  }
+
+  /** Remote filesystems opened on an SSH tab's connection (fs → connection id). */
+  private readonly liveConnections = new Map<string, string>();
+
+  private liveConnectionOf(fs: string): string | null {
+    return this.liveConnections.get(fs) ?? null;
+  }
+
+  /** Keep `panel` in the SSH tab's working folder as its shell reports it. */
+  private follow(panel: PanelView, connectionId: string): void {
+    this.stopFollowing();
+    const fs = panel.fs;
+    const stop = this.remote?.watchFolder(connectionId, (folder) => {
+      if (this.disposed || panel.fs !== fs) return this.stopFollowing();
+      void fsApi
+        .resolve(fs, folder)
+        .then((location) => panel.navigate(location, { quiet: true }))
+        .catch(() => undefined);
+    });
+    if (!stop) {
+      this.toast("No SSH tab uses this connection any more", "warn");
+      return;
+    }
+    this.following = { side: panel.side, fs, connectionId, stop };
+  }
+
+  private stopFollowing(): void {
+    this.following?.stop();
+    this.following = null;
   }
 
   /** Keep the reference a successful `sftpApi.connect` took (one per filesystem per tab). */
@@ -604,7 +663,7 @@ export class FileManagerTab implements AppTab, PanelHost {
     const results = await Promise.all(
       this.panels.map(async (panel) => {
         if (this.openOnStart?.side === panel.side) {
-          if (await this.openRemote(panel, this.openOnStart.target)) return true;
+          if (await this.openRemote(panel, this.openOnStart.target, true)) return true;
           if (this.disposed) return false;
         }
         const wanted = this.initialLocations?.[panel.side] ?? readLocation(panel.side);

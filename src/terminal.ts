@@ -10,6 +10,7 @@ import { icon } from "./icons";
 import { ringBell, termOptions } from "./settings";
 import type { LaunchSpec } from "./spec";
 import { SgrDimFilter } from "./dimfix";
+import { parseOsc7 } from "./osc7";
 import { escapeHtml, uuid } from "./util";
 import type { AppTab, TabStatusInfo } from "./tab";
 
@@ -48,6 +49,9 @@ export class TerminalSession implements AppTab {
   private baseTitle: string;
   /** Latest OSC 0/2 title set by the program, shell prompt, or remote host. */
   osTitle = "";
+  /** The shell's working folder, when it reports it (OSC 7). */
+  cwd: string | null = null;
+  private readonly cwdListeners = new Set<(cwd: string) => void>();
   /** A manually pinned name. Once set it overrides everything, permanently. */
   private customTitle: string | null = null;
 
@@ -90,6 +94,14 @@ export class TerminalSession implements AppTab {
       this.osTitle = t || "";
       this.onTitleUpdate?.();
     });
+    this.term.parser.registerOscHandler(7, (data) => {
+      const cwd = parseOsc7(data);
+      if (cwd && cwd !== this.cwd) {
+        this.cwd = cwd;
+        for (const listener of this.cwdListeners) listener(cwd);
+      }
+      return true;
+    });
     this.term.onBell(() => ringBell(this.element));
     // Scrolling the scrollback (mouse wheel) exposes many rows at once; the WebGL
     // renderer can surface stale/partial cells from earlier in-place redraws
@@ -110,6 +122,12 @@ export class TerminalSession implements AppTab {
    * Effective tab label. A user-pinned name wins over everything; otherwise the
    * program-set OSC title wins over the default label.
    */
+  /** Hear about the working folder changing; returns the unsubscribe. */
+  watchCwd(listener: (cwd: string) => void): () => void {
+    this.cwdListeners.add(listener);
+    return () => this.cwdListeners.delete(listener);
+  }
+
   get title(): string {
     return this.customTitle ?? (this.osTitle || this.baseTitle);
   }

@@ -12,6 +12,9 @@ export interface SshTab {
   connectionId: string;
   title: string;
   form: ConnForm;
+  /** Its shell's working folder (OSC 7), if reported. */
+  cwd: string | null;
+  watchCwd: (listener: (cwd: string) => void) => () => void;
 }
 
 function hostLabel(username: string, host: string, port: number): string {
@@ -102,6 +105,7 @@ export function appRemoteSource(sshTabs: () => SshTab[]): RemoteSource {
           .filter((tab) => tab.connectionId === connection.id)
           .map((tab) => tab.title)
           .join(", "),
+        folder: tabs.find((tab) => tab.connectionId === connection.id && tab.cwd)?.cwd ?? null,
       }));
     },
 
@@ -113,6 +117,11 @@ export function appRemoteSource(sshTabs: () => SshTab[]): RemoteSource {
     async relogin(connectionId: string): Promise<SftpConnectOptions | null> {
       const tab = sshTabs().find((each) => each.connectionId === connectionId);
       return tab ? loginFromForm(tab.form) : null;
+    },
+
+    watchFolder(connectionId, onFolder) {
+      const tab = sshTabs().find((each) => each.connectionId === connectionId);
+      return tab ? tab.watchCwd(onFolder) : null;
     },
   };
 }

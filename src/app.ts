@@ -543,7 +543,13 @@ export class App {
       if (!(tab instanceof TerminalSession)) continue;
       const connectionId = tab.info?.connectionId;
       if (tab.spec?.kind !== "ssh" || !connectionId) continue;
-      tabs.push({ connectionId, title: tab.title, form: tab.spec.form });
+      tabs.push({
+        connectionId,
+        title: tab.title,
+        form: tab.spec.form,
+        cwd: tab.cwd,
+        watchCwd: (listener) => tab.watchCwd(listener),
+      });
     }
     return tabs;
   }
