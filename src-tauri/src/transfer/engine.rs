@@ -591,6 +591,13 @@ impl Engine {
         destination: &VPath,
         name: &VName,
     ) -> Result<Option<(VPath, Placement)>, TransferError> {
+        // A remote name this machine can't hold (`a:b`, `CON` on Windows)
+        // lands under a safe spelling instead of failing the job.
+        let storable = match destination {
+            VPath::Native(_) => name.storable_here(),
+            VPath::Posix(_) => None,
+        };
+        let name = storable.as_ref().unwrap_or(name);
         let mut target = destination
             .join(name)
             .map_err(|e| TransferError::Failed(e.to_string()))?;
@@ -1770,5 +1777,33 @@ pub(crate) mod tests {
             Path::new("real.txt")
         );
         assert!(leftovers(&destination).is_empty());
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn remote_names_windows_cannot_store_arrive_under_safe_names() {
+        let remote = Arc::new(MemFs::new());
+        remote.add_dir("/src");
+        for name in ["a:b.txt", "CON", "notes.", r"back\slash"] {
+            remote.add_file(&format!("/src/{name}"), name.as_bytes());
+        }
+        let local_dir = tempdir().unwrap();
+        let outcome = run(
+            TransferKind::Copy,
+            memory(&remote, "sftp:test"),
+            local(),
+            &[MemFs::path("/src")],
+            &native(local_dir.path()),
+            no_conflicts(),
+        )
+        .await;
+        assert_eq!(outcome.result, Ok(()));
+        let copied = local_dir.path().join("src");
+        assert_eq!(fs::read(copied.join("a_b.txt")).unwrap(), b"a:b.txt");
+        assert_eq!(fs::read(copied.join("CON_")).unwrap(), b"CON");
+        assert_eq!(fs::read(copied.join("notes._")).unwrap(), b"notes.");
+        assert_eq!(fs::read(copied.join("back_slash")).unwrap(), br"back\slash");
+        // Nothing escaped the folder as a path.
+        assert_eq!(fs::read_dir(&copied).unwrap().count(), 4);
     }
 }

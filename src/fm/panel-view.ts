@@ -194,7 +194,11 @@ export class PanelView {
   async goUp(): Promise<void> {
     const { parent, location } = this.model;
     if (!parent || !location) return;
-    const from = location.display.replace(/[\\/]+$/, "").split(/[\\/]/).pop();
+    // The path token finds the folder; the name is a fallback. POSIX names
+    // may contain `\`, so only Windows-style paths split on it.
+    const windows = /^([A-Za-z]:)?\\/.test(location.display);
+    const separators = windows ? /[\\/]/ : /\//;
+    const from = location.display.replace(/[\\/]+$/, "").split(separators).pop();
     await this.navigate(parent, { focusPath: location.path, focusName: from });
   }
 

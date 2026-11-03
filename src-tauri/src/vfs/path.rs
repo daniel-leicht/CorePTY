@@ -200,6 +200,20 @@ impl VName {
         }
     }
 
+    /// The name to store on this machine when it can't hold this one as is,
+    /// or `None` when it can. Only Windows forbids names a remote host allows
+    /// (`a:b`, `CON`, `notes.`); there the forbidden characters become `_`, a
+    /// trailing dot or space gets a `_` after it (Windows would silently drop
+    /// it), and device names get a `_` after their stem (writing to `NUL`
+    /// would quietly discard the file).
+    pub fn storable_here(&self) -> Option<Self> {
+        if !cfg!(windows) {
+            return None;
+        }
+        windows_safe_name(&self.to_native().to_string_lossy())
+            .map(|safe| Self::Native(OsString::from(safe)))
+    }
+
     /// `report.txt` → `report (copy).txt`, then `report (copy 2).txt`, …
     pub fn with_copy_suffix(&self, number: u32) -> Self {
         let suffix = if number <= 1 {
@@ -238,6 +252,36 @@ impl VName {
             Self::Posix(_) => Self::Posix(renamed.into_bytes()),
         }
     }
+}
+
+/// See [`VName::storable_here`]; `None` when `name` is fine on Windows.
+fn windows_safe_name(name: &str) -> Option<String> {
+    let mut safe: String = name
+        .chars()
+        .map(|c| {
+            if c < ' ' || "<>:\"/\\|?*".contains(c) {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect();
+    if safe.ends_with('.') || safe.ends_with(' ') {
+        safe.push('_');
+    }
+    // `CON`, `con.txt`, `COM1 .log`: the part before the first dot names a device.
+    let stem_end = safe.find('.').unwrap_or(safe.len());
+    let stem = safe[..stem_end].trim_end_matches(' ').to_ascii_uppercase();
+    let numbered = |prefix: &str| {
+        stem.strip_prefix(prefix).is_some_and(|digit| {
+            digit.len() == 1 && digit.as_bytes()[0].is_ascii_digit() && digit != "0"
+        })
+    };
+    if matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL") || numbered("COM") || numbered("LPT")
+    {
+        safe.insert(stem_end, '_');
+    }
+    (safe != name).then_some(safe)
 }
 
 fn invalid_name(name: &str) -> io::Error {
@@ -375,6 +419,24 @@ mod tests {
 
     fn posix(path: &str) -> VPath {
         VPath::posix(path.as_bytes())
+    }
+
+    #[test]
+    fn names_windows_cannot_store_get_safe_ones() {
+        let safe = |name: &str| windows_safe_name(name);
+        assert_eq!(safe("report.txt"), None);
+        assert_eq!(safe("a:b?.txt").as_deref(), Some("a_b_.txt"));
+        assert_eq!(safe("back\\slash").as_deref(), Some("back_slash"));
+        assert_eq!(safe("tab\there").as_deref(), Some("tab_here"));
+        assert_eq!(safe("notes.").as_deref(), Some("notes._"));
+        assert_eq!(safe("trailing ").as_deref(), Some("trailing _"));
+        assert_eq!(safe("CON").as_deref(), Some("CON_"));
+        assert_eq!(safe("nul.txt").as_deref(), Some("nul_.txt"));
+        assert_eq!(safe("com1.log").as_deref(), Some("com1_.log"));
+        assert_eq!(safe("COM10"), None);
+        assert_eq!(safe("COM0"), None);
+        assert_eq!(safe("console"), None);
+        assert_eq!(safe(".bashrc"), None);
     }
 
     #[test]
