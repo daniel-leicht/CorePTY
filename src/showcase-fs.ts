@@ -97,8 +97,10 @@ export class ShowcaseFs {
           notice: null,
         };
       case "sftp_close":
+      case "fs_edit_resolve":
       case "fs_close_copies":
         return null;
+      case "fs_edit":
       case "fs_open_copy":
         return { id: "copy-1", path: `C:\Users\dev\AppData\Local\Temp\CorePTY\open\copy-1\${nameOf(untoken(a.location.path))}` };
       case "sftp_sessions":

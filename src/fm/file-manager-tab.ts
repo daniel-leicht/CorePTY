@@ -13,6 +13,7 @@ import {
   type SftpConnectOptions,
   type SftpStatus,
   type SftpView,
+  type EditEvent,
   type TransferKind,
   type TransferRequest,
 } from "../ipc";
@@ -29,6 +30,7 @@ import {
   type DialogContext,
 } from "./dialogs";
 import { formatFileSize } from "./format";
+import { current as settings } from "../settings";
 import { commandFor, FUNCTION_KEYS, isQuickSearchKey, type FmCommand } from "./keymap";
 import { DRAG_TYPE, PanelView, type PanelHost } from "./panel-view";
 import {
@@ -113,6 +115,10 @@ export class FileManagerTab implements AppTab, PanelHost {
   /** Stops listening for remote filesystems dropping and coming back. */
   private readonly statusListener: Promise<(() => void) | null> = sftpApi
     .onStatus((status) => this.onRemoteStatus(status))
+    .catch(() => null);
+  /** Stops listening for edited remote files being uploaded. */
+  private readonly editListener: Promise<(() => void) | null> = fsApi
+    .onEdit((event) => this.onEdit(event))
     .catch(() => null);
   private readonly dialogs: DialogContext = {
     signal: this.lifetime.signal,
@@ -210,6 +216,7 @@ export class FileManagerTab implements AppTab, PanelHost {
   dispose(): void {
     this.disposed = true;
     void this.statusListener.then((unlisten) => unlisten?.());
+    void this.editListener.then((unlisten) => unlisten?.());
     this.lifetime.abort();
     this.queue.cancelAll();
     for (const [type, listener] of this.windowListeners) window.removeEventListener(type, listener);
@@ -507,6 +514,38 @@ export class FileManagerTab implements AppTab, PanelHost {
     }
   }
 
+  /** An edited remote file's save: uploaded, failed, or clashing with the server's. */
+  private onEdit(event: EditEvent): void {
+    if (this.disposed || !this.copies.includes(event.id)) return;
+    switch (event.event) {
+      case "uploaded": {
+        this.toast(`Uploaded ${event.name}`, "info");
+        for (const panel of this.panels) if (isRemote(panel.fs)) void panel.refresh();
+        break;
+      }
+      case "failed":
+        this.toast(`Couldn't upload ${event.name}: ${event.message}`, "error");
+        break;
+      case "conflict":
+        void (async () => {
+          const overwrite = await confirmAction(
+            {
+              title: "Changed on the server",
+              message: `“${event.name}” changed on the server since you opened it. Upload your copy over it?`,
+              detail: "Keeping the server's version leaves your copy as it is; save it again to upload it.",
+              action: "Upload mine",
+              danger: true,
+            },
+            this.dialogs
+          );
+          void fsApi.editResolve(event.id, overwrite).catch(() => undefined);
+        })();
+        break;
+      case "uploading":
+        break;
+    }
+  }
+
   /** A remote filesystem dropped or came back: show it on its panels. */
   private onRemoteStatus(status: SftpStatus): void {
     if (this.disposed) return;
@@ -739,7 +778,7 @@ export class FileManagerTab implements AppTab, PanelHost {
       case "view":
         return this.view(panel);
       case "edit":
-        return this.edit(panel);
+        return this.edit(panel, model.cursorEntry(), true);
       case "copy":
       case "move":
         return this.transferToOther(command);
@@ -782,10 +821,16 @@ export class FileManagerTab implements AppTab, PanelHost {
   }
 
   /** F4 / Enter on a file: open it with the OS default application. */
-  private async edit(panel: PanelView, entry = panel.model.cursorEntry()): Promise<void> {
+  /** Enter (or F4, `editing`) on a file: open it with the OS; a remote one
+   * as a downloaded copy, which F4 keeps uploading as it's saved. */
+  private async edit(
+    panel: PanelView,
+    entry = panel.model.cursorEntry(),
+    editing = false
+  ): Promise<void> {
     if (!entry || entry.isDirectory) return;
     if (!panel.capabilities.openNative) {
-      await this.openCopy(panel, entry);
+      await this.openCopy(panel, entry, editing);
       return;
     }
     try {
@@ -796,7 +841,7 @@ export class FileManagerTab implements AppTab, PanelHost {
   }
 
   /** A remote file: download a copy to a temp folder and open it there. */
-  private async openCopy(panel: PanelView, entry: FsEntry): Promise<void> {
+  private async openCopy(panel: PanelView, entry: FsEntry, editing = false): Promise<void> {
     const big = (entry.size ?? 0) > LARGE_DOWNLOAD;
     if (big) {
       const go = await confirmAction(
@@ -809,9 +854,15 @@ export class FileManagerTab implements AppTab, PanelHost {
       );
       if (!go || this.disposed) return;
     }
-    this.toast(`Opening a copy of ${entry.name}…`, "info");
+    this.toast(
+      editing ? `Editing ${entry.name} — saves are uploaded` : `Opening a copy of ${entry.name}…`,
+      "info"
+    );
     try {
-      const copy = await fsApi.openCopy({ fs: panel.fs, path: entry.path });
+      const location = { fs: panel.fs, path: entry.path };
+      const copy = editing
+        ? await fsApi.edit(location, settings.externalEditor)
+        : await fsApi.openCopy(location);
       if (this.disposed) {
         void fsApi.closeCopies([copy.id]);
         return;

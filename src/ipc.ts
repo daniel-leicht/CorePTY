@@ -272,6 +272,13 @@ export const fsApi = {
   openCopy: (location: FsLocation) =>
     invoke<{ id: string; path: string }>("fs_open_copy", { location: plain(location) }),
   closeCopies: (ids: string[]) => invoke<void>("fs_close_copies", { ids }),
+  /** Edit a remote file: download, open in `editor` (blank: default app), upload each save. */
+  edit: (location: FsLocation, editor: string) =>
+    invoke<{ id: string; path: string }>("fs_edit", { location: plain(location), editor: editor || null }),
+  /** Answer an edit conflict: upload over the server's newer file, or keep it. */
+  editResolve: (id: string, overwrite: boolean) => invoke<void>("fs_edit_resolve", { id, overwrite }),
+  onEdit: (cb: (event: EditEvent) => void): Promise<UnlistenFn> =>
+    listen<EditEvent>("fs://edit", (e) => cb(e.payload)),
   /** Raw bytes `[offset, offset + length)` (at most 4 MiB per call). */
   read: (location: FsLocation, offset: number, length: number) =>
     invoke<ArrayBuffer>("fs_read", { location: plain(location), offset, length }),
@@ -344,6 +351,13 @@ export const sftpApi = {
   close: (fs: string) => invoke<void>("sftp_close", { fs }),
   sessions: () => invoke<SftpSessionView[]>("sftp_sessions"),
 };
+
+/** Progress of an edited remote file's saves. */
+export type EditEvent =
+  | { event: "uploading"; id: string; name: string }
+  | { event: "uploaded"; id: string; name: string }
+  | { event: "conflict"; id: string; name: string }
+  | { event: "failed"; id: string; name: string; message: string };
 
 /** Just the addressing fields — views and entries carry extra display data. */
 function plain(location: FsLocation): FsLocation {

@@ -49,6 +49,8 @@ pub fn run() {
                 .set_events(Arc::new(move |event| {
                     let _ = handle.emit("ssh://connection", event);
                 }));
+            // Saves of remote files being edited are reported as they upload.
+            edit::forward_events(app.handle().clone(), &app.state::<edit::OpenedCopies>());
             Ok(())
         })
         .manage(SessionManager::default())
@@ -86,6 +88,8 @@ pub fn run() {
             vfs::commands::fs_delete,
             vfs::commands::fs_chmod,
             edit::fs_open_copy,
+            edit::fs_edit,
+            edit::fs_edit_resolve,
             edit::fs_close_copies,
             vfs::commands::fs_trash,
             vfs::commands::fs_open_native,
