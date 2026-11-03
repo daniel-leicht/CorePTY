@@ -24,7 +24,7 @@ use std::{
     sync::{Arc, RwLock},
     time::{SystemTime, UNIX_EPOCH},
 };
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 
 /// Which filesystem a path belongs to: [`FsId::LOCAL`] or a connection id.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -193,8 +193,8 @@ pub struct Capabilities {
     pub symlinks: bool,
 }
 
-// Truncate/Append serve resumed and remote transfers (Phase 6); LocalFs
-// supports and tests them already.
+// Truncate is for callers that replace a file in place; none does yet
+// (uploads stage and rename), but every filesystem supports it.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WriteMode {
@@ -202,9 +202,13 @@ pub enum WriteMode {
     CreateNew,
     /// Create, or empty an existing file.
     Truncate,
-    /// Continue an existing file (resumed transfers).
-    Append,
+    /// Write into an existing file from this offset on, keeping what's
+    /// before it (a resumed transfer).
+    At(u64),
 }
+
+/// The most one [`Vfs::read_range`] returns.
+pub const MAX_READ_RANGE: usize = 4 * 1024 * 1024;
 
 pub type VRead = Pin<Box<dyn AsyncRead + Send>>;
 pub type VWrite = Pin<Box<dyn AsyncWrite + Send>>;
@@ -248,6 +252,24 @@ pub trait Vfs: Send + Sync {
 
     async fn open_read(&self, path: &VPath, offset: u64) -> io::Result<VRead>;
 
+    /// [`Self::open_read`] for a caller that expects the file to end at
+    /// `end` (its listed size): a remote filesystem then asks for no more
+    /// than that up front. Reading past it still works.
+    async fn open_read_until(&self, path: &VPath, offset: u64, end: u64) -> io::Result<VRead> {
+        let _ = end;
+        self.open_read(path, offset).await
+    }
+
+    /// Up to `length` bytes from `offset` (at most [`MAX_READ_RANGE`]); fewer
+    /// at the end of the file. For viewers, which read pieces of a file.
+    async fn read_range(&self, path: &VPath, offset: u64, length: usize) -> io::Result<Vec<u8>> {
+        let length = length.min(MAX_READ_RANGE);
+        let reader = self
+            .open_read_until(path, offset, offset.saturating_add(length as u64))
+            .await?;
+        read_up_to(reader, length).await
+    }
+
     async fn open_write(&self, path: &VPath, mode: WriteMode) -> io::Result<VWrite>;
 
     async fn set_times(
@@ -279,6 +301,29 @@ pub trait Vfs: Send + Sync {
     fn connection(&self) -> Option<tokio::sync::watch::Receiver<bool>> {
         None
     }
+}
+
+/// [`WriteMode::At`] past the end of the file (it would leave a hole).
+pub fn shorter_than(offset: u64) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!("the file is shorter than {offset} bytes, where writing was to continue"),
+    )
+}
+
+/// Read until `length` bytes or the end of the file.
+pub async fn read_up_to(mut reader: VRead, length: usize) -> io::Result<Vec<u8>> {
+    let mut buffer = vec![0_u8; length];
+    let mut filled = 0;
+    while filled < length {
+        let read = reader.read(&mut buffer[filled..]).await?;
+        if read == 0 {
+            break;
+        }
+        filled += read;
+    }
+    buffer.truncate(filled);
+    Ok(buffer)
 }
 
 pub fn unsupported(what: &str) -> io::Error {

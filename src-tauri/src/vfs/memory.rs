@@ -397,8 +397,11 @@ impl Vfs for MemFs {
             (WriteMode::CreateNew, Some(_)) => {
                 return Err(io::Error::new(io::ErrorKind::AlreadyExists, "exists"))
             }
-            (WriteMode::Append, Some(data)) => data,
-            (WriteMode::Append, None) => return Err(not_found(&key)),
+            (WriteMode::At(offset), Some(data)) if data.len() as u64 >= offset => {
+                data[..offset as usize].to_vec()
+            }
+            (WriteMode::At(offset), Some(_)) => return Err(super::shorter_than(offset)),
+            (WriteMode::At(_), None) => return Err(not_found(&key)),
             _ => Vec::new(),
         };
         // Like a real file, it exists as soon as it's opened.

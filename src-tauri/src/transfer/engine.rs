@@ -11,7 +11,7 @@ use crate::vfs::{epoch_millis, Entry, EntryKind, FsId, Meta, VName, VPath, Vfs, 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fmt,
     future::Future,
     io,
@@ -19,7 +19,7 @@ use std::{
     pin::Pin,
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc, Mutex,
+        Arc, LazyLock, Mutex,
     },
 };
 use tokio::{
@@ -212,10 +212,75 @@ enum Placement {
     Merge,
 }
 
+#[derive(Clone)]
 enum Decision {
     Overwrite,
     Skip,
     RenameTo(VName),
+}
+
+/// What a job did in its earlier attempts (the engine outlives a dropped
+/// connection), so that picking up again trusts only its own work: a
+/// `.filepart` or a finished-looking file it didn't write is asked about.
+#[derive(Default)]
+struct Ledger {
+    /// Targets this job put a source at (by [`ledger_key`]), and that source.
+    written: HashMap<VPath, VPath>,
+    /// `.filepart` files this job wrote.
+    partials: HashSet<VPath>,
+    /// Folders this job created (they get their times and mode at the end).
+    folders: HashSet<VPath>,
+    /// How each clash was answered, so a retry doesn't ask again.
+    decided: HashMap<VPath, Decision>,
+    /// Picked items already moved (they're gone from the source).
+    moved: HashSet<VPath>,
+    /// Temporary files that couldn't be removed (the connection was gone).
+    leftovers: Vec<VPath>,
+}
+
+/// The same target, as this machine compares names: Windows and macOS
+/// folders don't tell `Readme` from `README`.
+fn ledger_key(path: &VPath) -> VPath {
+    match path {
+        VPath::Native(native) if cfg!(any(windows, target_os = "macos")) => {
+            VPath::Native(native.to_string_lossy().to_lowercase().into())
+        }
+        _ => path.clone(),
+    }
+}
+
+/// `.filepart` files being written right now, by any job: another job
+/// copying a file of that name to the same folder stages elsewhere.
+static PARTIALS_IN_USE: LazyLock<Mutex<HashSet<(FsId, VPath)>>> = LazyLock::new(Mutex::default);
+
+/// A claim on one of [`PARTIALS_IN_USE`], given up when dropped.
+struct PartialClaim(FsId, VPath);
+
+impl PartialClaim {
+    fn take(fs: &FsId, path: &VPath) -> Option<Self> {
+        let mut in_use = PARTIALS_IN_USE.lock().unwrap_or_else(|e| e.into_inner());
+        in_use
+            .insert((fs.clone(), path.clone()))
+            .then(|| Self(fs.clone(), path.clone()))
+    }
+}
+
+impl Drop for PartialClaim {
+    fn drop(&mut self) {
+        PARTIALS_IN_USE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&(self.0.clone(), self.1.clone()));
+    }
+}
+
+/// Where a file's data goes before it takes the target's name.
+struct Staging {
+    path: VPath,
+    /// Resume: write from this offset into what's there.
+    resume_at: Option<u64>,
+    /// Held for a `.filepart`.
+    claim: Option<PartialClaim>,
 }
 
 /// How one source entry is handled.
@@ -290,10 +355,9 @@ pub struct Engine {
     partial_skipped: bool,
     /// Give copies the source's permissions (POSIX mode bits).
     preserve_mode: bool,
-    /// Picking up after a dropped connection: files already copied are
-    /// passed over and partial copies resumed, without asking.
-    retrying: bool,
-    /// `place` found the file already copied (when retrying).
+    /// What earlier attempts did.
+    done: Ledger,
+    /// `place` found the file already copied (by an earlier attempt).
     already_there: bool,
     /// Planned totals of every walked folder, for counting renamed subtrees.
     folder_stats: HashMap<VPath, WorkStats>,
@@ -321,27 +385,26 @@ impl Engine {
             sticky_partial: None,
             partial_skipped: false,
             preserve_mode: true,
-            retrying: false,
+            done: Ledger::default(),
             already_there: false,
             folder_stats: HashMap::new(),
             buffer: Vec::new(),
         }
     }
 
-    /// Count everything the job will touch.
     /// Whether copies get the source's permissions (on by default).
     pub fn set_preserve_mode(&mut self, preserve: bool) {
         self.preserve_mode = preserve;
     }
 
-    /// Run again after a dropped connection: what's already done is kept.
-    pub fn set_retrying(&mut self) {
-        self.retrying = true;
-    }
-
+    /// Count everything the job will touch. Run again (after a dropped
+    /// connection), it counts what's left.
     pub async fn plan(&mut self, sources: &[VPath]) -> Result<WorkStats, TransferError> {
         let mut total = WorkStats::default();
         for source in sources {
+            if self.done.moved.contains(source) {
+                continue;
+            }
             total += self.measure(source, None, Walk::default()).await?;
         }
         Ok(total)
@@ -364,9 +427,20 @@ impl Engine {
                 destination.display()
             )));
         }
+        // An earlier attempt's temporaries, if the connection is back.
+        for leftover in std::mem::take(&mut self.done.leftovers) {
+            let _ = self.target.fs.remove(&leftover, false).await;
+        }
         for source in sources {
-            self.transfer(source, destination, None, None, Walk::default())
+            if self.done.moved.contains(source) {
+                continue;
+            }
+            let outcome = self
+                .transfer(source, destination, None, None, Walk::default())
                 .await?;
+            if outcome == Outcome::Done && self.kind == TransferKind::Move {
+                self.done.moved.insert(source.clone());
+            }
         }
         Ok(())
     }
@@ -663,9 +737,12 @@ impl Engine {
         let mut target = destination
             .join(name)
             .map_err(|e| TransferError::Failed(e.to_string()))?;
-        loop {
+        // An earlier attempt's answer is used once; asked again only if
+        // where it led is taken too.
+        let mut earlier = self.done.decided.get(source).cloned();
+        let placed = loop {
             let Some(existing) = self.target_meta(&target).await? else {
-                return Ok(Some((target, Placement::Fresh)));
+                break (target, Placement::Fresh);
             };
             if self.same_fs() && self.same_entry(source, &target).await {
                 // Copying an item onto itself makes a "(copy)" beside it, as
@@ -676,16 +753,34 @@ impl Engine {
                 target = self.unique_target(destination, name).await?;
                 continue;
             }
+            match self.done.written.get(&ledger_key(&target)) {
+                // Another item of this job already landed on this name (`a:b`
+                // and `a_b` both stored as `a_b`, `Readme` and `README` on
+                // Windows): keep both, never one over the other.
+                Some(from) if from != source => {
+                    target = self.unique_target(destination, name).await?;
+                    continue;
+                }
+                // Copied by an earlier attempt, before the connection dropped.
+                Some(_) if !walks && same_file(meta, &existing) => {
+                    self.already_there = true;
+                    return Ok(None);
+                }
+                _ => {}
+            }
             if walks && existing.is_real_directory() {
-                return Ok(Some((target, Placement::Merge)));
+                break (target, Placement::Merge);
             }
-            if self.retrying && !walks && same_file(meta, &existing) {
-                // Copied before the connection dropped.
-                self.already_there = true;
-                return Ok(None);
-            }
-            match self.decide(name, source, meta, &target, &existing).await? {
-                Decision::Overwrite => return Ok(Some((target, Placement::Overwrite))),
+            let decision = match earlier.take() {
+                Some(decision) => decision,
+                None => {
+                    let decision = self.decide(name, source, meta, &target, &existing).await?;
+                    self.done.decided.insert(source.clone(), decision.clone());
+                    decision
+                }
+            };
+            match decision {
+                Decision::Overwrite => break (target, Placement::Overwrite),
                 Decision::Skip => return Ok(None),
                 // A typed name that isn't valid here: ask again.
                 Decision::RenameTo(new_name) => {
@@ -694,7 +789,11 @@ impl Engine {
                     }
                 }
             }
-        }
+        };
+        self.done
+            .written
+            .insert(ledger_key(&placed.0), source.clone());
+        Ok(Some(placed))
     }
 
     async fn decide(
@@ -823,6 +922,7 @@ impl Engine {
                 .mkdir(target)
                 .await
                 .map_err(|e| failed("create", target, e))?;
+            self.done.folders.insert(ledger_key(target));
         }
         self.counters.add(WorkStats { items: 1, bytes: 0 });
         let children = self
@@ -847,9 +947,9 @@ impl Engine {
                 complete = false;
             }
         }
-        if placement != Placement::Merge {
-            // A folder we created gets its times (and mode) last: writing
-            // its contents changed them.
+        if self.done.folders.contains(&ledger_key(target)) {
+            // A folder this job created (perhaps in an attempt cut short)
+            // gets its times (and mode) last: writing its contents changed them.
             if let Some(modified) = meta.modified {
                 let _ = self
                     .target
@@ -926,23 +1026,48 @@ impl Engine {
         source: &VPath,
         meta: &Meta,
         target: &VPath,
-    ) -> Result<Option<(VPath, u64)>, TransferError> {
+    ) -> Result<Option<Staging>, TransferError> {
+        let hidden = |target: &VPath| -> Result<Option<Staging>, TransferError> {
+            Ok(Some(Staging {
+                path: temporary_beside(target, "part")?,
+                resume_at: None,
+                claim: None,
+            }))
+        };
         let size = meta.size.unwrap_or(0);
         if size < RESUMABLE_SIZE {
-            return Ok(Some((temporary_beside(target, "part")?, 0)));
+            return hidden(target);
         }
-        let partial = partial_beside(target)?;
+        // A name too long for the suffix, or another job writing that
+        // `.filepart` right now: not resumable, but it still copies.
+        let Some(partial) = partial_beside(target)? else {
+            return hidden(target);
+        };
+        let Some(claim) = PartialClaim::take(&self.target.id, &partial) else {
+            return hidden(target);
+        };
+        let fresh = |claim: PartialClaim| {
+            Ok(Some(Staging {
+                path: partial.clone(),
+                resume_at: None,
+                claim: Some(claim),
+            }))
+        };
         let Some(existing) = self.target_meta(&partial).await? else {
-            return Ok(Some((partial, 0)));
+            return fresh(claim);
         };
         if existing.kind != EntryKind::File {
             // Not ours to touch (a folder by that name, say).
-            return Ok(Some((temporary_beside(target, "part")?, 0)));
+            return hidden(target);
         }
         let have = existing.size.unwrap_or(0);
-        let resumable = have > 0 && have < size;
+        // This job's own (a dropped connection) resumes without asking, even
+        // when it's complete (the rename was cut off); anyone else's is asked
+        // about: it may be from another version of the file.
+        let ours = self.done.partials.contains(&partial);
+        let resumable = have > 0 && (have < size || (ours && have == size));
         let resume = resumable
-            && (self.retrying
+            && (ours
                 || self
                     .ask_resume(name, source, meta, &partial, &existing)
                     .await?);
@@ -950,7 +1075,19 @@ impl Engine {
             return Ok(None);
         }
         if resume {
-            return Ok(Some((partial, have)));
+            // Writes to a server are pipelined, and one that failed doesn't
+            // stop the ones sent after it, so the end of the file may have
+            // holes: write its last stretch again.
+            let overlap = if self.target.id.is_local() {
+                0
+            } else {
+                RESUME_OVERLAP
+            };
+            return Ok(Some(Staging {
+                path: partial,
+                resume_at: Some(have.saturating_sub(overlap)),
+                claim: Some(claim),
+            }));
         }
         // Start over: an empty or complete leftover, or the user's choice.
         self.target
@@ -958,7 +1095,7 @@ impl Engine {
             .remove(&partial, false)
             .await
             .map_err(|e| failed("replace", &partial, e))?;
-        Ok(Some((partial, 0)))
+        fresh(claim)
     }
 
     /// Resume the partial copy at `partial`? Sets `partial_skipped` when the
@@ -1011,19 +1148,30 @@ impl Engine {
         target: &VPath,
         overwrite: bool,
     ) -> Result<Outcome, TransferError> {
-        let Some((temporary, offset)) = self.staging(name, source, meta, target).await? else {
+        let Some(staging) = self.staging(name, source, meta, target).await? else {
             return Ok(Outcome::Skipped);
         };
-        let keeps_partial = offset > 0 || is_partial(&temporary);
+        // The claim on a .filepart lasts until the copy is finished or given up.
+        let Staging {
+            path: temporary,
+            resume_at,
+            claim,
+        } = staging;
+        let partial = claim.is_some();
+        if partial {
+            self.done.partials.insert(temporary.clone());
+        }
         let mut buffer = std::mem::take(&mut self.buffer);
         buffer.resize(CHUNK_SIZE, 0);
-        let streamed = self.stream(source, &temporary, offset, &mut buffer).await;
+        let streamed = self
+            .stream(source, meta, &temporary, resume_at, &mut buffer)
+            .await;
         self.buffer = buffer;
         if let Err(error) = streamed {
             // A copy cut short keeps its .filepart to resume; a cancelled one
             // (and any hidden temporary) is cleaned up.
-            if !keeps_partial || error == TransferError::Cancelled {
-                let _ = self.target.fs.remove(&temporary, false).await;
+            if !partial || error == TransferError::Cancelled {
+                self.discard(&temporary).await;
             }
             return Err(error);
         }
@@ -1036,9 +1184,14 @@ impl Engine {
                 .await;
         }
         if let Err(e) = self.target.fs.rename(&temporary, target, overwrite).await {
-            let _ = self.target.fs.remove(&temporary, false).await;
+            // Cut off by a dropped connection, a finished .filepart is kept:
+            // the retry only has to rename it.
+            if !partial || self.target.fs.is_connected() {
+                self.discard(&temporary).await;
+            }
             return Err(failed("finish", target, e));
         }
+        self.done.partials.remove(&temporary);
 
         // Permissions last: a read-only file can't have its times set.
         if let Some(mode) = self.mode_to_keep(meta) {
@@ -1046,6 +1199,15 @@ impl Engine {
         }
         self.counters.add(WorkStats { items: 1, bytes: 0 });
         Ok(Outcome::Done)
+    }
+
+    /// Remove a temporary file; if that fails too (the connection is gone),
+    /// the next attempt tries again.
+    async fn discard(&mut self, temporary: &VPath) {
+        self.done.partials.remove(temporary);
+        if self.target.fs.remove(temporary, false).await.is_err() {
+            self.done.leftovers.push(temporary.clone());
+        }
     }
 
     /// The permissions to give a copy of an entry with `meta`, if any.
@@ -1062,32 +1224,44 @@ impl Engine {
         }
     }
 
-    /// Copy `source` into `temporary`, from `offset` on (resuming: the bytes
-    /// before it are already there).
+    /// Copy `source` into `temporary`; resuming, from `resume_at` on (the
+    /// bytes before it are already there).
     async fn stream(
         &self,
         source: &VPath,
+        meta: &Meta,
         temporary: &VPath,
-        offset: u64,
+        resume_at: Option<u64>,
         buffer: &mut [u8],
     ) -> Result<(), TransferError> {
-        let mut reader = self
-            .source
-            .fs
-            .open_read(source, offset)
-            .await
-            .map_err(|e| failed("open", source, e))?;
-        let mode = if offset > 0 {
-            WriteMode::Append
-        } else {
-            WriteMode::CreateNew
+        let offset = resume_at.unwrap_or(0);
+        // A stalled server must not keep Cancel from working.
+        let cancelled = || {
+            let mut cancel = self.cancel.clone();
+            async move {
+                let _ = cancel.wait_for(|cancelled| *cancelled).await;
+            }
         };
-        let mut writer = self
-            .target
-            .fs
-            .open_write(temporary, mode)
-            .await
-            .map_err(|e| failed("create", temporary, e))?;
+        let open = async {
+            match meta.size {
+                Some(size) => self.source.fs.open_read_until(source, offset, size).await,
+                None => self.source.fs.open_read(source, offset).await,
+            }
+        };
+        let mut reader = tokio::select! {
+            opened = open => opened.map_err(|e| failed("open", source, e))?,
+            _ = cancelled() => return Err(TransferError::Cancelled),
+        };
+        let mode = match resume_at {
+            Some(offset) => WriteMode::At(offset),
+            None => WriteMode::CreateNew,
+        };
+        let mut writer = tokio::select! {
+            opened = self.target.fs.open_write(temporary, mode) => {
+                opened.map_err(|e| failed("create", temporary, e))?
+            }
+            _ = cancelled() => return Err(TransferError::Cancelled),
+        };
         if offset > 0 {
             self.counters.add(WorkStats {
                 items: 0,
@@ -1096,32 +1270,41 @@ impl Engine {
         }
         loop {
             self.check_cancelled()?;
-            let read = match reader.read(buffer).await {
+            let read = tokio::select! {
+                read = reader.read(buffer) => read,
+                _ = cancelled() => return Err(TransferError::Cancelled),
+            };
+            let read = match read {
                 Ok(read) => read,
                 Err(e) => {
                     // The source went away (a dropped connection): keep
                     // everything that arrived, which is where a resume
-                    // continues. (Writes land in order, so it's a prefix.)
-                    let _ = writer.shutdown().await;
+                    // continues.
+                    tokio::select! {
+                        _ = writer.shutdown() => {}
+                        _ = cancelled() => {}
+                    }
                     return Err(failed("read", source, e));
                 }
             };
             if read == 0 {
                 break;
             }
-            writer
-                .write_all(&buffer[..read])
-                .await
-                .map_err(|e| failed("write", temporary, e))?;
+            tokio::select! {
+                written = writer.write_all(&buffer[..read]) => {
+                    written.map_err(|e| failed("write", temporary, e))?
+                }
+                _ = cancelled() => return Err(TransferError::Cancelled),
+            }
             self.counters.add(WorkStats {
                 items: 0,
                 bytes: read as u64,
             });
         }
-        writer
-            .shutdown()
-            .await
-            .map_err(|e| failed("finish", temporary, e))
+        tokio::select! {
+            finished = writer.shutdown() => finished.map_err(|e| failed("finish", temporary, e)),
+            _ = cancelled() => Err(TransferError::Cancelled),
+        }
     }
 
     async fn finish_move(&self, source: &VPath, walk: &Walk) -> Result<Outcome, TransferError> {
@@ -1160,21 +1343,38 @@ fn same_file(source: &Meta, target: &Meta) -> bool {
 /// Files from this size on are copied via `<name>.filepart` (resumable).
 const RESUMABLE_SIZE: u64 = 1024 * 1024;
 const PARTIAL_SUFFIX: &str = ".filepart";
+/// What a resumed upload writes again: as much as can be in flight (the SFTP
+/// pipeline keeps up to 8 MiB of writes outstanding).
+const RESUME_OVERLAP: u64 = 8 * 1024 * 1024;
+/// The longest name most filesystems take (bytes; UTF-16 units on Windows).
+const MAX_NAME: usize = 255;
 
-/// `<name>.filepart` beside the target.
-fn partial_beside(target: &VPath) -> Result<VPath, TransferError> {
+/// `<name>.filepart` beside the target, unless that name would be too long.
+fn partial_beside(target: &VPath) -> Result<Option<VPath>, TransferError> {
     let folder = target.parent().unwrap_or_else(|| target.clone());
     let name = target
         .file_name()
         .ok_or_else(|| TransferError::Failed(format!("{} has no name", target.display())))?;
+    let partial = name.with_suffix(PARTIAL_SUFFIX);
+    if name_length(&partial) > MAX_NAME {
+        return Ok(None);
+    }
     folder
-        .join(&name.with_suffix(PARTIAL_SUFFIX))
+        .join(&partial)
+        .map(Some)
         .map_err(|e| TransferError::Failed(e.to_string()))
 }
 
-fn is_partial(path: &VPath) -> bool {
-    path.file_name()
-        .is_some_and(|name| name.display().ends_with(PARTIAL_SUFFIX))
+fn name_length(name: &VName) -> usize {
+    match name {
+        VName::Posix(bytes) => bytes.len(),
+        #[cfg(windows)]
+        VName::Native(name) => {
+            std::os::windows::ffi::OsStrExt::encode_wide(name.as_os_str()).count()
+        }
+        #[cfg(not(windows))]
+        VName::Native(name) => name.as_encoded_bytes().len(),
+    }
 }
 
 /// `.corepty-<uuid>.<what>` in the target's folder (same volume, so the final
@@ -2242,5 +2442,98 @@ pub(crate) mod tests {
                 "preserve={preserve}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_resumed_upload_writes_its_last_stretch_again() {
+        let source = Arc::new(MemFs::new());
+        let data: Vec<u8> = (0..12 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
+        source.add_dir("/up");
+        source.add_file("/up/big.iso", &data);
+        let server = Arc::new(MemFs::new());
+        server.add_dir("/srv");
+        // A partial upload whose pipelined writes left a hole near its end.
+        let mut partial = data[..10 * 1024 * 1024].to_vec();
+        partial[9 * 1024 * 1024..9 * 1024 * 1024 + 4096].fill(0);
+        server.add_file("/srv/big.iso.filepart", &partial);
+
+        let resumed = run(
+            TransferKind::Copy,
+            memory(&source, "local-memory"),
+            memory(&server, "remote"),
+            &[MemFs::path("/up/big.iso")],
+            &MemFs::path("/srv"),
+            Scripted::new(&[(Resolution::Resume, false)]),
+        )
+        .await;
+        assert_eq!(resumed.result, Ok(()));
+        assert_eq!(server.read("/srv/big.iso").unwrap(), data);
+        assert!(!server.exists("/srv/big.iso.filepart"));
+    }
+
+    #[tokio::test]
+    async fn a_name_too_long_for_the_partial_suffix_still_copies() {
+        let (from, to) = (tempdir().unwrap(), tempdir().unwrap());
+        let name = format!("{}.bin", "x".repeat(250));
+        let data = vec![3_u8; 2 * 1024 * 1024];
+        fs::write(from.path().join(&name), &data).unwrap();
+        let copied = run(
+            TransferKind::Copy,
+            local(),
+            local(),
+            &[native(&from.path().join(&name))],
+            &native(to.path()),
+            no_conflicts(),
+        )
+        .await;
+        assert_eq!(copied.result, Ok(()));
+        assert_eq!(fs::read(to.path().join(&name)).unwrap(), data);
+        assert!(leftovers(to.path()).is_empty());
+    }
+
+    #[test]
+    fn a_partial_copy_is_written_by_one_job_at_a_time() {
+        let path = MemFs::path("/srv/big.iso.filepart");
+        let fs = FsId("remote".to_string());
+        let first = PartialClaim::take(&fs, &path).expect("free");
+        assert!(PartialClaim::take(&fs, &path).is_none());
+        assert!(PartialClaim::take(&FsId("other".to_string()), &path).is_some());
+        drop(first);
+        assert!(PartialClaim::take(&fs, &path).is_some());
+    }
+
+    #[tokio::test]
+    #[cfg(windows)]
+    async fn items_that_meet_on_one_name_here_are_all_kept() {
+        // Remote names this machine stores under one name: `a:b` becomes
+        // `a_b`, and Windows doesn't tell `Readme` from `README`.
+        let remote = Arc::new(MemFs::new());
+        remote.add_dir("/src");
+        for name in ["a:b", "a_b", "Readme", "README"] {
+            remote.add_file(&format!("/src/{name}"), name.as_bytes());
+        }
+        let to = tempdir().unwrap();
+        let sources: Vec<VPath> = ["a:b", "a_b", "Readme", "README"]
+            .iter()
+            .map(|name| MemFs::path(&format!("/src/{name}")))
+            .collect();
+        // A move: an item written over by another would be lost for good.
+        let moved = run(
+            TransferKind::Move,
+            memory(&remote, "remote"),
+            local(),
+            &sources,
+            &native(to.path()),
+            no_conflicts(),
+        )
+        .await;
+        assert_eq!(moved.result, Ok(()));
+        let mut contents: Vec<String> = fs::read_dir(to.path())
+            .unwrap()
+            .map(|entry| fs::read_to_string(entry.unwrap().path()).unwrap())
+            .collect();
+        contents.sort();
+        assert_eq!(contents, ["README", "Readme", "a:b", "a_b"]);
+        assert_eq!(remote.paths(), ["/", "/src"]);
     }
 }

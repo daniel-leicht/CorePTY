@@ -2,7 +2,8 @@
 //! pool; file contents stream through `tokio::fs`.
 
 use super::{
-    Capabilities, Entry, EntryKind, Meta, Root, VName, VPath, VRead, VWrite, Vfs, WriteMode,
+    shorter_than, Capabilities, Entry, EntryKind, Meta, Root, VName, VPath, VRead, VWrite, Vfs,
+    WriteMode,
 };
 use async_trait::async_trait;
 use std::{
@@ -107,9 +108,16 @@ impl Vfs for LocalFs {
         match mode {
             WriteMode::CreateNew => options.write(true).create_new(true),
             WriteMode::Truncate => options.write(true).create(true).truncate(true),
-            WriteMode::Append => options.append(true),
+            WriteMode::At(_) => options.write(true),
         };
-        Ok(Box::pin(options.open(native(path)?).await?))
+        let mut file = options.open(native(path)?).await?;
+        if let WriteMode::At(offset) = mode {
+            if file.metadata().await?.len() < offset {
+                return Err(shorter_than(offset));
+            }
+            file.seek(SeekFrom::Start(offset)).await?;
+        }
+        Ok(Box::pin(file))
     }
 
     async fn set_times(
@@ -545,7 +553,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn truncate_rewrites_and_append_resumes() {
+    async fn truncate_rewrites_and_at_resumes() {
         let temp = tempdir().unwrap();
         let file = vpath(&temp.path().join("part.bin"));
         fs::write(temp.path().join("part.bin"), b"stale data").unwrap();
@@ -557,11 +565,19 @@ mod tests {
         writer.write_all(b"abc").await.unwrap();
         writer.shutdown().await.unwrap();
         drop(writer);
-        let mut writer = LocalFs.open_write(&file, WriteMode::Append).await.unwrap();
-        writer.write_all(b"def").await.unwrap();
+        // Resuming rewrites from the offset on and keeps what's before it.
+        let mut writer = LocalFs.open_write(&file, WriteMode::At(2)).await.unwrap();
+        writer.write_all(b"cdef").await.unwrap();
         writer.shutdown().await.unwrap();
         drop(writer);
         assert_eq!(fs::read(temp.path().join("part.bin")).unwrap(), b"abcdef");
+        // Never past the end: that would leave a hole.
+        let error = LocalFs
+            .open_write(&file, WriteMode::At(7))
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
     }
 
     #[tokio::test]

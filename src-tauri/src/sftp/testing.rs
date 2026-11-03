@@ -164,3 +164,109 @@ pub async fn local_sftp(dir: &Path) -> Option<(SftpFs, Child)> {
         .expect("SFTP handshake with sftp-server");
     Some((fs, child))
 }
+
+/// A request as [`fake_server`] saw it: its type, id, and the fields after the id.
+pub struct Seen {
+    pub kind: u8,
+    pub id: u32,
+    pub fields: Vec<u8>,
+}
+
+/// A scripted SFTP server over an in-memory pipe, for what real servers
+/// rarely do (malformed replies, overlong reads). It answers the handshake,
+/// then hands each request to `answer`, which returns the raw packets to send
+/// back (length included; see [`reply`]).
+pub struct FakeServer {
+    pub stream: tokio::io::DuplexStream,
+    /// Every request so far.
+    pub seen: std::sync::Arc<std::sync::Mutex<Vec<Seen>>>,
+    /// Ends when the client closes the session.
+    pub done: tokio::task::JoinHandle<()>,
+}
+
+pub fn fake_server<F>(mut answer: F) -> FakeServer
+where
+    F: FnMut(&Seen) -> Vec<Vec<u8>> + Send + 'static,
+{
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let (stream, mut server) = tokio::io::duplex(64 * 1024);
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let log = seen.clone();
+    let done = tokio::spawn(async move {
+        loop {
+            let mut length = [0; 4];
+            if server.read_exact(&mut length).await.is_err() {
+                return;
+            }
+            let mut body = vec![0; u32::from_be_bytes(length) as usize];
+            if server.read_exact(&mut body).await.is_err() {
+                return;
+            }
+            let packets = if body[0] == super::protocol::FXP_INIT {
+                vec![reply::version()]
+            } else {
+                let request = Seen {
+                    kind: body[0],
+                    id: u32::from_be_bytes([body[1], body[2], body[3], body[4]]),
+                    fields: body[5..].to_vec(),
+                };
+                let packets = answer(&request);
+                log.lock().unwrap().push(request);
+                packets
+            };
+            for packet in packets {
+                if server.write_all(&packet).await.is_err() {
+                    return;
+                }
+            }
+        }
+    });
+    FakeServer { stream, seen, done }
+}
+
+/// Reply packets for [`fake_server`].
+pub mod reply {
+    use crate::sftp::protocol::{self as fx, Encoder};
+
+    pub fn version() -> Vec<u8> {
+        let mut packet = Encoder::new(fx::FXP_VERSION);
+        packet.u32(fx::VERSION);
+        packet.finish()
+    }
+
+    pub fn status(id: u32, code: u32) -> Vec<u8> {
+        let mut packet = Encoder::new(fx::FXP_STATUS);
+        packet.u32(id).u32(code).bytes(b"").bytes(b"");
+        packet.finish()
+    }
+
+    pub fn handle(id: u32, handle: &[u8]) -> Vec<u8> {
+        let mut packet = Encoder::new(fx::FXP_HANDLE);
+        packet.u32(id).bytes(handle);
+        packet.finish()
+    }
+
+    pub fn data(id: u32, data: &[u8]) -> Vec<u8> {
+        let mut packet = Encoder::new(fx::FXP_DATA);
+        packet.u32(id).bytes(data);
+        packet.finish()
+    }
+
+    /// Attributes with nothing set.
+    pub fn attrs(id: u32) -> Vec<u8> {
+        let mut packet = Encoder::new(fx::FXP_ATTRS);
+        packet.u32(id).u32(0);
+        packet.finish()
+    }
+
+    /// Any packet: `kind`, then `id`, then `fields` as given.
+    pub fn raw(kind: u8, id: u32, fields: &[u8]) -> Vec<u8> {
+        let mut packet = Encoder::new(kind);
+        packet.u32(id);
+        let mut packet = packet.finish();
+        packet.extend_from_slice(fields);
+        let length = (packet.len() - 4) as u32;
+        packet[..4].copy_from_slice(&length.to_be_bytes());
+        packet
+    }
+}

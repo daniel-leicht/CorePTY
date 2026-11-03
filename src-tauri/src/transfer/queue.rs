@@ -25,6 +25,9 @@ const MAX_RUNNING: usize = 2;
 const KEEP_FINISHED: usize = 50;
 /// At most ten progress events a second per job.
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
+/// How long a cancelled job gets to clean up (remove its partial file)
+/// before it's abandoned: a stalled server may never answer.
+const CANCEL_GRACE: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -375,14 +378,6 @@ async fn run_job(
     let id = job.id.clone();
     sink(TransferEvent::Queued { id: id.clone() });
     let mut cancelled = job.cancel.subscribe();
-    let _permits = tokio::select! {
-        permits = reserve(&inner, running, &job, &source.id) => permits,
-        _ = cancelled.wait_for(|cancelled| *cancelled) => {
-            finish(&job, &sink, Err(TransferError::Cancelled));
-            prune_finished(&mut lock(&inner.jobs));
-            return;
-        }
-    };
 
     let resolver = Arc::new(QueueResolver {
         job: job.clone(),
@@ -408,12 +403,25 @@ async fn run_job(
         if let Err(error) = until_connected(&job, &sink, &sides, &mut cancelled).await {
             break Err(error);
         }
+        if job.state() == JobState::Paused {
+            job.set_state(JobState::Queued);
+            sink(TransferEvent::Queued { id: id.clone() });
+        }
+        // Slots are held only while running: a paused job lets others go.
+        let permits = tokio::select! {
+            permits = reserve(&inner, running.clone(), &job, &sides[0].id) => permits,
+            _ = cancelled.wait_for(|cancelled| *cancelled) => break Err(TransferError::Cancelled),
+        };
+        if sides.iter().any(|side| !side.fs.is_connected()) {
+            // It dropped again while this job waited for a slot.
+            continue;
+        }
         let attempt = attempt(&job, &sink, &mut engine, &sources).await;
+        drop(permits);
         match attempt {
             // The connection dropped mid-way: wait for it, then pick up
             // where it stopped (finished files kept, partial ones resumed).
             Err(TransferError::Failed(_)) if sides.iter().any(|side| !side.fs.is_connected()) => {
-                engine.set_retrying();
                 job.counters.reset();
             }
             other => break other,
@@ -440,7 +448,7 @@ async fn until_connected(
                 sink(TransferEvent::Paused {
                     id: job.id.clone(),
                     fs: side.id.clone(),
-                    message: format!("{} is disconnected — waiting to reconnect", side.id.0),
+                    message: "the server is disconnected — waiting to reconnect".to_string(),
                 });
             }
             tokio::select! {
@@ -456,8 +464,31 @@ async fn until_connected(
     Ok(())
 }
 
-/// Plan and run the job once, reporting progress.
+/// Plan and run the job once, reporting progress. Cancelling stops it even
+/// while a request hangs: the engine gets a moment to clean up, then it's
+/// dropped (which drops whatever it was waiting for).
 async fn attempt(
+    job: &Arc<Job>,
+    sink: &EventSink,
+    engine: &mut Engine,
+    sources: &[VPath],
+) -> Result<(), TransferError> {
+    let mut cancelled = job.cancel.subscribe();
+    let run = attempt_once(job, sink, engine, sources);
+    tokio::pin!(run);
+    let cancel = async {
+        let _ = cancelled.wait_for(|cancelled| *cancelled).await;
+    };
+    tokio::select! {
+        result = &mut run => result,
+        () = cancel => {
+            let _ = tokio::time::timeout(CANCEL_GRACE, run).await;
+            Err(TransferError::Cancelled)
+        }
+    }
+}
+
+async fn attempt_once(
     job: &Arc<Job>,
     sink: &EventSink,
     engine: &mut Engine,
@@ -896,6 +927,20 @@ mod tests {
         inner: Arc<MemFs>,
         connected: watch::Sender<bool>,
         reads_before_drop: AtomicU64,
+        /// Reads never answer (a server that hangs).
+        stall_reads: std::sync::atomic::AtomicBool,
+    }
+
+    struct Stalled;
+
+    impl tokio::io::AsyncRead for Stalled {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Pending
+        }
     }
 
     impl Flaky {
@@ -904,6 +949,7 @@ mod tests {
                 inner,
                 connected: watch::channel(true).0,
                 reads_before_drop: AtomicU64::new(reads_before_drop),
+                stall_reads: std::sync::atomic::AtomicBool::new(false),
             })
         }
 
@@ -973,6 +1019,9 @@ mod tests {
             if self.reads_before_drop.fetch_sub(1, Ordering::SeqCst) == 1 {
                 self.connected.send_replace(false);
                 self.up()?;
+            }
+            if self.stall_reads.load(Ordering::SeqCst) {
+                return Ok(Box::pin(Stalled));
             }
             self.inner.open_read(path, offset).await
         }
@@ -1109,5 +1158,217 @@ mod tests {
         let rest = until_finished(&mut events).await;
         assert!(matches!(rest.last(), Some(TransferEvent::Cancelled { .. })));
         assert!(!local.exists("/dst/a.txt"));
+    }
+
+    async fn until_paused(events: &mut mpsc::UnboundedReceiver<TransferEvent>) {
+        loop {
+            match next(events).await {
+                TransferEvent::Paused { .. } => return,
+                event @ (TransferEvent::Finished { .. }
+                | TransferEvent::Failed { .. }
+                | TransferEvent::Cancelled { .. }) => panic!("ended instead: {event:?}"),
+                _ => {}
+            }
+        }
+    }
+
+    fn remote_request(source: &str, destination: &str) -> TransferRequest {
+        TransferRequest {
+            kind: TransferKind::Copy,
+            sources: vec![location("remote", source)],
+            destination: location("m", destination),
+            preserve_mode: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn after_a_drop_a_partial_copy_the_job_did_not_write_is_asked_about() {
+        let remote = Arc::new(MemFs::new());
+        remote.add_dir("/src");
+        remote.add_file("/src/a.txt", b"a");
+        let big: Vec<u8> = (0..3 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
+        remote.add_file("/src/big.bin", &big);
+        // The connection drops at the first file, before big.bin.
+        let flaky = Flaky::new(remote, 1);
+        let local = Arc::new(MemFs::new());
+        local.add_dir("/dst");
+        local.add_dir("/dst/src");
+        // Left by an earlier transfer, of another version of the file.
+        local.add_file("/dst/src/big.bin.filepart", &[0xEE; 1024 * 1024]);
+        let manager = TransferManager::default();
+        let (sink, mut events) = collector();
+        let job = manager
+            .start(
+                remote_request("/src", "/dst"),
+                flaky.clone(),
+                local.clone(),
+                sink,
+            )
+            .unwrap();
+        until_paused(&mut events).await;
+        flaky.reconnect();
+
+        let conflict_id = loop {
+            match next(&mut events).await {
+                TransferEvent::Conflict {
+                    conflict_id,
+                    conflict,
+                    ..
+                } => {
+                    assert!(conflict.partial, "{conflict:?}");
+                    break conflict_id;
+                }
+                event @ TransferEvent::Finished { .. } => {
+                    panic!("resumed without asking: {event:?}")
+                }
+                _ => {}
+            }
+        };
+        let start_over = ConflictAnswer {
+            resolution: Resolution::Overwrite,
+            apply_to_all: false,
+        };
+        manager.resolve(&job.id, conflict_id, start_over).unwrap();
+        assert!(matches!(
+            until_finished(&mut events).await.last(),
+            Some(TransferEvent::Finished { .. })
+        ));
+        assert_eq!(local.read("/dst/src/big.bin").unwrap(), big);
+    }
+
+    #[tokio::test]
+    async fn a_retry_does_not_ask_again_about_answered_clashes() {
+        let remote = Arc::new(MemFs::new());
+        remote.add_dir("/src");
+        remote.add_file("/src/a.txt", b"new a");
+        remote.add_file("/src/b.txt", b"b");
+        // Drops when b.txt is opened, after a.txt's clash was answered.
+        let flaky = Flaky::new(remote, 2);
+        let local = Arc::new(MemFs::new());
+        local.add_dir("/dst");
+        local.add_dir("/dst/src");
+        local.add_file("/dst/src/a.txt", b"old a");
+        let manager = TransferManager::default();
+        let (sink, mut events) = collector();
+        let job = manager
+            .start(
+                remote_request("/src", "/dst"),
+                flaky.clone(),
+                local.clone(),
+                sink,
+            )
+            .unwrap();
+        let conflict_id = loop {
+            if let TransferEvent::Conflict { conflict_id, .. } = next(&mut events).await {
+                break conflict_id;
+            }
+        };
+        let keep_both = ConflictAnswer {
+            resolution: Resolution::Rename { name: None },
+            apply_to_all: false,
+        };
+        manager.resolve(&job.id, conflict_id, keep_both).unwrap();
+        until_paused(&mut events).await;
+        flaky.reconnect();
+
+        let rest = until_finished(&mut events).await;
+        assert!(
+            matches!(rest.last(), Some(TransferEvent::Finished { .. })),
+            "{rest:?}"
+        );
+        assert!(
+            !rest
+                .iter()
+                .any(|e| matches!(e, TransferEvent::Conflict { .. })),
+            "asked again: {rest:?}"
+        );
+        assert_eq!(local.read("/dst/src/a.txt").unwrap(), b"old a");
+        assert_eq!(local.read("/dst/src/a (copy).txt").unwrap(), b"new a");
+        assert_eq!(local.read("/dst/src/b.txt").unwrap(), b"b");
+        assert!(!local.exists("/dst/src/a (copy 2).txt"));
+    }
+
+    #[tokio::test]
+    async fn paused_jobs_let_other_jobs_run() {
+        let local = Arc::new(MemFs::new());
+        local.add_dir("/dst");
+        local.add_dir("/src");
+        local.add_file("/src/here.txt", b"here");
+        let manager = TransferManager::default();
+        // As many paused jobs as there are slots, each on a server that's down.
+        let mut paused = Vec::new();
+        for server in ["ra", "rb"] {
+            let remote = Arc::new(MemFs::new());
+            remote.add_dir("/src");
+            remote.add_file("/src/a.txt", b"a");
+            let flaky = Flaky::new(remote, u64::MAX);
+            flaky.connected.send_replace(false);
+            let (sink, mut events) = collector();
+            let request = TransferRequest {
+                kind: TransferKind::Copy,
+                sources: vec![location(server, "/src/a.txt")],
+                destination: location("local", "/dst"),
+                preserve_mode: true,
+            };
+            manager.start(request, flaky, local.clone(), sink).unwrap();
+            until_paused(&mut events).await;
+            paused.push(events);
+        }
+
+        let (sink, mut events) = collector();
+        let request = TransferRequest {
+            kind: TransferKind::Copy,
+            sources: vec![location("local", "/src/here.txt")],
+            destination: location("local", "/dst"),
+            preserve_mode: true,
+        };
+        manager
+            .start(request, local.clone(), local.clone(), sink)
+            .unwrap();
+        assert!(matches!(
+            until_finished(&mut events).await.last(),
+            Some(TransferEvent::Finished { .. })
+        ));
+        assert_eq!(local.read("/dst/here.txt").unwrap(), b"here");
+    }
+
+    #[tokio::test]
+    async fn cancel_stops_a_job_whose_server_stalls() {
+        let remote = Arc::new(MemFs::new());
+        remote.add_dir("/src");
+        remote.add_file("/src/a.txt", b"a");
+        let flaky = Flaky::new(remote, u64::MAX);
+        flaky.stall_reads.store(true, Ordering::SeqCst);
+        let local = Arc::new(MemFs::new());
+        local.add_dir("/dst");
+        let manager = TransferManager::default();
+        let (sink, mut events) = collector();
+        let job = manager
+            .start(
+                remote_request("/src/a.txt", "/dst"),
+                flaky,
+                local.clone(),
+                sink,
+            )
+            .unwrap();
+        while !matches!(next(&mut events).await, TransferEvent::Planned { .. }) {}
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let asked = Instant::now();
+        assert!(manager.cancel(&job.id));
+        assert!(matches!(
+            until_finished(&mut events).await.last(),
+            Some(TransferEvent::Cancelled { .. })
+        ));
+        assert!(asked.elapsed() < CANCEL_GRACE, "{:?}", asked.elapsed());
+        // Its temporary file is gone too.
+        assert_eq!(
+            local
+                .paths()
+                .iter()
+                .filter(|p| p.contains("corepty"))
+                .count(),
+            0
+        );
     }
 }

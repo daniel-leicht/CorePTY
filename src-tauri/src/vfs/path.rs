@@ -205,13 +205,19 @@ impl VName {
     /// (`a:b`, `CON`, `notes.`); there the forbidden characters become `_`, a
     /// trailing dot or space gets a `_` after it (Windows would silently drop
     /// it), and device names get a `_` after their stem (writing to `NUL`
-    /// would quietly discard the file).
+    /// would quietly discard the file). A remote name that isn't UTF-8 gets
+    /// its readable spelling (`caf�`), so it counts as changed too.
     pub fn storable_here(&self) -> Option<Self> {
         if !cfg!(windows) {
             return None;
         }
-        windows_safe_name(&self.to_native().to_string_lossy())
-            .map(|safe| Self::Native(OsString::from(safe)))
+        let readable = self.to_native().to_string_lossy().into_owned();
+        let undecodable = matches!(self, Self::Posix(bytes) if std::str::from_utf8(bytes).is_err());
+        match windows_safe_name(&readable) {
+            Some(safe) => Some(Self::Native(OsString::from(safe))),
+            None if undecodable => Some(Self::Native(OsString::from(readable))),
+            None => None,
+        }
     }
 
     /// This name with `suffix` appended, byte-exact (`movie.mkv.filepart`).
@@ -288,12 +294,21 @@ fn windows_safe_name(name: &str) -> Option<String> {
     // `CON`, `con.txt`, `COM1 .log`: the part before the first dot names a device.
     let stem_end = safe.find('.').unwrap_or(safe.len());
     let stem = safe[..stem_end].trim_end_matches(' ').to_ascii_uppercase();
+    // COM1–COM9 and LPT1–LPT9, and their superscript ¹ ² ³ spellings.
     let numbered = |prefix: &str| {
-        stem.strip_prefix(prefix).is_some_and(|digit| {
-            digit.len() == 1 && digit.as_bytes()[0].is_ascii_digit() && digit != "0"
+        stem.strip_prefix(prefix).is_some_and(|number| {
+            let mut chars = number.chars();
+            matches!(
+                (chars.next(), chars.next()),
+                (Some('1'..='9' | '¹' | '²' | '³'), None)
+            )
         })
     };
-    if matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL") || numbered("COM") || numbered("LPT")
+    if matches!(
+        stem.as_str(),
+        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
+    ) || numbered("COM")
+        || numbered("LPT")
     {
         safe.insert(stem_end, '_');
     }
@@ -451,8 +466,20 @@ mod tests {
         assert_eq!(safe("com1.log").as_deref(), Some("com1_.log"));
         assert_eq!(safe("COM10"), None);
         assert_eq!(safe("COM0"), None);
+        assert_eq!(safe("lpt².txt").as_deref(), Some("lpt²_.txt"));
+        assert_eq!(safe("CONOUT$").as_deref(), Some("CONOUT$_"));
+        assert_eq!(safe("conin$.log").as_deref(), Some("conin$_.log"));
+        assert_eq!(safe("COM⁴"), None);
         assert_eq!(safe("console"), None);
         assert_eq!(safe(".bashrc"), None);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn remote_names_that_are_not_utf8_count_as_mapped() {
+        let lossy = VName::Posix(b"caf\xe9".to_vec()).storable_here();
+        assert_eq!(lossy, Some(VName::Native("caf\u{fffd}".into())));
+        assert_eq!(VName::Posix(b"cafe".to_vec()).storable_here(), None);
     }
 
     #[test]

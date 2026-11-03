@@ -31,6 +31,12 @@ pub struct SftpReader {
     pipeline: Pipeline,
     /// Where the next new request starts.
     next_offset: u64,
+    /// Where the caller expects the file to end (its size, or the end of the
+    /// range it wants): no reads are sent past it but one, which finds the
+    /// end of the file in the same round trip. `None` once the file turns
+    /// out longer.
+    expected_end: Option<u64>,
+    probed: bool,
     in_flight: VecDeque<InFlight>,
     end_of_file: bool,
     chunk: Vec<u8>,
@@ -38,12 +44,20 @@ pub struct SftpReader {
 }
 
 impl SftpReader {
-    pub fn new(client: Arc<SftpClient>, handle: Vec<u8>, offset: u64, pipeline: Pipeline) -> Self {
+    pub fn new(
+        client: Arc<SftpClient>,
+        handle: Vec<u8>,
+        offset: u64,
+        expected_end: Option<u64>,
+        pipeline: Pipeline,
+    ) -> Self {
         Self {
             client,
             handle,
             pipeline,
             next_offset: offset,
+            expected_end,
+            probed: false,
             in_flight: VecDeque::new(),
             end_of_file: false,
             chunk: Vec::new(),
@@ -61,8 +75,19 @@ impl SftpReader {
 
     fn fill_pipeline(&mut self) {
         while !self.end_of_file && self.in_flight.len() < self.pipeline.depth {
-            let request = self.request(self.next_offset, self.pipeline.chunk);
-            self.next_offset += u64::from(self.pipeline.chunk);
+            let mut length = self.pipeline.chunk;
+            if let Some(end) = self.expected_end {
+                if self.next_offset >= end {
+                    if self.probed {
+                        break;
+                    }
+                    self.probed = true;
+                } else {
+                    length = length.min(u32::try_from(end - self.next_offset).unwrap_or(u32::MAX));
+                }
+            }
+            let request = self.request(self.next_offset, length);
+            self.next_offset += u64::from(length);
             self.in_flight.push_back(request);
         }
     }
@@ -89,8 +114,15 @@ impl AsyncRead for SftpReader {
             let result = ready!(front.reply.as_mut().poll(cx));
             let InFlight { offset, length, .. } = this.in_flight.pop_front().expect("front");
             match result? {
-                Some(data) if !data.is_empty() => {
+                Some(mut data) if !data.is_empty() => {
+                    // A server sending more than was asked for would shift
+                    // everything after it.
+                    data.truncate(length as usize);
                     let received = data.len() as u32;
+                    if reaches_past(this.expected_end, offset, received) {
+                        // The file is longer than expected: read on normally.
+                        this.expected_end = None;
+                    }
                     if received < length {
                         // A short read before the end: fetch the rest of this
                         // range before anything that was requested after it.
@@ -108,6 +140,11 @@ impl AsyncRead for SftpReader {
             }
         }
     }
+}
+
+/// Whether data received at `offset` goes past where the file was expected to end.
+fn reaches_past(expected_end: Option<u64>, offset: u64, received: u32) -> bool {
+    expected_end.is_some_and(|end| offset + u64::from(received) > end)
 }
 
 impl Drop for SftpReader {
@@ -249,5 +286,83 @@ impl Drop for SftpWriter {
             self.in_flight.clear();
             self.client.close_quietly(&self.handle);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sftp::{
+        protocol::{self as fx, Attrs, Decoder},
+        testing::{fake_server, reply, FakeServer},
+    };
+    use tokio::io::AsyncReadExt;
+
+    /// A server with one 100-byte file whose full-length DATA replies carry
+    /// five bytes too many.
+    fn overlong_server() -> FakeServer {
+        let file: Vec<u8> = (0..100).collect();
+        fake_server(move |request| match request.kind {
+            fx::FXP_OPEN => vec![reply::handle(request.id, b"h")],
+            fx::FXP_READ => {
+                let mut fields = Decoder::new(&request.fields);
+                fields.bytes().unwrap();
+                let offset = fields.u64().unwrap() as usize;
+                let length = fields.u32().unwrap() as usize;
+                if offset >= file.len() {
+                    return vec![reply::status(request.id, fx::FX_EOF)];
+                }
+                let mut data = file[offset..(offset + length).min(file.len())].to_vec();
+                if data.len() == length {
+                    data.extend_from_slice(b"junk!");
+                }
+                vec![reply::data(request.id, &data)]
+            }
+            _ => vec![reply::status(request.id, fx::FX_OK)],
+        })
+    }
+
+    async fn read(
+        client: &Arc<SftpClient>,
+        expected_end: Option<u64>,
+        pipeline: Pipeline,
+    ) -> Vec<u8> {
+        let handle = client
+            .open(b"/file", fx::FXF_READ, &Attrs::default())
+            .await
+            .unwrap();
+        let mut reader = SftpReader::new(client.clone(), handle, 0, expected_end, pipeline);
+        let mut data = Vec::new();
+        reader.read_to_end(&mut data).await.unwrap();
+        data
+    }
+
+    #[tokio::test]
+    async fn reads_take_no_more_than_was_asked_and_stop_at_the_expected_end() {
+        let fake = overlong_server();
+        let seen = fake.seen.clone();
+        let client = Arc::new(SftpClient::start(fake.stream).await.unwrap());
+        let file: Vec<u8> = (0..100).collect();
+        let pipeline = Pipeline {
+            chunk: 32,
+            depth: 16,
+        };
+        let reads = || {
+            seen.lock()
+                .unwrap()
+                .iter()
+                .filter(|request| request.kind == fx::FXP_READ)
+                .count()
+        };
+
+        // Expecting 100 bytes: reads at 0, 32, 64 and 96, and one at 100
+        // that finds the end, all at once; not a pipeline's worth.
+        assert_eq!(read(&client, Some(100), pipeline).await, file);
+        assert_eq!(reads(), 5);
+
+        // A file longer than expected is still read to its end.
+        assert_eq!(read(&client, Some(50), pipeline).await, file);
+        // No hint: the same bytes.
+        assert_eq!(read(&client, None, pipeline).await, file);
     }
 }

@@ -177,19 +177,29 @@ pub async fn sftp_connect(
 ) -> Result<SftpView, String> {
     // Already open on this connection: share it.
     if let Some(connection_id) = options.connection_id.as_deref() {
-        let shared = {
-            let mut open = sessions.open();
-            open.iter_mut()
-                .find(|(_, opened)| {
-                    opened.connection_id == connection_id && opened.mount.is_connected()
-                })
-                .map(|(id, opened)| {
-                    opened.users += 1;
-                    (id.clone(), opened.mount.clone(), opened.label.clone())
-                })
-        };
-        if let Some((id, mount, label)) = shared {
-            return Ok(view(&id, &mount, connection_id, &label).await);
+        let existing = sessions
+            .open()
+            .iter()
+            .find(|(_, opened)| opened.connection_id == connection_id)
+            .map(|(id, opened)| (id.clone(), opened.mount.clone(), opened.label.clone()));
+        if let Some((id, mount, label)) = existing {
+            // A session that ended on a connection that's still up (the
+            // server's sftp process went away, say) starts again in the same
+            // mount, so its other panels and paused jobs carry on.
+            let usable = mount.is_connected()
+                || match connections.attach(connection_id) {
+                    Some(lease) => {
+                        let _reconnecting = mount.reconnecting().await;
+                        if !mount.is_connected() {
+                            mount.replace(SftpFs::over_connection(lease).await?);
+                        }
+                        true
+                    }
+                    None => false,
+                };
+            if usable && share(&sessions, &id, &mount) {
+                return Ok(view(&id, &mount, connection_id, &label).await);
+            }
         }
     }
 
@@ -199,15 +209,22 @@ pub async fn sftp_connect(
     let fs = SftpFs::over_connection(lease).await?;
     let id = FsId(format!("sftp:{connection_id}"));
 
-    // Another panel may have opened it meanwhile: keep the first one.
     let mount = {
         let mut open = sessions.open();
         match open.get_mut(&id) {
-            Some(opened) if opened.mount.is_connected() => {
+            Some(opened) => {
+                // Another panel opened it meanwhile (keep the first), or its
+                // session ended (carry on in the same mount, which panels and
+                // paused jobs hold).
+                if !opened.mount.is_connected() {
+                    opened.mount.replace(fs);
+                    opened.connection_id = connection_id.clone();
+                    opened.label = label.clone();
+                }
                 opened.users += 1;
                 opened.mount.clone()
             }
-            _ => {
+            None => {
                 let mount = SftpMount::new(fs);
                 registry.register(id.clone(), mount.clone());
                 report_status(app, id.clone(), &mount);
@@ -229,6 +246,17 @@ pub async fn sftp_connect(
     Ok(result)
 }
 
+/// Count one more panel on `id`, if it's still open as `mount`.
+fn share(sessions: &SftpSessions, id: &FsId, mount: &Arc<SftpMount>) -> bool {
+    match sessions.open().get_mut(id) {
+        Some(opened) if Arc::ptr_eq(&opened.mount, mount) => {
+            opened.users += 1;
+            true
+        }
+        _ => false,
+    }
+}
+
 /// Carry on with `fs` over a new session (after its connection dropped):
 /// panels keep their folders and paused transfers continue.
 #[tauri::command]
@@ -243,6 +271,18 @@ pub async fn sftp_reconnect(
         .get(&fs)
         .map(|opened| opened.mount.clone())
         .ok_or_else(|| format!("{} is not open", fs.0))?;
+    // One at a time; and a mount that's connected (another panel reconnected
+    // it first) keeps its session: replacing it would cut off its transfers.
+    let _reconnecting = mount.reconnecting().await;
+    if mount.is_connected() {
+        let current = sessions
+            .open()
+            .get(&fs)
+            .map(|opened| (opened.connection_id.clone(), opened.label.clone()));
+        if let Some((connection_id, label)) = current {
+            return Ok(view(&fs, &mount, &connection_id, &label).await);
+        }
+    }
     let (lease, notice) = lease_for(&connections, &options).await?;
     let connection_id = lease.id.clone();
     let label = lease.label();

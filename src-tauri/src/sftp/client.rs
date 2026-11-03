@@ -21,7 +21,8 @@ use tokio::{
     sync::{mpsc, oneshot, watch},
 };
 
-type Waiters = HashMap<u32, oneshot::Sender<Response>>;
+/// A reply, or why the one for this request made no sense.
+type Waiters = HashMap<u32, oneshot::Sender<io::Result<Response>>>;
 
 struct Shared {
     waiters: Mutex<Waiters>,
@@ -102,6 +103,9 @@ pub struct SftpClient {
     outgoing: mpsc::UnboundedSender<Vec<u8>>,
     next_id: AtomicU32,
     pub extensions: Extensions,
+    /// Kept as long as the client (the SSH connection's lease): files still
+    /// open keep the connection up after their filesystem has gone.
+    kept: Mutex<Option<Box<dyn std::any::Any + Send + Sync>>>,
 }
 
 impl Drop for SftpClient {
@@ -115,7 +119,7 @@ impl Drop for SftpClient {
 pub struct Pending {
     id: u32,
     shared: Arc<Shared>,
-    reply: Option<oneshot::Receiver<Response>>,
+    reply: Option<oneshot::Receiver<io::Result<Response>>>,
 }
 
 impl Future for Pending {
@@ -129,7 +133,10 @@ impl Future for Pending {
             Poll::Pending => Poll::Pending,
             Poll::Ready(result) => {
                 self.reply = None;
-                Poll::Ready(result.map_err(|_| self.shared.lost()))
+                Poll::Ready(match result {
+                    Ok(reply) => reply,
+                    Err(_) => Err(self.shared.lost()),
+                })
             }
         }
     }
@@ -183,40 +190,66 @@ impl SftpClient {
         let shared = Arc::new(Shared::default());
         let (outgoing, mut queue) = mpsc::unbounded_channel::<Vec<u8>>();
         let writing = shared.clone();
+        let mut ended = shared.ended.subscribe();
         tokio::spawn(async move {
-            while let Some(packet) = queue.recv().await {
-                if let Err(e) = writer.write_all(&packet).await {
-                    writing.close(format!("the connection was lost ({e})"));
-                    return;
+            loop {
+                tokio::select! {
+                    packet = queue.recv() => {
+                        let Some(packet) = packet else { break };
+                        if let Err(e) = writer.write_all(&packet).await {
+                            writing.close(format!("the connection was lost ({e})"));
+                            return;
+                        }
+                    }
+                    _ = async { let _ = ended.wait_for(|reason| reason.is_some()).await; } => break,
                 }
             }
-            // The client is gone: end the channel politely.
+            // The client is gone, or the session ended: end the channel
+            // politely, so the server closes its side too.
             let _ = writer.shutdown().await;
         });
         let reading = shared.clone();
         tokio::spawn(async move {
             let reason = loop {
                 match read_packet(&mut reader).await {
-                    Ok(Some(body)) => match fx::parse_response(&body) {
-                        Ok((id, response)) => {
-                            if let Some(waiter) = reading.waiters().remove(&id) {
-                                let _ = waiter.send(response);
-                            }
+                    Ok(Some(body)) => {
+                        let (id, reply) = match fx::parse_response(&body) {
+                            Ok((id, response)) => (id, Ok(response)),
+                            // Packets are framed by their length, so one that
+                            // makes no sense fails only its own request.
+                            Err(e) => match body.get(1..5) {
+                                Some(id) => {
+                                    (u32::from_be_bytes([id[0], id[1], id[2], id[3]]), Err(e))
+                                }
+                                None => break e.to_string(),
+                            },
+                        };
+                        if let Some(waiter) = reading.waiters().remove(&id) {
+                            let _ = waiter.send(reply);
                         }
-                        Err(e) => break e.to_string(),
-                    },
+                    }
                     Ok(None) => break "the server closed the SFTP session".to_string(),
                     Err(e) => break format!("the connection was lost ({e})"),
                 }
             };
             reading.close(reason);
+            // Keep reading until the channel closes: SSH stops the whole
+            // connection (terminals on it included) while one channel's data
+            // goes unread.
+            let _ = tokio::io::copy(&mut reader, &mut tokio::io::sink()).await;
         });
         Ok(Self {
             shared,
             outgoing,
             next_id: AtomicU32::new(1),
             extensions,
+            kept: Mutex::default(),
         })
+    }
+
+    /// Keep `value` (a connection lease) alive as long as the session.
+    pub fn hold(&self, value: Box<dyn std::any::Any + Send + Sync>) {
+        *self.kept.lock().unwrap_or_else(|e| e.into_inner()) = Some(value);
     }
 
     /// Whether the session has ended (the connection dropped, say).
@@ -355,7 +388,7 @@ impl SftpClient {
         Box::pin(async move { status(pending.await?) })
     }
 
-    /// Every entry of a folder (without `.` and `..`).
+    /// Every entry of a folder (without `.`, `..` and names no entry can have).
     pub async fn read_dir(&self, path: &[u8]) -> io::Result<Vec<NameEntry>> {
         let handle = self.opendir(path).await?;
         let mut entries = Vec::new();
@@ -364,7 +397,7 @@ impl SftpClient {
                 Ok(Some(batch)) => entries.extend(
                     batch
                         .into_iter()
-                        .filter(|entry| entry.filename != b"." && entry.filename != b".."),
+                        .filter(|entry| is_child_name(&entry.filename)),
                 ),
                 Ok(None) => break Ok(()),
                 Err(e) => break Err(e),
@@ -544,5 +577,52 @@ fn single_name(response: Response) -> io::Result<Vec<u8>> {
         Response::Name(mut entries) if !entries.is_empty() => Ok(entries.swap_remove(0).filename),
         Response::Name(_) => Err(fx::bad_message("empty name reply")),
         other => Err(unexpected(other)),
+    }
+}
+
+/// A name a folder entry can have: not `.` or `..`, not empty, no `/` (a
+/// hostile server's `""` would make a recursive delete walk the folder again).
+fn is_child_name(name: &[u8]) -> bool {
+    !name.is_empty() && name != b"." && name != b".." && !name.contains(&b'/')
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sftp::testing::{fake_server, reply};
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn a_malformed_reply_fails_only_its_own_request() {
+        let fake = fake_server(|request| match request.id {
+            // A packet type no server sends.
+            1 => vec![reply::raw(250, request.id, b"")],
+            // Attributes cut short.
+            2 => vec![reply::raw(fx::FXP_ATTRS, request.id, &[0, 0])],
+            _ => vec![reply::attrs(request.id)],
+        });
+        let client = SftpClient::start(fake.stream).await.unwrap();
+        for _ in 0..2 {
+            let error = client.stat(b"/a").await.unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{error}");
+        }
+        assert!(client.stat(b"/b").await.is_ok());
+        assert!(!client.has_ended());
+    }
+
+    #[tokio::test]
+    async fn after_a_broken_packet_the_channel_is_still_read_until_it_closes() {
+        // A length of zero breaks the framing; then a flood the server can
+        // only get out while the client keeps reading (SSH would otherwise
+        // stall the whole connection, terminals on it included).
+        let fake = fake_server(|_| vec![vec![0, 0, 0, 0], vec![7; 1024 * 1024]]);
+        let client = SftpClient::start(fake.stream).await.unwrap();
+        let error = client.stat(b"/a").await.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::ConnectionAborted, "{error}");
+        assert!(client.has_ended());
+        tokio::time::timeout(Duration::from_secs(5), fake.done)
+            .await
+            .expect("the server got its data out and saw the session end")
+            .unwrap();
     }
 }

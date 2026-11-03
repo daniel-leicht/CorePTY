@@ -7,7 +7,6 @@ use super::{
 use serde::Serialize;
 use std::{io, sync::Arc};
 use tauri::State;
-use tokio::io::AsyncReadExt;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct RootView {
@@ -193,31 +192,67 @@ pub async fn fs_chmod(
 
 /// Apply `mode` to `path`; with `recursive`, to everything inside it too.
 /// Recursively, folders also get `x` wherever `r` is set (so they stay
-/// openable), and links inside are left alone rather than followed out of
-/// the tree.
+/// openable), each after its contents (a mode that locks its owner out
+/// would otherwise stop the walk), and links inside are left alone rather
+/// than followed out of the tree. An item that can't be changed doesn't stop
+/// the rest; the error then says how many failed.
 pub async fn chmod(fs: &dyn Vfs, path: &VPath, mode: u32, recursive: bool) -> io::Result<u64> {
     let top = fs.lstat(path).await?;
-    let mut pending = vec![(path.clone(), top, 0_usize)];
+    if !(recursive && top.is_real_directory()) {
+        fs.set_mode(path, mode).await?;
+        return Ok(1);
+    }
+    let folder_mode = mode | ((mode & 0o444) >> 2);
+    // (path, metadata, depth, its contents are done)
+    let mut pending = vec![(path.clone(), top, 0_usize, false)];
     let mut changed = 0;
-    while let Some((path, meta, depth)) = pending.pop() {
+    let mut failed = 0;
+    let mut first_error: Option<(VPath, io::Error)> = None;
+    let mut fail = |path: VPath, error: io::Error| {
+        failed += 1;
+        first_error.get_or_insert((path, error));
+    };
+    while let Some((path, meta, depth, contents_done)) = pending.pop() {
         if depth > 0 && meta.kind == EntryKind::Symlink {
             continue;
         }
         let folder = meta.is_real_directory();
-        let wanted = if folder && recursive {
-            mode | ((mode & 0o444) >> 2)
-        } else {
-            mode
-        };
-        fs.set_mode(&path, wanted).await?;
-        changed += 1;
-        if folder && recursive {
-            for child in fs.list(&path).await? {
-                pending.push((child.path, child.meta, depth + 1));
+        if folder && !contents_done {
+            match fs.list(&path).await {
+                Ok(children) => {
+                    pending.push((path, meta, depth, true));
+                    for child in children {
+                        pending.push((child.path, child.meta, depth + 1, false));
+                    }
+                }
+                Err(error) => {
+                    // Its contents stay as they are; the folder itself is
+                    // still changed (that may be what lets it be listed).
+                    fail(path.clone(), error);
+                    pending.push((path, meta, depth, true));
+                }
             }
+            continue;
+        }
+        match fs
+            .set_mode(&path, if folder { folder_mode } else { mode })
+            .await
+        {
+            Ok(()) => changed += 1,
+            Err(error) => fail(path, error),
         }
     }
-    Ok(changed)
+    match first_error {
+        None => Ok(changed),
+        Some((path, error)) => Err(io::Error::new(
+            error.kind(),
+            format!(
+                "{failed} item{} could not be changed (first, {}: {error})",
+                if failed == 1 { "" } else { "s" },
+                path.display()
+            ),
+        )),
+    }
 }
 
 #[tauri::command]
@@ -261,10 +296,8 @@ pub async fn fs_open_native(location: Location) -> Result<(), String> {
     .map_err(|e| format!("open failed: {e}"))?
 }
 
-/// Largest chunk one `fs_read` call returns.
-const MAX_READ: usize = 4 * 1024 * 1024;
-
-/// Up to `length` bytes from `offset`, as a raw binary response (no base64).
+/// Up to `length` bytes from `offset` (at most 4 MiB), as a raw binary
+/// response (no base64).
 /// The viewer reads text heads and images in chunks with this.
 #[tauri::command]
 pub async fn fs_read(
@@ -274,26 +307,11 @@ pub async fn fs_read(
     length: u32,
 ) -> Result<tauri::ipc::Response, String> {
     let fs = provider(&registry, &location.fs)?;
-    let bytes = read_range(fs.as_ref(), &location.path, offset, length as usize)
+    let bytes = fs
+        .read_range(&location.path, offset, length as usize)
         .await
         .map_err(|e| failed("read", &location.path, e))?;
     Ok(tauri::ipc::Response::new(bytes))
-}
-
-async fn read_range(fs: &dyn Vfs, path: &VPath, offset: u64, length: usize) -> io::Result<Vec<u8>> {
-    let length = length.min(MAX_READ);
-    let mut reader = fs.open_read(path, offset).await?;
-    let mut buffer = vec![0_u8; length];
-    let mut filled = 0;
-    while filled < length {
-        let read = reader.read(&mut buffer[filled..]).await?;
-        if read == 0 {
-            break;
-        }
-        filled += read;
-    }
-    buffer.truncate(filled);
-    Ok(buffer)
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
@@ -344,11 +362,9 @@ mod tests {
         let fs = MemFs::new();
         fs.add_file("/data.txt", b"0123456789");
         let path = MemFs::path("/data.txt");
-        assert_eq!(read_range(&fs, &path, 2, 4).await.unwrap(), b"2345");
-        assert_eq!(read_range(&fs, &path, 8, 100).await.unwrap(), b"89");
-        assert!(read_range(&fs, &MemFs::path("/missing"), 0, 4)
-            .await
-            .is_err());
+        assert_eq!(fs.read_range(&path, 2, 4).await.unwrap(), b"2345");
+        assert_eq!(fs.read_range(&path, 8, 100).await.unwrap(), b"89");
+        assert!(fs.read_range(&MemFs::path("/missing"), 0, 4).await.is_err());
     }
 
     #[tokio::test]

@@ -2,7 +2,8 @@
 //! so no remote name is ever mangled on its way to the UI and back.
 
 use super::{
-    Capabilities, Entry, EntryKind, Meta, Root, VName, VPath, VRead, VWrite, Vfs, WriteMode,
+    read_up_to, shorter_than, Capabilities, Entry, EntryKind, Meta, Root, VName, VPath, VRead,
+    VWrite, Vfs, WriteMode, MAX_READ_RANGE,
 };
 use crate::connections::ConnectionLease;
 use crate::sftp::{
@@ -22,13 +23,49 @@ use tokio::io::{AsyncRead, AsyncWrite};
 const STAT_BATCH: usize = 64;
 
 pub struct SftpFs {
+    /// The session for listings and other small requests.
     client: Arc<SftpClient>,
+    /// The one file data goes through; see [`Self::bulk`].
+    bulk: tokio::sync::Mutex<Bulk>,
     home: Vec<u8>,
     read: Pipeline,
     write: Pipeline,
-    /// Keeps the SSH connection up while this filesystem is in use (`None`
-    /// over a plain stream, in tests).
-    _lease: Option<ConnectionLease>,
+    /// Keeps the SSH connection up while a session on it is in use (`None`
+    /// over a plain stream, in tests). Each session holds it too, so files
+    /// still open keep it after the filesystem goes.
+    lease: Option<Arc<ConnectionLease>>,
+}
+
+enum Bulk {
+    NotOpened,
+    Open(Arc<SftpClient>),
+    /// The server allows no second channel (sshd's MaxSessions): file data
+    /// shares the main session.
+    Refused,
+}
+
+/// Open the `sftp` subsystem on a channel of the connection.
+async fn subsystem(
+    lease: &ConnectionLease,
+) -> Result<russh::ChannelStream<russh::client::Msg>, String> {
+    let mut channel = lease.open_session().await?;
+    channel
+        .request_subsystem(true, "sftp")
+        .await
+        .map_err(|e| format!("could not start SFTP on {}: {e}", lease.label()))?;
+    loop {
+        match channel.wait().await {
+            Some(russh::ChannelMsg::Success) => break,
+            Some(russh::ChannelMsg::Failure) | None => {
+                return Err(format!(
+                    "{} refused SFTP (is the SFTP subsystem enabled on the server?)",
+                    lease.label()
+                ))
+            }
+            Some(_) => {}
+        }
+    }
+    Ok(channel.into_stream())
 }
 
 impl SftpFs {
@@ -37,7 +74,12 @@ impl SftpFs {
     where
         S: AsyncRead + AsyncWrite + Send + 'static,
     {
-        let client = Arc::new(SftpClient::start(stream).await?);
+        let lease = lease.map(Arc::new);
+        let client = SftpClient::start(stream).await?;
+        if let Some(lease) = &lease {
+            client.hold(Box::new(lease.clone()));
+        }
+        let client = Arc::new(client);
         let home = client.realpath(b".").await?;
         let limits = if client.extensions.limits {
             client.limits().await.unwrap_or_default()
@@ -46,36 +88,63 @@ impl SftpFs {
         };
         Ok(Self {
             client,
+            bulk: tokio::sync::Mutex::new(Bulk::NotOpened),
             home,
-            read: pipeline_for(limits.max_read),
-            write: pipeline_for(limits.max_write),
-            _lease: lease,
+            read: pipeline_for(limits.max_read, limits.max_packet),
+            write: pipeline_for(limits.max_write, limits.max_packet),
+            lease,
         })
     }
 
     /// Open the `sftp` subsystem on a shared SSH connection.
     pub async fn over_connection(lease: ConnectionLease) -> Result<Self, String> {
-        let mut channel = lease.open_session().await?;
-        channel
-            .request_subsystem(true, "sftp")
-            .await
-            .map_err(|e| format!("could not start SFTP on {}: {e}", lease.label()))?;
-        loop {
-            match channel.wait().await {
-                Some(russh::ChannelMsg::Success) => break,
-                Some(russh::ChannelMsg::Failure) | None => {
-                    return Err(format!(
-                        "{} refused SFTP (is the SFTP subsystem enabled on the server?)",
-                        lease.label()
-                    ))
-                }
-                Some(_) => {}
-            }
-        }
+        let stream = subsystem(&lease).await?;
         let label = lease.label();
-        Self::start(channel.into_stream(), Some(lease))
+        Self::start(stream, Some(lease))
             .await
             .map_err(|e| format!("could not start SFTP on {label}: {e}"))
+    }
+
+    /// The session file data goes through: a second SFTP channel on the same
+    /// connection, opened on first use (as WinSCP does), so a panel listing a
+    /// folder never waits behind megabytes of a transfer in flight. The main
+    /// session when there's no connection (tests) or no second channel.
+    async fn bulk(&self) -> Arc<SftpClient> {
+        let Some(lease) = &self.lease else {
+            return self.client.clone();
+        };
+        let mut bulk = self.bulk.lock().await;
+        match &*bulk {
+            Bulk::Open(client) if !client.has_ended() => return client.clone(),
+            Bulk::Refused => return self.client.clone(),
+            _ => {}
+        }
+        if self.client.has_ended() {
+            // The connection is gone: fail at once, on the main session.
+            return self.client.clone();
+        }
+        let opened = match subsystem(lease).await {
+            Ok(stream) => SftpClient::start(stream).await.ok(),
+            Err(_) => None,
+        };
+        match opened {
+            Some(client) => {
+                client.hold(Box::new(lease.clone()));
+                let client = Arc::new(client);
+                *bulk = Bulk::Open(client.clone());
+                client
+            }
+            None => {
+                *bulk = Bulk::Refused;
+                self.client.clone()
+            }
+        }
+    }
+
+    /// Whether file data has a session of its own (tests).
+    #[cfg(test)]
+    pub async fn has_bulk_session(&self) -> bool {
+        matches!(&*self.bulk.lock().await, Bulk::Open(_))
     }
 
     pub fn has_ended(&self) -> bool {
@@ -108,13 +177,20 @@ const LARGEST_CHUNK: u64 = 255 * 1024;
 /// the SSH window adds nothing), bounded so memory stays small.
 const IN_FLIGHT: u64 = 8 * 1024 * 1024;
 
-/// Chunk size within the server's limit (`0`: none given, so the safe size),
-/// and as many in flight as make up [`IN_FLIGHT`].
-fn pipeline_for(limit: u64) -> Pipeline {
-    let chunk = match limit {
+/// Room in a packet for a request's own fields (id, handle, offset).
+const PACKET_OVERHEAD: u64 = 1024;
+
+/// Chunk size within the server's read or write limit (`0`: none given, so
+/// the safe size) and its packet size, and as many in flight as make up
+/// [`IN_FLIGHT`].
+fn pipeline_for(limit: u64, max_packet: u64) -> Pipeline {
+    let mut chunk = match limit {
         0 => SAFE_CHUNK,
         limit => limit.min(LARGEST_CHUNK),
     };
+    if max_packet > PACKET_OVERHEAD {
+        chunk = chunk.min(max_packet - PACKET_OVERHEAD);
+    }
     Pipeline {
         chunk: chunk as u32,
         depth: (IN_FLIGHT / chunk).clamp(4, 256) as usize,
@@ -189,6 +265,26 @@ fn owner_and_group(longname: &[u8]) -> Option<(String, String)> {
     Some((owner.to_string(), group.to_string()))
 }
 
+/// The entry type an `ls -l` style line starts with (`-`, `d`, `l`, …).
+fn listed_type(longname: &[u8]) -> Option<u8> {
+    let first = longname.split(|byte| *byte == b' ').next()?;
+    let looks_like_mode = first.len() >= 10 && b"-dlcbps".contains(&first[0]);
+    looks_like_mode.then_some(first[0])
+}
+
+/// What a listing entry is. Its attributes say, unless they say nothing (no
+/// permissions) or, on servers that follow links in listings, describe the
+/// link's target: then the `ls -l` line tells.
+fn listed_kind(entry: &NameEntry) -> EntryKind {
+    match (entry.attrs.file_type(), listed_type(&entry.longname)) {
+        (_, Some(b'l')) => EntryKind::Symlink,
+        (None, Some(b'd')) => EntryKind::Directory,
+        (None, Some(b'-')) => EntryKind::File,
+        (None, Some(_)) => EntryKind::Other,
+        _ => kind(&entry.attrs),
+    }
+}
+
 fn name_of(path: &[u8]) -> &[u8] {
     let trimmed = path.strip_suffix(b"/").unwrap_or(path);
     trimmed
@@ -255,12 +351,25 @@ impl SftpFs {
             .into_iter()
             .zip(targets)
             .map(|(entry, target)| {
+                let listed = listed_kind(&entry);
                 let NameEntry {
                     filename,
                     longname,
                     attrs,
                 } = entry;
-                let mut meta = meta(&filename, &attrs, target.as_ref());
+                let mut meta = if listed == EntryKind::Symlink && !attrs.is_symlink() {
+                    // The server followed the link: these are its target's.
+                    meta(&filename, &attrs, Some(&attrs))
+                } else {
+                    meta(&filename, &attrs, target.as_ref())
+                };
+                if listed != meta.kind {
+                    meta.kind = listed;
+                    if listed == EntryKind::Directory {
+                        meta.is_directory = true;
+                        meta.size = None;
+                    }
+                }
                 // v3 carries owner and group names only in the `ls -l` line.
                 if let Some((owner, group)) = owner_and_group(&longname) {
                     meta.owner = Some(owner);
@@ -289,7 +398,7 @@ impl SftpFs {
             for entry in self.client.read_dir(&dir).await? {
                 let path = join(&dir, &entry.filename);
                 // Links are removed, never followed.
-                if entry.attrs.is_dir() {
+                if listed_kind(&entry) == EntryKind::Directory {
                     stack.push((path, false));
                 } else {
                     files.push(path);
@@ -309,7 +418,13 @@ impl SftpFs {
     /// Nothing replaces a folder in one step. Move it aside, put the new entry
     /// in its place, then delete the old one (restored if the rename fails).
     async fn replace_by_moving_aside(&self, from: &[u8], to: &[u8], dir: bool) -> io::Result<()> {
-        let mut aside = to.to_vec();
+        // A short name beside it: one built on its own name could pass the
+        // 255-byte limit.
+        let folder = match to.iter().rposition(|byte| *byte == b'/') {
+            Some(slash) => &to[..=slash],
+            None => &b""[..],
+        };
+        let mut aside = folder.to_vec();
         aside.extend_from_slice(
             format!(".corepty-{}.old", uuid::Uuid::new_v4().simple()).as_bytes(),
         );
@@ -333,6 +448,27 @@ impl SftpFs {
             self.client.remove(&aside).await
         };
         Ok(())
+    }
+}
+
+impl SftpFs {
+    async fn reader(
+        &self,
+        client: Arc<SftpClient>,
+        path: &VPath,
+        offset: u64,
+        expected_end: Option<u64>,
+    ) -> io::Result<VRead> {
+        let handle = client
+            .open(bytes(path)?, fx::FXF_READ, &Attrs::default())
+            .await?;
+        Ok(Box::pin(SftpReader::new(
+            client,
+            handle,
+            offset,
+            expected_end,
+            self.read,
+        )))
     }
 }
 
@@ -465,50 +601,60 @@ impl Vfs for SftpFs {
     }
 
     async fn open_read(&self, path: &VPath, offset: u64) -> io::Result<VRead> {
-        let handle = self
-            .client
-            .open(bytes(path)?, fx::FXF_READ, &Attrs::default())
+        self.reader(self.bulk().await, path, offset, None).await
+    }
+
+    async fn open_read_until(&self, path: &VPath, offset: u64, end: u64) -> io::Result<VRead> {
+        self.reader(self.bulk().await, path, offset, Some(end))
+            .await
+    }
+
+    async fn read_range(&self, path: &VPath, offset: u64, length: usize) -> io::Result<Vec<u8>> {
+        // A viewer is waiting: the main session, not behind a transfer.
+        let length = length.min(MAX_READ_RANGE);
+        let end = offset.saturating_add(length as u64);
+        let reader = self
+            .reader(self.client.clone(), path, offset, Some(end))
             .await?;
-        Ok(Box::pin(SftpReader::new(
-            self.client.clone(),
-            handle,
-            offset,
-            self.read,
-        )))
+        read_up_to(reader, length).await
     }
 
     async fn open_write(&self, path: &VPath, mode: WriteMode) -> io::Result<VWrite> {
+        let client = self.bulk().await;
         let path = bytes(path)?;
         let flags = match mode {
             WriteMode::CreateNew => fx::FXF_WRITE | fx::FXF_CREAT | fx::FXF_EXCL,
             WriteMode::Truncate => fx::FXF_WRITE | fx::FXF_CREAT | fx::FXF_TRUNC,
             // Not SSH_FXF_APPEND: servers differ on whether it ignores the
-            // write offsets. Write at the current end instead.
-            WriteMode::Append => fx::FXF_WRITE,
+            // write offsets. Every write says where it goes instead.
+            WriteMode::At(_) => fx::FXF_WRITE,
         };
-        let handle = match self.client.open(path, flags, &Attrs::default()).await {
+        let handle = match client.open(path, flags, &Attrs::default()).await {
             Ok(handle) => handle,
             Err(e) if mode == WriteMode::CreateNew => {
                 return Err(self.explain_failure(path, e).await)
             }
             Err(e) => return Err(e),
         };
-        let offset = if mode == WriteMode::Append {
-            match self.client.fstat(&handle).await {
-                Ok(attrs) => attrs.size.unwrap_or(0),
-                Err(e) => {
-                    self.client.close_quietly(&handle);
-                    return Err(e);
+        let offset = match mode {
+            WriteMode::At(offset) => {
+                let size = match client.fstat(&handle).await {
+                    Ok(attrs) => attrs.size.unwrap_or(0),
+                    Err(e) => {
+                        client.close_quietly(&handle);
+                        return Err(e);
+                    }
+                };
+                if size < offset {
+                    client.close_quietly(&handle);
+                    return Err(shorter_than(offset));
                 }
+                offset
             }
-        } else {
-            0
+            _ => 0,
         };
         Ok(Box::pin(SftpWriter::new(
-            self.client.clone(),
-            handle,
-            offset,
-            self.write,
+            client, handle, offset, self.write,
         )))
     }
 
@@ -642,13 +788,20 @@ mod tests {
             data.len()
         );
 
-        // Append continues at the end; Truncate starts over.
+        // At continues from an offset (rewriting what's after it); never
+        // past the end. Truncate starts over.
         let hello = at(&sftp, "hello.txt");
-        write_all(&sftp, &hello, WriteMode::Append, b", world").await;
+        write_all(&sftp, &hello, WriteMode::At(4), b"o, world").await;
         assert_eq!(
             fs::read(dir.path().join("hello.txt")).unwrap(),
             b"hello, world"
         );
+        let error = sftp
+            .open_write(&hello, WriteMode::At(99))
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
         write_all(&sftp, &hello, WriteMode::Truncate, b"hi").await;
         assert_eq!(fs::read(dir.path().join("hello.txt")).unwrap(), b"hi");
 
@@ -998,6 +1151,9 @@ mod tests {
         write_all(&sftp, &uploaded, WriteMode::CreateNew, &data).await;
         assert_eq!(fs::read(root.path().join("up.bin")).unwrap(), data);
         assert_eq!(read_all(&sftp, &uploaded, 0).await, data);
+        // File data went through a channel of its own; still one connection,
+        // and the panel still counts once.
+        assert!(sftp.has_bulk_session().await);
         assert_eq!(server.connections.load(Ordering::SeqCst), 1);
         assert_eq!(registry.list()[0].users, 2);
 
@@ -1103,14 +1259,17 @@ mod tests {
     #[test]
     fn pipelines_follow_the_server_limits() {
         // No limits given: the size every server must take, many in flight.
-        let safe = pipeline_for(0);
+        let safe = pipeline_for(0, 0);
         assert_eq!((safe.chunk, safe.depth), (32 * 1024, 256));
-        // OpenSSH's 255 KiB: capped there, about 8 MiB in flight.
-        let openssh = pipeline_for(261_120);
+        // OpenSSH's 255 KiB (in 256 KiB packets): capped there, about 8 MiB
+        // in flight.
+        let openssh = pipeline_for(261_120, 262_144);
         assert_eq!((openssh.chunk, openssh.depth), (255 * 1024, 32));
         // A server with a small limit is respected.
-        assert_eq!(pipeline_for(16 * 1024).chunk, 16 * 1024);
-        assert_eq!(pipeline_for(1 << 30).chunk, 255 * 1024);
+        assert_eq!(pipeline_for(16 * 1024, 0).chunk, 16 * 1024);
+        assert_eq!(pipeline_for(1 << 30, 0).chunk, 255 * 1024);
+        // So is a packet size too small for the read or write size it gives.
+        assert_eq!(pipeline_for(1 << 20, 65_536).chunk, 63 * 1024);
     }
 
     #[tokio::test]
@@ -1131,5 +1290,112 @@ mod tests {
         assert_eq!(name_of(b"/a/b"), b"b");
         assert_eq!(name_of(b"/a/b/"), b"b");
         assert_eq!(name_of(b"x"), b"x");
+    }
+
+    #[tokio::test]
+    async fn file_data_shares_the_main_session_when_the_server_allows_one_channel() {
+        use crate::connections::{tests as ssh, ConnectionRegistry};
+        if crate::sftp::testing::sftp_server().is_none() {
+            return;
+        }
+        let root = tempdir().unwrap();
+        // Like sshd with MaxSessions 1.
+        let server = ssh::start_with(ssh::ServerOptions {
+            sftp_root: Some(root.path().to_path_buf()),
+            max_sessions: Some(1),
+            ..ssh::ServerOptions::default()
+        })
+        .await;
+        let keys = tempdir().unwrap();
+        let registry = ConnectionRegistry::default();
+        let lease = registry
+            .connect(
+                "conn".into(),
+                &ssh::target(&server, "secret"),
+                &ssh::temp_host_keys(&keys),
+                &|_| {},
+            )
+            .await
+            .unwrap();
+        let sftp = SftpFs::over_connection(lease).await.unwrap();
+        let data = pattern(300_000);
+        let file = at(&sftp, "one.bin");
+        write_all(&sftp, &file, WriteMode::CreateNew, &data).await;
+        assert_eq!(read_all(&sftp, &file, 0).await, data);
+        assert!(!sftp.has_bulk_session().await);
+        assert_eq!(
+            names(&sftp.list(&at(&sftp, "")).await.unwrap()),
+            ["one.bin"]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_viewer_reads_just_the_range_it_asks_for() {
+        let dir = tempdir().unwrap();
+        let data = pattern(3 * 1024 * 1024);
+        fs::write(dir.path().join("image.bin"), &data).unwrap();
+        let Some((sftp, _server)) = local_sftp(dir.path()).await else {
+            return;
+        };
+        let file = at(&sftp, "image.bin");
+        let piece = sftp.read_range(&file, 1_000_000, 512 * 1024).await.unwrap();
+        assert_eq!(piece, &data[1_000_000..1_000_000 + 512 * 1024]);
+        // Past the end: what's there.
+        let tail = sftp
+            .read_range(&file, data.len() as u64 - 10, 100)
+            .await
+            .unwrap();
+        assert_eq!(tail, &data[data.len() - 10..]);
+    }
+
+    #[test]
+    fn listings_trust_the_long_line_over_followed_or_missing_attributes() {
+        let entry = |longname: &str, permissions: Option<u32>| NameEntry {
+            filename: b"x".to_vec(),
+            longname: longname.as_bytes().to_vec(),
+            attrs: Attrs {
+                permissions,
+                ..Attrs::default()
+            },
+        };
+        let line =
+            |kind: char| format!("{kind}rwxr-xr-x    1 alice    staff     4096 Jan  1 00:00 x");
+        // A server that follows links in listings: a folder, says the line's `l`.
+        assert_eq!(
+            listed_kind(&entry(&line('l'), Some(fx::S_IFDIR | 0o755))),
+            EntryKind::Symlink
+        );
+        // No permissions sent: the line tells files from folders.
+        assert_eq!(listed_kind(&entry(&line('d'), None)), EntryKind::Directory);
+        assert_eq!(listed_kind(&entry(&line('-'), None)), EntryKind::File);
+        // Otherwise the attributes say.
+        assert_eq!(
+            listed_kind(&entry(&line('-'), Some(fx::S_IFDIR | 0o755))),
+            EntryKind::Directory
+        );
+        assert_eq!(
+            listed_kind(&entry("x", Some(fx::S_IFREG | 0o644))),
+            EntryKind::File
+        );
+    }
+
+    #[tokio::test]
+    async fn recursive_chmod_can_take_its_owner_out_of_a_folder() {
+        let dir = tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("locked/inner")).unwrap();
+        fs::write(dir.path().join("locked/inner/file.txt"), b"x").unwrap();
+        let Some((sftp, _server)) = local_sftp(dir.path()).await else {
+            return;
+        };
+        // Write-only, so no listing the folders afterwards: each is changed
+        // after its contents.
+        let changed = crate::vfs::commands::chmod(&sftp, &at(&sftp, "locked"), 0o200, true).await;
+        #[cfg(unix)]
+        for folder in ["locked", "locked/inner"] {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(dir.path().join(folder), fs::Permissions::from_mode(0o755))
+                .unwrap();
+        }
+        assert_eq!(changed.unwrap(), 3);
     }
 }

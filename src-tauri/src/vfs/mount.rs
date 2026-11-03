@@ -16,6 +16,8 @@ pub struct SftpMount {
     connected: watch::Sender<bool>,
     /// Why the last session ended.
     lost_reason: Mutex<Option<String>>,
+    /// Held while reconnecting, so two reconnects don't race.
+    reconnecting: tokio::sync::Mutex<()>,
 }
 
 impl SftpMount {
@@ -25,6 +27,7 @@ impl SftpMount {
             current: RwLock::new(fs.clone()),
             connected: watch::channel(true).0,
             lost_reason: Mutex::new(None),
+            reconnecting: tokio::sync::Mutex::new(()),
         });
         mount.watch(&fs);
         mount
@@ -40,10 +43,20 @@ impl SftpMount {
     /// Carry on over a new session (after a reconnect).
     pub fn replace(self: &Arc<Self>, fs: SftpFs) {
         let fs = Arc::new(fs);
-        *self.current.write().unwrap_or_else(|e| e.into_inner()) = fs.clone();
-        *self.lost_reason.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        self.connected.send_replace(true);
+        {
+            // Under the lock the watcher takes too, so a session ending just
+            // now can't mark the new one disconnected.
+            let mut current = self.current.write().unwrap_or_else(|e| e.into_inner());
+            *current = fs.clone();
+            *self.lost_reason.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            self.connected.send_replace(true);
+        }
         self.watch(&fs);
+    }
+
+    /// Hold this while reconnecting: one reconnect at a time.
+    pub async fn reconnecting(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.reconnecting.lock().await
     }
 
     pub fn lost_reason(&self) -> Option<String> {
@@ -64,7 +77,8 @@ impl SftpMount {
             let (Some(mount), Some(watched)) = (mount.upgrade(), watched.upgrade()) else {
                 return;
             };
-            if Arc::ptr_eq(&mount.current(), &watched) {
+            let current = mount.current.read().unwrap_or_else(|e| e.into_inner());
+            if Arc::ptr_eq(&current, &watched) {
                 *mount.lost_reason.lock().unwrap_or_else(|e| e.into_inner()) = Some(reason);
                 mount.connected.send_replace(false);
             }
@@ -125,6 +139,14 @@ impl Vfs for SftpMount {
 
     async fn open_read(&self, path: &VPath, offset: u64) -> io::Result<VRead> {
         self.current().open_read(path, offset).await
+    }
+
+    async fn open_read_until(&self, path: &VPath, offset: u64, end: u64) -> io::Result<VRead> {
+        self.current().open_read_until(path, offset, end).await
+    }
+
+    async fn read_range(&self, path: &VPath, offset: u64, length: usize) -> io::Result<Vec<u8>> {
+        self.current().read_range(path, offset, length).await
     }
 
     async fn open_write(&self, path: &VPath, mode: WriteMode) -> io::Result<VWrite> {
