@@ -130,6 +130,26 @@ fn meta(name: &[u8], attrs: &Attrs, target: Option<&Attrs>) -> Meta {
     }
 }
 
+/// Owner and group from an `ls -l` style line, as servers send in listings:
+/// `-rw-r--r--    1 alice    staff        1234 Jan  1 00:00 notes.txt`.
+fn owner_and_group(longname: &[u8]) -> Option<(String, String)> {
+    let text = String::from_utf8_lossy(longname);
+    let mut fields = text.split_whitespace();
+    let mode = fields.next()?;
+    let looks_like_mode = mode.len() >= 10
+        && mode
+            .chars()
+            .next()
+            .is_some_and(|kind| "-dlcbps".contains(kind));
+    if !looks_like_mode {
+        return None;
+    }
+    fields.next()?.parse::<u64>().ok()?; // the link count
+    let owner = fields.next()?;
+    let group = fields.next()?;
+    Some((owner.to_string(), group.to_string()))
+}
+
 fn name_of(path: &[u8]) -> &[u8] {
     let trimmed = path.strip_suffix(b"/").unwrap_or(path);
     trimmed
@@ -195,19 +215,25 @@ impl SftpFs {
         Ok(listed
             .into_iter()
             .zip(targets)
-            .map(
-                |(
-                    NameEntry {
-                        filename, attrs, ..
-                    },
-                    target,
-                )| Entry {
-                    meta: meta(&filename, &attrs, target.as_ref()),
+            .map(|(entry, target)| {
+                let NameEntry {
+                    filename,
+                    longname,
+                    attrs,
+                } = entry;
+                let mut meta = meta(&filename, &attrs, target.as_ref());
+                // v3 carries owner and group names only in the `ls -l` line.
+                if let Some((owner, group)) = owner_and_group(&longname) {
+                    meta.owner = Some(owner);
+                    meta.group = Some(group);
+                }
+                Entry {
+                    meta,
                     path: VPath::Posix(join(dir, &filename)),
                     name: VName::Posix(filename),
                     error: None,
-                },
-            )
+                }
+            })
             .collect())
     }
 
@@ -921,6 +947,37 @@ mod tests {
         assert!(error.contains("refused SFTP"), "{error}");
         // The failed attempt didn't keep the connection alive.
         assert!(eventually(|| registry.list().is_empty()).await);
+    }
+
+    #[test]
+    fn owner_and_group_come_from_the_long_listing_line() {
+        assert_eq!(
+            owner_and_group(b"-rw-r--r--    1 alice    staff        1234 Jan  1 00:00 notes.txt"),
+            Some(("alice".to_string(), "staff".to_string()))
+        );
+        assert_eq!(
+            owner_and_group(b"drwxr-xr-x   12 1000     1000         4096 Mar  3  2024 src"),
+            Some(("1000".to_string(), "1000".to_string()))
+        );
+        // Servers that send something else (or nothing) give no names.
+        assert_eq!(owner_and_group(b"notes.txt"), None);
+        assert_eq!(owner_and_group(b""), None);
+        assert_eq!(owner_and_group(b"-rw-r--r-- x alice staff"), None);
+    }
+
+    #[tokio::test]
+    async fn listings_carry_owner_names_and_modes() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("mine.txt"), b"x").unwrap();
+        let Some((sftp, _server)) = local_sftp(dir.path()).await else {
+            return;
+        };
+        let listed = sftp.list(&at(&sftp, "")).await.unwrap();
+        let mine = find(&listed, "mine.txt");
+        let owner = mine.meta.owner.as_deref().unwrap_or("");
+        assert!(!owner.is_empty(), "{:?}", mine.meta);
+        assert!(mine.meta.group.is_some());
+        assert!(mine.meta.mode.is_some_and(|mode| mode & 0o400 != 0));
     }
 
     #[test]

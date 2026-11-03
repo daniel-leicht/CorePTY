@@ -239,8 +239,14 @@ describe("format", () => {
     expect(formatFileSize(1536)).toBe("1.50 KB");
     expect(formatDuration(75)).toBe("1:15");
     expect(formatDuration(3725)).toBe("1:02:05");
-    expect(formatMode(0o755, true)).toBe("drwxr-xr-x");
-    expect(formatMode(0o640, false)).toBe("-rw-r-----");
+    expect(formatMode(0o755, "d")).toBe("drwxr-xr-x");
+    expect(formatMode(0o640)).toBe("-rw-r-----");
+    expect(formatMode(0o777, "l")).toBe("lrwxrwxrwx");
+    expect(formatMode(0o4755)).toBe("-rwsr-xr-x");
+    expect(formatMode(0o2644)).toBe("-rw-r-Sr--");
+    expect(formatMode(0o1777, "d")).toBe("drwxrwxrwt");
+    expect(formatMode(0o1666, "d")).toBe("drw-rw-rwT");
+    expect(formatMode(null)).toBe("");
   });
 
   it("turns masks into whole-name, case-insensitive patterns", () => {

@@ -5,7 +5,7 @@
 
 import { icon } from "../icons";
 import { fsApi, type FsCapabilities, type FsEntry, type FsLocationView } from "../ipc";
-import { formatFileSize, formatMode, formatModified } from "./format";
+import { formatFileSize, formatMode, formatModified, modeType } from "./format";
 import { History, PanelModel, type SortKey } from "./panel-model";
 
 export const ROW_HEIGHT = 28;
@@ -102,6 +102,7 @@ export class PanelView {
           <span role="columnheader" class="fm-col-size"><button type="button" data-sort="size">Size <span></span></button></span>
           <span role="columnheader" class="fm-col-modified"><button type="button" data-sort="modified">Modified <span></span></button></span>
           <span role="columnheader" class="fm-col-perms">Rights</span>
+          <span role="columnheader" class="fm-col-owner">Owner</span>
         </div>
         <div class="fm-list" role="rowgroup"><div class="fm-spacer"></div></div>
         <div class="fm-quicksearch" hidden></div>
@@ -218,6 +219,11 @@ export class PanelView {
     this.element.querySelector<HTMLElement>(".fm-provider")!.textContent =
       location && location.fs !== "local" ? location.fs.toUpperCase() : "LOCAL";
     this.element.classList.toggle("has-perms", this.capabilities.posixPermissions);
+    // Owner names come with remote listings; local ones don't have them.
+    this.element.classList.toggle(
+      "has-owner",
+      this.model.visibleEntries().some((entry) => entry.owner !== null)
+    );
     this.updateToolbar();
     this.updateHeader();
     this.renderRows();
@@ -393,7 +399,8 @@ export class PanelView {
         <span class="fm-cell fm-col-name" role="gridcell"><span class="fm-row__mark"></span><span class="fm-row__icon">${icon("up")}</span><span class="fm-row__name">..</span></span>
         <span class="fm-cell fm-col-size" role="gridcell"></span>
         <span class="fm-cell fm-col-modified" role="gridcell"></span>
-        <span class="fm-cell fm-col-perms" role="gridcell"></span>`;
+        <span class="fm-cell fm-col-perms" role="gridcell"></span>
+        <span class="fm-cell fm-col-owner" role="gridcell"></span>`;
       return row;
     }
     const entry = data.entry;
@@ -411,8 +418,14 @@ export class PanelView {
       </span>
       <span class="fm-cell fm-col-size" role="gridcell"></span>
       <span class="fm-cell fm-col-modified" role="gridcell">${formatModified(entry.modified)}</span>
-      <span class="fm-cell fm-col-perms" role="gridcell">${formatMode(entry.mode, entry.isDirectory)}</span>`;
+      <span class="fm-cell fm-col-perms" role="gridcell">${formatMode(entry.mode, modeType(entry))}</span>
+      <span class="fm-cell fm-col-owner" role="gridcell"></span>`;
     row.querySelector<HTMLElement>(".fm-row__name")!.textContent = entry.name;
+    const owner = row.querySelector<HTMLElement>(".fm-col-owner")!;
+    owner.textContent = entry.owner ?? "";
+    if (entry.owner !== null || entry.group !== null) {
+      owner.title = `${entry.owner ?? "?"}:${entry.group ?? "?"}`;
+    }
     if (entry.isDirectory) row.dataset.dirSize = "";
     this.fillSize(row, index);
     return row;

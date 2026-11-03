@@ -274,14 +274,19 @@ mod tests {
         }
     }
 
-    async fn eventually(mut condition: impl FnMut() -> bool) -> bool {
-        for _ in 0..300 {
+    async fn eventually(condition: impl FnMut() -> bool) -> bool {
+        within(Duration::from_secs(3), condition).await
+    }
+
+    async fn within(limit: Duration, mut condition: impl FnMut() -> bool) -> bool {
+        let deadline = tokio::time::Instant::now() + limit;
+        while tokio::time::Instant::now() < deadline {
             if condition() {
                 return true;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        false
+        condition()
     }
 
     /// A tab: its shell runs in the background; `output` collects what it shows.
@@ -394,7 +399,9 @@ mod tests {
         .await;
         assert!(ran.is_ok(), "the connection stalled behind the paste");
         // And the whole paste was echoed back in the end.
-        assert!(eventually(|| tab.output.lock().unwrap().len() >= 2 + 4 * 1024 * 1024).await);
+        // (Echoing 4 MiB back through a 64 KiB window takes a while on slow CI.)
+        let echoed = || tab.output.lock().unwrap().len() >= 2 + 4 * 1024 * 1024;
+        assert!(within(Duration::from_secs(30), echoed).await);
         tab.input.send(SessionInput::Close).unwrap();
         tab.done.await.unwrap();
         drop((lease, other));

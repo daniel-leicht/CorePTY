@@ -849,17 +849,34 @@ button {
   grid-template-columns: minmax(120px, 1fr) minmax(62px, 84px) minmax(108px, 138px);
   align-items: center;
 }
-/* POSIX filesystems (Linux/macOS, SFTP) get a rights column. */
+/* POSIX filesystems (Linux/macOS, SFTP) get a rights column; remote listings
+   that name owners get an owner column too. */
 .fm-panel.has-perms .fm-header,
 .fm-panel.has-perms .fm-row {
   grid-template-columns: minmax(120px, 1fr) minmax(62px, 84px) minmax(108px, 138px) 86px;
 }
-.fm-col-perms {
+.fm-panel.has-perms.has-owner .fm-header,
+.fm-panel.has-perms.has-owner .fm-row {
+  grid-template-columns:
+    minmax(120px, 1fr) minmax(62px, 84px) minmax(108px, 138px) 86px minmax(56px, 96px);
+}
+.fm-col-perms,
+.fm-col-owner {
   display: none;
 }
-.fm-panel.has-perms .fm-col-perms {
+.fm-panel.has-perms .fm-col-perms,
+.fm-panel.has-perms.has-owner .fm-col-owner {
   display: block;
 }
+.fm-row .fm-col-owner {
+  overflow: hidden;
+  padding: 0 7px;
+  color: var(--text-3);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.fm-header .fm-col-owner,
 .fm-header .fm-col-perms {
   padding: 0 7px;
   color: var(--text-3);
@@ -897,7 +914,9 @@ button {
   color: var(--accent-2);
   font-size: 12px;
 }
-.fm-header > [role="columnheader"] {
+/* Zero specificity: the rules that hide a column (rights, owner, dates in
+   narrow panels) must win over this for its header too. */
+:where(.fm-header) > :where([role="columnheader"]) {
   min-width: 0;
   display: flex;
 }
@@ -1446,6 +1465,27 @@ button {
   font-size: 10px;
 }
 
+/* Narrower panels drop columns: the owner first, then rights and dates. */
+@container (max-width: 560px) {
+  .fm-panel.has-perms.has-owner .fm-header,
+  .fm-panel.has-perms.has-owner .fm-row {
+    grid-template-columns: minmax(120px, 1fr) minmax(62px, 84px) minmax(108px, 138px) 86px;
+  }
+  .fm-panel.has-perms.has-owner .fm-col-owner {
+    display: none;
+  }
+}
+@container (max-width: 440px) {
+  .fm-panel.has-perms .fm-header,
+  .fm-panel.has-perms .fm-row,
+  .fm-panel.has-perms.has-owner .fm-header,
+  .fm-panel.has-perms.has-owner .fm-row {
+    grid-template-columns: minmax(120px, 1fr) minmax(62px, 84px) minmax(108px, 138px);
+  }
+  .fm-panel.has-perms .fm-col-perms {
+    display: none;
+  }
+}
 @container (max-width: 410px) {
   .fm-provider,
   .fm-tool[data-act="roots"],
@@ -1453,7 +1493,11 @@ button {
     display: none;
   }
   .fm-header,
-  .fm-row {
+  .fm-row,
+  .fm-panel.has-perms .fm-header,
+  .fm-panel.has-perms .fm-row,
+  .fm-panel.has-perms.has-owner .fm-header,
+  .fm-panel.has-perms.has-owner .fm-row {
     grid-template-columns: minmax(110px, 1fr) minmax(58px, 78px);
   }
   .fm-col-modified {
