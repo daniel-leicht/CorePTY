@@ -104,6 +104,7 @@ export class App {
     this.tree = new ConnectionsTree(this.connectionsEl, {
       onConnect: (s) => void this.connectSaved(s),
       onEdit: (s) => void this.openDialog(s),
+      onOpenSftp: (s) => this.openSftpForSaved(s),
       onNewConnection: (folderId) => void this.openDialog(undefined, { folderId }),
       toast: (m, k) => this.toast(m, k),
     });
@@ -520,6 +521,17 @@ export class App {
       openRemote,
     });
     this.addTab(tab);
+  }
+
+  /** A file manager tab with this PC on the left and the server on the right. */
+  private openSftp(target: RemoteTarget): void {
+    this.newFileManager(undefined, { side: 1, target });
+  }
+
+  /** "Open SFTP" on a saved connection: on its tab's live connection if one is open. */
+  private openSftpForSaved(saved: SavedSession): void {
+    const live = this.sshTabs().find((tab) => tab.form.id === saved.id);
+    this.openSftp(live ? { kind: "live", connectionId: live.connectionId } : { kind: "saved", id: saved.id });
   }
 
   /** The file manager's view of the connections: saved ones and SSH tabs'. */
@@ -1008,6 +1020,14 @@ export class App {
       },
       { label: "Rename…", icon: "pencil", action: () => this.startTabRename(session) },
     ];
+    const connectionId = session instanceof TerminalSession ? session.info?.connectionId : undefined;
+    if (session instanceof TerminalSession && session.spec?.kind === "ssh" && connectionId && session.alive) {
+      items.splice(1, 0, {
+        label: "Open SFTP",
+        icon: "files",
+        action: () => this.openSftp({ kind: "live", connectionId }),
+      });
+    }
     if (session.pinned) {
       items.push({
         label: "Reset name",

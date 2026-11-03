@@ -8,7 +8,7 @@ import "@xterm/xterm/css/xterm.css";
 import "../scripts/showcase.css";
 import { mockIPC, mockWindows } from "@tauri-apps/api/mocks";
 import type { ConnForm } from "./dialog";
-import { ShowcaseFs } from "./showcase-fs";
+import { REMOTE_CONNECTION, ShowcaseFs } from "./showcase-fs";
 
 const markCaptureStage = (stage: string): void => {
   document.documentElement.dataset.captureStage = stage;
@@ -124,6 +124,8 @@ mockIPC(
           id,
           kind: command === "session_create_ssh" ? "ssh" : "local",
           title: options?.title ?? (command === "session_create_ssh" ? "edge-01" : "PowerShell 7"),
+          // The SSH tab shares its connection with SFTP panels.
+          connectionId: command === "session_create_ssh" ? REMOTE_CONNECTION : undefined,
         };
       }
       default:
