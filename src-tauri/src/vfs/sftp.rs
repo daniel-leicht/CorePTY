@@ -78,8 +78,13 @@ impl SftpFs {
             .map_err(|e| format!("could not start SFTP on {label}: {e}"))
     }
 
-    pub fn is_closed(&self) -> bool {
-        self.client.is_closed()
+    pub fn has_ended(&self) -> bool {
+        self.client.has_ended()
+    }
+
+    /// Resolves with the reason once the session has ended.
+    pub fn ended(&self) -> impl std::future::Future<Output = String> + Send + 'static {
+        self.client.ended()
     }
 
     /// Override the chunk sizes and pipeline depths (benchmarks).

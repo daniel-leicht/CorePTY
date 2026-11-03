@@ -171,6 +171,8 @@ export type TransferState =
   | "planning"
   | "running"
   | "waiting_for_user"
+  /** A filesystem it uses is disconnected; it carries on after a reconnect. */
+  | "paused"
   | "done"
   | "failed"
   | "cancelled";
@@ -244,7 +246,8 @@ export type TransferEvent =
       skippedItems: number;
     }
   | { event: "failed"; id: string; message: string }
-  | { event: "cancelled"; id: string };
+  | { event: "cancelled"; id: string }
+  | { event: "paused"; id: string; fs: string; message: string };
 
 export const fsApi = {
   capabilities: (fs: string) => invoke<FsCapabilities>("fs_capabilities", { fs }),
@@ -319,9 +322,21 @@ export interface SftpSessionView {
   connected: boolean;
 }
 
+/** Sent when an SFTP filesystem drops or comes back. */
+export interface SftpStatus {
+  fs: string;
+  connected: boolean;
+  message: string | null;
+}
+
 export const sftpApi = {
   /** Call `close` once for every successful `connect`. */
   connect: (options: SftpConnectOptions) => invoke<SftpView>("sftp_connect", { options }),
+  /** Carry on with `fs` over a new session: panels and paused jobs continue. */
+  reconnect: (fs: string, options: SftpConnectOptions) =>
+    invoke<SftpView>("sftp_reconnect", { fs, options }),
+  onStatus: (cb: (status: SftpStatus) => void): Promise<UnlistenFn> =>
+    listen<SftpStatus>("sftp://status", (e) => cb(e.payload)),
   close: (fs: string) => invoke<void>("sftp_close", { fs }),
   sessions: () => invoke<SftpSessionView[]>("sftp_sessions"),
 };

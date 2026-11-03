@@ -6,9 +6,12 @@
 import {
   fsApi,
   pickDirectory,
+  sftpApi,
   type FsEntry,
   type FsLocation,
   type FsLocationView,
+  type SftpConnectOptions,
+  type SftpStatus,
   type TransferKind,
   type TransferRequest,
 } from "../ipc";
@@ -58,6 +61,14 @@ interface DragPayload {
 /** Shared by every file manager tab, like the OS clipboard. */
 let clipboard: Clipboard | null = null;
 
+/** How to log in again to each remote filesystem (set when one is opened). */
+const logins = new Map<string, SftpConnectOptions>();
+
+/** Remember how `fs` was opened, so a panel can reconnect it after a drop. */
+export function rememberLogin(fs: string, options: SftpConnectOptions): void {
+  logins.set(fs, options);
+}
+
 export class FileManagerTab implements AppTab, PanelHost {
   readonly tabType = "file-manager" as const;
   readonly uid = uuid();
@@ -82,6 +93,10 @@ export class FileManagerTab implements AppTab, PanelHost {
   private readonly transferSources = new WeakMap<TransferRequest, FsLocationView | null>();
   /** Aborted on dispose: dismisses this tab's dialogs. */
   private readonly lifetime = new AbortController();
+  /** Stops listening for remote filesystems dropping and coming back. */
+  private readonly statusListener: Promise<(() => void) | null> = sftpApi
+    .onStatus((status) => this.onRemoteStatus(status))
+    .catch(() => null);
   private readonly dialogs: DialogContext = {
     signal: this.lifetime.signal,
     fallbackFocus: () => this.focus(),
@@ -174,6 +189,7 @@ export class FileManagerTab implements AppTab, PanelHost {
 
   dispose(): void {
     this.disposed = true;
+    void this.statusListener.then((unlisten) => unlisten?.());
     this.lifetime.abort();
     this.queue.cancelAll();
     for (const [type, listener] of this.windowListeners) window.removeEventListener(type, listener);
@@ -334,6 +350,37 @@ export class FileManagerTab implements AppTab, PanelHost {
     );
   }
 
+  reconnect(panel: PanelView): void {
+    const fs = panel.fs;
+    const login = logins.get(fs);
+    if (!login) {
+      this.toast("Open the connection again to reconnect", "warn");
+      return;
+    }
+    void (async () => {
+      try {
+        const view = await sftpApi.reconnect(fs, login);
+        if (view.notice) this.toast(view.notice, "info");
+      } catch (error) {
+        this.toast(`Couldn't reconnect: ${error}`, "error");
+      }
+    })();
+  }
+
+  /** A remote filesystem dropped or came back: show it on its panels. */
+  private onRemoteStatus(status: SftpStatus): void {
+    if (this.disposed) return;
+    for (const panel of this.panels) {
+      if (panel.fs !== status.fs) continue;
+      panel.setOffline(status.connected ? null : (status.message ?? "The connection was lost."));
+      if (status.connected) {
+        void panel.refresh();
+        if (panel === this.active) panel.focus();
+      }
+    }
+    this.onStatusChange?.();
+  }
+
   drop(panel: PanelView, folder: FsEntry | null, event: DragEvent): void {
     let payload: DragPayload;
     try {
@@ -394,6 +441,8 @@ export class FileManagerTab implements AppTab, PanelHost {
     // A context menu handles its own keys; the panel underneath stays put.
     if (event.defaultPrevented || modalOpen() || document.querySelector(".ctx-menu")) return;
     const target = event.target as HTMLElement;
+    // The Disconnected banner's button takes its own keys (Enter reconnects).
+    if (target.closest(".fm-offline")) return;
     if (target.matches("input, textarea")) {
       // Inputs keep their keys, but never let F-keys/Ctrl+R reach the webview
       // (F5 / Ctrl+R would reload the whole app, F7 toggles caret browsing).

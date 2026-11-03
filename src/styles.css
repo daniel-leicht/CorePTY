@@ -1137,6 +1137,56 @@ button {
   display: none;
 }
 
+/* A remote panel whose connection dropped: the listing dims, a banner offers
+   to reconnect. */
+.fm-offline {
+  position: absolute;
+  top: 38px;
+  left: 10px;
+  right: 10px;
+  z-index: 3;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-left: 3px solid #f59e0b;
+  border-radius: 8px;
+  background: var(--bg-4);
+  box-shadow: var(--shadow-1);
+}
+.fm-offline[hidden] {
+  display: none;
+}
+.fm-offline__icon {
+  display: grid;
+  color: #f59e0b;
+}
+.fm-offline__icon .icon {
+  width: 18px;
+  height: 18px;
+}
+.fm-offline__text {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  color: var(--text-0);
+  font-size: 12.5px;
+}
+.fm-offline__text span {
+  overflow: hidden;
+  color: var(--text-3);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.fm-panel.is-offline .fm-list,
+.fm-panel.is-offline .fm-header {
+  opacity: 0.4;
+}
+
 /* F-key bar */
 .fm-keys {
   flex: none;

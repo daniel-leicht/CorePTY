@@ -86,6 +86,13 @@ impl Counters {
         }
     }
 
+    /// Start counting from zero (a job picking up after a dropped connection).
+    pub fn reset(&self) {
+        self.items.store(0, Ordering::Relaxed);
+        self.bytes.store(0, Ordering::Relaxed);
+        self.skipped.store(0, Ordering::Relaxed);
+    }
+
     fn add(&self, stats: WorkStats) {
         self.items.fetch_add(stats.items, Ordering::Relaxed);
         self.bytes.fetch_add(stats.bytes, Ordering::Relaxed);
@@ -283,6 +290,11 @@ pub struct Engine {
     partial_skipped: bool,
     /// Give copies the source's permissions (POSIX mode bits).
     preserve_mode: bool,
+    /// Picking up after a dropped connection: files already copied are
+    /// passed over and partial copies resumed, without asking.
+    retrying: bool,
+    /// `place` found the file already copied (when retrying).
+    already_there: bool,
     /// Planned totals of every walked folder, for counting renamed subtrees.
     folder_stats: HashMap<VPath, WorkStats>,
     /// Copy buffer, allocated once per job.
@@ -309,6 +321,8 @@ impl Engine {
             sticky_partial: None,
             partial_skipped: false,
             preserve_mode: true,
+            retrying: false,
+            already_there: false,
             folder_stats: HashMap::new(),
             buffer: Vec::new(),
         }
@@ -318,6 +332,11 @@ impl Engine {
     /// Whether copies get the source's permissions (on by default).
     pub fn set_preserve_mode(&mut self, preserve: bool) {
         self.preserve_mode = preserve;
+    }
+
+    /// Run again after a dropped connection: what's already done is kept.
+    pub fn set_retrying(&mut self) {
+        self.retrying = true;
     }
 
     pub async fn plan(&mut self, sources: &[VPath]) -> Result<WorkStats, TransferError> {
@@ -537,10 +556,15 @@ impl Engine {
                 )));
             }
 
+            self.already_there = false;
             let Some((target, placement)) = self
                 .place(source, &meta, handling.walks(), destination, &name)
                 .await?
             else {
+                if self.already_there {
+                    self.counters.add(self.stats_of(source, &meta));
+                    return self.finish_move(source, &walk).await;
+                }
                 return Ok(self.skip(source, &meta));
             };
 
@@ -654,6 +678,11 @@ impl Engine {
             }
             if walks && existing.is_real_directory() {
                 return Ok(Some((target, Placement::Merge)));
+            }
+            if self.retrying && !walks && same_file(meta, &existing) {
+                // Copied before the connection dropped.
+                self.already_there = true;
+                return Ok(None);
             }
             match self.decide(name, source, meta, &target, &existing).await? {
                 Decision::Overwrite => return Ok(Some((target, Placement::Overwrite))),
@@ -913,9 +942,10 @@ impl Engine {
         let have = existing.size.unwrap_or(0);
         let resumable = have > 0 && have < size;
         let resume = resumable
-            && self
-                .ask_resume(name, source, meta, &partial, &existing)
-                .await?;
+            && (self.retrying
+                || self
+                    .ask_resume(name, source, meta, &partial, &existing)
+                    .await?);
         if resumable && !resume && self.partial_skipped {
             return Ok(None);
         }
@@ -1110,6 +1140,21 @@ impl Engine {
 /// skipped (their kind is Other).
 fn listed_meta(entry: &Entry) -> Meta {
     entry.meta.clone()
+}
+
+/// A finished copy of `source`: same size, same modified time (to the
+/// second, as SFTP keeps it).
+fn same_file(source: &Meta, target: &Meta) -> bool {
+    let seconds = |meta: &Meta| {
+        meta.modified
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|elapsed| elapsed.as_secs())
+    };
+    target.kind == EntryKind::File
+        && source.size.is_some()
+        && source.size == target.size
+        && seconds(source).is_some()
+        && seconds(source) == seconds(target)
 }
 
 /// Files from this size on are copied via `<name>.filepart` (resumable).

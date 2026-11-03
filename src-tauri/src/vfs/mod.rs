@@ -9,6 +9,7 @@ pub mod commands;
 pub mod local;
 #[cfg(test)]
 pub mod memory;
+pub mod mount;
 mod path;
 pub mod sftp;
 
@@ -266,6 +267,17 @@ pub trait Vfs: Send + Sync {
 
     async fn trash(&self, _paths: &[VPath]) -> io::Result<()> {
         Err(unsupported("moving to the Trash"))
+    }
+
+    /// Whether the filesystem can be reached now (a remote one can drop).
+    fn is_connected(&self) -> bool {
+        true
+    }
+
+    /// Follows [`Self::is_connected`], for filesystems that can drop and come
+    /// back (`None`: always connected).
+    fn connection(&self) -> Option<tokio::sync::watch::Receiver<bool>> {
+        None
     }
 }
 

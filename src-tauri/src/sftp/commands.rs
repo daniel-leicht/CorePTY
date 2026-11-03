@@ -1,20 +1,24 @@
 //! IPC commands that open SFTP filesystems on SSH connections and register
 //! them with the file manager. One filesystem per connection, shared by every
 //! panel showing it, so a move between two panels on one host stays a
-//! server-side rename.
+//! server-side rename. Each is an [`SftpMount`]: when its connection drops,
+//! `sftp://status` says so, and `sftp_reconnect` carries on under the same id.
 
-use crate::connections::{ConnectionRegistry, HostKeys, SshAuth, SshTarget};
-use crate::vfs::{sftp::SftpFs, FsId, FsRegistry, Location, LocationView, VPath, Vfs};
+use crate::connections::{ConnectionLease, ConnectionRegistry, HostKeys, SshAuth, SshTarget};
+use crate::vfs::{
+    mount::SftpMount, sftp::SftpFs, FsId, FsRegistry, Location, LocationView, VPath, Vfs,
+};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex, MutexGuard},
 };
-use tauri::State;
+use tauri::{AppHandle, Emitter, State};
 use uuid::Uuid;
 
 struct Opened {
-    fs: Arc<SftpFs>,
+    mount: Arc<SftpMount>,
+    /// The SSH connection the current session runs on.
     connection_id: String,
     label: String,
     /// Panels using it; it's closed when the last one lets go.
@@ -65,8 +69,14 @@ pub struct SftpView {
     pub notice: Option<String>,
 }
 
-pub fn fs_id(connection_id: &str) -> FsId {
-    FsId(format!("sftp:{connection_id}"))
+/// Sent as `sftp://status` when a filesystem drops or comes back.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SftpStatus {
+    pub fs: FsId,
+    pub connected: bool,
+    /// Why it dropped.
+    pub message: Option<String>,
 }
 
 impl SftpConnectOptions {
@@ -80,8 +90,8 @@ impl SftpConnectOptions {
     }
 }
 
-async fn view(fs: &FsId, opened: &Arc<SftpFs>, connection_id: &str, label: &str) -> SftpView {
-    let home = opened
+async fn view(fs: &FsId, mount: &Arc<SftpMount>, connection_id: &str, label: &str) -> SftpView {
+    let home = mount
         .home()
         .await
         .unwrap_or_else(|_| VPath::posix(b"/".to_vec()));
@@ -98,10 +108,68 @@ async fn view(fs: &FsId, opened: &Arc<SftpFs>, connection_id: &str, label: &str)
     }
 }
 
+/// A lease on the requested connection, logging in if it's gone (and the
+/// options say how). Returns notices for the user (a newly trusted key).
+async fn lease_for(
+    connections: &ConnectionRegistry,
+    options: &SftpConnectOptions,
+) -> Result<(ConnectionLease, Option<String>), String> {
+    if let Some(lease) = options
+        .connection_id
+        .as_deref()
+        .and_then(|id| connections.attach(id))
+    {
+        return Ok((lease, None));
+    }
+    let target = options.target().ok_or_else(|| {
+        "that SSH connection has closed; connect again to browse its files".to_string()
+    })?;
+    let notices = Mutex::new(Vec::<String>::new());
+    let report = |message: String| {
+        notices
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(message);
+    };
+    let lease = connections
+        .connect(
+            Uuid::new_v4().to_string(),
+            &target,
+            &HostKeys::user(),
+            &report,
+        )
+        .await?;
+    let notices = notices.into_inner().unwrap_or_else(|e| e.into_inner());
+    Ok((lease, (!notices.is_empty()).then(|| notices.join("; "))))
+}
+
+/// Tell the UI whenever `mount` drops or comes back. Ends with the mount.
+fn report_status(app: AppHandle, fs: FsId, mount: &Arc<SftpMount>) {
+    let Some(mut connection) = mount.connection() else {
+        return;
+    };
+    let mount = Arc::downgrade(mount);
+    tauri::async_runtime::spawn(async move {
+        while connection.changed().await.is_ok() {
+            let connected = *connection.borrow_and_update();
+            let message = mount.upgrade().and_then(|mount| mount.lost_reason());
+            let _ = app.emit(
+                "sftp://status",
+                SftpStatus {
+                    fs: fs.clone(),
+                    connected,
+                    message,
+                },
+            );
+        }
+    });
+}
+
 /// Open SFTP on a live connection, or log in first. Call `sftp_close` once
 /// per successful `sftp_connect`.
 #[tauri::command]
 pub async fn sftp_connect(
+    app: AppHandle,
     connections: State<'_, ConnectionRegistry>,
     registry: State<'_, FsRegistry>,
     sessions: State<'_, SftpSessions>,
@@ -109,80 +177,82 @@ pub async fn sftp_connect(
 ) -> Result<SftpView, String> {
     // Already open on this connection: share it.
     if let Some(connection_id) = options.connection_id.as_deref() {
-        let id = fs_id(connection_id);
         let shared = {
             let mut open = sessions.open();
-            match open.get_mut(&id) {
-                Some(opened) if !opened.fs.is_closed() => {
+            open.iter_mut()
+                .find(|(_, opened)| {
+                    opened.connection_id == connection_id && opened.mount.is_connected()
+                })
+                .map(|(id, opened)| {
                     opened.users += 1;
-                    Some((opened.fs.clone(), opened.label.clone()))
-                }
-                _ => None,
-            }
+                    (id.clone(), opened.mount.clone(), opened.label.clone())
+                })
         };
-        if let Some((fs, label)) = shared {
-            return Ok(view(&id, &fs, connection_id, &label).await);
+        if let Some((id, mount, label)) = shared {
+            return Ok(view(&id, &mount, connection_id, &label).await);
         }
     }
 
-    let notices = Mutex::new(Vec::<String>::new());
-    let lease = match options
-        .connection_id
-        .as_deref()
-        .and_then(|id| connections.attach(id))
-    {
-        Some(lease) => lease,
-        None => {
-            let target = options.target().ok_or_else(|| {
-                "that SSH connection has closed; connect again to browse its files".to_string()
-            })?;
-            let report = |message: String| {
-                notices
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .push(message);
-            };
-            connections
-                .connect(
-                    Uuid::new_v4().to_string(),
-                    &target,
-                    &HostKeys::user(),
-                    &report,
-                )
-                .await?
-        }
-    };
+    let (lease, notice) = lease_for(&connections, &options).await?;
     let connection_id = lease.id.clone();
     let label = lease.label();
-    let fs = Arc::new(SftpFs::over_connection(lease).await?);
-    let id = fs_id(&connection_id);
+    let fs = SftpFs::over_connection(lease).await?;
+    let id = FsId(format!("sftp:{connection_id}"));
 
     // Another panel may have opened it meanwhile: keep the first one.
-    let fs = {
+    let mount = {
         let mut open = sessions.open();
         match open.get_mut(&id) {
-            Some(opened) if !opened.fs.is_closed() => {
+            Some(opened) if opened.mount.is_connected() => {
                 opened.users += 1;
-                opened.fs.clone()
+                opened.mount.clone()
             }
             _ => {
-                registry.register(id.clone(), fs.clone());
+                let mount = SftpMount::new(fs);
+                registry.register(id.clone(), mount.clone());
+                report_status(app, id.clone(), &mount);
                 open.insert(
                     id.clone(),
                     Opened {
-                        fs: fs.clone(),
+                        mount: mount.clone(),
                         connection_id: connection_id.clone(),
                         label: label.clone(),
                         users: 1,
                     },
                 );
-                fs
+                mount
             }
         }
     };
-    let mut result = view(&id, &fs, &connection_id, &label).await;
-    let notices = notices.into_inner().unwrap_or_else(|e| e.into_inner());
-    result.notice = (!notices.is_empty()).then(|| notices.join("; "));
+    let mut result = view(&id, &mount, &connection_id, &label).await;
+    result.notice = notice;
+    Ok(result)
+}
+
+/// Carry on with `fs` over a new session (after its connection dropped):
+/// panels keep their folders and paused transfers continue.
+#[tauri::command]
+pub async fn sftp_reconnect(
+    connections: State<'_, ConnectionRegistry>,
+    sessions: State<'_, SftpSessions>,
+    fs: FsId,
+    options: SftpConnectOptions,
+) -> Result<SftpView, String> {
+    let mount = sessions
+        .open()
+        .get(&fs)
+        .map(|opened| opened.mount.clone())
+        .ok_or_else(|| format!("{} is not open", fs.0))?;
+    let (lease, notice) = lease_for(&connections, &options).await?;
+    let connection_id = lease.id.clone();
+    let label = lease.label();
+    mount.replace(SftpFs::over_connection(lease).await?);
+    if let Some(opened) = sessions.open().get_mut(&fs) {
+        opened.connection_id = connection_id.clone();
+        opened.label = label.clone();
+    }
+    let mut result = view(&fs, &mount, &connection_id, &label).await;
+    result.notice = notice;
     Ok(result)
 }
 
@@ -222,7 +292,7 @@ pub fn sftp_sessions(sessions: State<'_, SftpSessions>) -> Vec<SftpSessionView> 
             connection_id: opened.connection_id.clone(),
             label: opened.label.clone(),
             users: opened.users,
-            connected: !opened.fs.is_closed(),
+            connected: opened.mount.is_connected(),
         })
         .collect();
     views.sort_by(|a, b| a.label.cmp(&b.label));

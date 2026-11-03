@@ -13,7 +13,15 @@ import {
 import { conflictDialog, type DialogContext } from "./dialogs";
 import { formatDuration, formatFileSize, formatSpeed } from "./format";
 
-type JobState = "queued" | "planning" | "running" | "waiting" | "done" | "failed" | "cancelled";
+type JobState =
+  | "queued"
+  | "planning"
+  | "running"
+  | "waiting"
+  | "paused"
+  | "done"
+  | "failed"
+  | "cancelled";
 
 interface Job {
   id: string | null;
@@ -217,6 +225,13 @@ export class TransferQueue {
         job.state = "cancelled";
         this.ended(job);
         break;
+      case "paused":
+        // The connection dropped: it carries on (where it stopped) after a reconnect.
+        job.state = "paused";
+        job.message = event.message;
+        job.speed = 0;
+        job.eta = null;
+        break;
     }
     this.update(job);
   }
@@ -313,6 +328,8 @@ function detail(job: Job): string {
       return job.message;
     case "cancelled":
       return "Cancelled";
+    case "paused":
+      return `Paused — ${job.message}`;
     case "running": {
       const parts = [
         job.current,

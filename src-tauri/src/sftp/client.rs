@@ -18,16 +18,27 @@ use std::{
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
-    sync::{mpsc, oneshot},
+    sync::{mpsc, oneshot, watch},
 };
 
 type Waiters = HashMap<u32, oneshot::Sender<Response>>;
 
-#[derive(Default)]
 struct Shared {
     waiters: Mutex<Waiters>,
     /// Why the session ended, once it has.
     closed: Mutex<Option<String>>,
+    /// The same, for those waiting to hear about it.
+    ended: watch::Sender<Option<String>>,
+}
+
+impl Default for Shared {
+    fn default() -> Self {
+        Self {
+            waiters: Mutex::default(),
+            closed: Mutex::default(),
+            ended: watch::channel(None).0,
+        }
+    }
 }
 
 impl Shared {
@@ -47,7 +58,8 @@ impl Shared {
         {
             let mut closed = self.closed.lock().unwrap_or_else(|e| e.into_inner());
             if closed.is_none() {
-                *closed = Some(reason);
+                *closed = Some(reason.clone());
+                self.ended.send_replace(Some(reason));
             }
         }
         // Dropping the senders wakes every waiter with an error.
@@ -207,8 +219,24 @@ impl SftpClient {
         })
     }
 
-    pub fn is_closed(&self) -> bool {
+    /// Whether the session has ended (the connection dropped, say).
+    pub fn has_ended(&self) -> bool {
         self.shared.closed_reason().is_some()
+    }
+
+    /// Resolves with the reason once the session has ended.
+    pub fn ended(&self) -> impl Future<Output = String> + Send + 'static {
+        let mut ended = self.shared.ended.subscribe();
+        async move {
+            loop {
+                if let Some(reason) = ended.borrow_and_update().clone() {
+                    return reason;
+                }
+                if ended.changed().await.is_err() {
+                    return "the SFTP session was closed".to_string();
+                }
+            }
+        }
     }
 
     /// Send a request now; `build` writes the fields after the request id.

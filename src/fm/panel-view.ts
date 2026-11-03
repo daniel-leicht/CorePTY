@@ -25,6 +25,8 @@ export interface PanelHost {
   /** The cursor, marks or location changed (status bar, key bar). */
   changed(panel: PanelView): void;
   toast(message: string, kind?: "info" | "warn" | "error"): void;
+  /** The panel's remote filesystem dropped; the user asked to reconnect. */
+  reconnect(panel: PanelView): void;
 }
 
 export interface NavigateOptions {
@@ -106,6 +108,11 @@ export class PanelView {
         </div>
         <div class="fm-list" role="rowgroup"><div class="fm-spacer"></div></div>
         <div class="fm-quicksearch" hidden></div>
+        <div class="fm-offline" role="alert" hidden>
+          <span class="fm-offline__icon">${icon("server")}</span>
+          <div class="fm-offline__text"><strong>Disconnected</strong><span></span></div>
+          <button type="button" class="btn primary" data-act="reconnect">Reconnect</button>
+        </div>
       </div>
       <div class="fm-panel-status"></div>`;
 
@@ -118,10 +125,30 @@ export class PanelView {
     this.status = this.element.querySelector(".fm-panel-status")!;
     this.quick = this.element.querySelector(".fm-quicksearch")!;
     this.wire();
+    this.element
+      .querySelector(".fm-offline button")!
+      .addEventListener("click", () => this.host.reconnect(this));
   }
 
   get location(): FsLocationView | null {
     return this.model.location;
+  }
+
+  /** Show (with why) or hide the "Disconnected — Reconnect" banner. */
+  setOffline(message: string | null): void {
+    const banner = this.element.querySelector<HTMLElement>(".fm-offline")!;
+    const wasHidden = banner.hidden;
+    banner.hidden = message === null;
+    this.element.classList.toggle("is-offline", message !== null);
+    banner.querySelector(".fm-offline__text span")!.textContent = message ?? "";
+    if (message !== null && wasHidden && this.element.classList.contains("is-active")) {
+      // Keyboard users reach the button at once; Enter reconnects.
+      banner.querySelector<HTMLButtonElement>("button")!.focus({ preventScroll: true });
+    }
+  }
+
+  get offline(): boolean {
+    return this.element.classList.contains("is-offline");
   }
 
   get fs(): string {

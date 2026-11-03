@@ -71,6 +71,7 @@ pub fn run() {
             connections::ssh_connections,
             sftp::commands::sftp_connect,
             sftp::commands::sftp_close,
+            sftp::commands::sftp_reconnect,
             sftp::commands::sftp_sessions,
             vfs::commands::fs_capabilities,
             vfs::commands::fs_home,

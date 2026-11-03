@@ -50,6 +50,8 @@ pub enum JobState {
     Planning,
     Running,
     WaitingForUser,
+    /// A filesystem it uses is disconnected; it carries on after a reconnect.
+    Paused,
     Done,
     Failed,
     Cancelled,
@@ -108,6 +110,12 @@ pub enum TransferEvent {
     },
     Cancelled {
         id: String,
+    },
+    /// Waiting for a connection to come back (`fs` is the filesystem id).
+    Paused {
+        id: String,
+        fs: FsId,
+        message: String,
     },
 }
 
@@ -376,29 +384,90 @@ async fn run_job(
         }
     };
 
-    job.set_state(JobState::Planning);
-    sink(TransferEvent::Planning { id: id.clone() });
     let resolver = Arc::new(QueueResolver {
         job: job.clone(),
         sink: sink.clone(),
     });
     let mut engine = Engine::new(
         job.kind,
-        source,
-        target,
+        source.clone(),
+        target.clone(),
         job.counters.clone(),
         job.cancel.subscribe(),
         resolver,
     );
     engine.set_preserve_mode(job.preserve_mode);
+    let sides = [source, target];
     let sources: Vec<VPath> = job
         .sources
         .iter()
         .map(|location| location.path.clone())
         .collect();
 
-    let result = async {
-        let totals = engine.plan(&sources).await?;
+    let result = loop {
+        if let Err(error) = until_connected(&job, &sink, &sides, &mut cancelled).await {
+            break Err(error);
+        }
+        let attempt = attempt(&job, &sink, &mut engine, &sources).await;
+        match attempt {
+            // The connection dropped mid-way: wait for it, then pick up
+            // where it stopped (finished files kept, partial ones resumed).
+            Err(TransferError::Failed(_)) if sides.iter().any(|side| !side.fs.is_connected()) => {
+                engine.set_retrying();
+                job.counters.reset();
+            }
+            other => break other,
+        }
+    };
+    finish(&job, &sink, result);
+    prune_finished(&mut lock(&inner.jobs));
+}
+
+/// Wait while a filesystem the job uses is disconnected (paused).
+async fn until_connected(
+    job: &Job,
+    sink: &EventSink,
+    sides: &[Side; 2],
+    cancelled: &mut watch::Receiver<bool>,
+) -> Result<(), TransferError> {
+    for side in sides {
+        let Some(mut connection) = side.fs.connection() else {
+            continue;
+        };
+        while !side.fs.is_connected() {
+            if job.state() != JobState::Paused {
+                job.set_state(JobState::Paused);
+                sink(TransferEvent::Paused {
+                    id: job.id.clone(),
+                    fs: side.id.clone(),
+                    message: format!("{} is disconnected — waiting to reconnect", side.id.0),
+                });
+            }
+            tokio::select! {
+                changed = connection.changed() => {
+                    if changed.is_err() {
+                        return Err(TransferError::Failed(format!("{} was closed", side.id.0)));
+                    }
+                }
+                _ = cancelled.wait_for(|cancelled| *cancelled) => return Err(TransferError::Cancelled),
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Plan and run the job once, reporting progress.
+async fn attempt(
+    job: &Arc<Job>,
+    sink: &EventSink,
+    engine: &mut Engine,
+    sources: &[VPath],
+) -> Result<(), TransferError> {
+    let id = job.id.clone();
+    job.set_state(JobState::Planning);
+    sink(TransferEvent::Planning { id: id.clone() });
+    {
+        let totals = engine.plan(sources).await?;
         *lock(&job.totals) = totals;
         sink(TransferEvent::Planned {
             id: id.clone(),
@@ -407,7 +476,7 @@ async fn run_job(
         });
         job.set_state(JobState::Running);
 
-        let run = engine.run(&sources, &job.destination.path);
+        let run = engine.run(sources, &job.destination.path);
         tokio::pin!(run);
         let mut ticker = tokio::time::interval(PROGRESS_INTERVAL);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -436,9 +505,6 @@ async fn run_job(
             }
         }
     }
-    .await;
-    finish(&job, &sink, result);
-    prune_finished(&mut lock(&inner.jobs));
 }
 
 fn progress_event(id: &str, snapshot: &Snapshot, totals: WorkStats, speed: f64) -> TransferEvent {
@@ -823,5 +889,225 @@ mod tests {
             TransferEvent::Progress { eta_seconds, .. } => assert_eq!(eta_seconds, Some(2)),
             other => panic!("unexpected {other:?}"),
         }
+    }
+    /// A remote filesystem whose connection drops on a given read and stays
+    /// down (every call fails) until `reconnect`.
+    struct Flaky {
+        inner: Arc<MemFs>,
+        connected: watch::Sender<bool>,
+        reads_before_drop: AtomicU64,
+    }
+
+    impl Flaky {
+        fn new(inner: Arc<MemFs>, reads_before_drop: u64) -> Arc<Self> {
+            Arc::new(Self {
+                inner,
+                connected: watch::channel(true).0,
+                reads_before_drop: AtomicU64::new(reads_before_drop),
+            })
+        }
+
+        fn up(&self) -> std::io::Result<()> {
+            if *self.connected.borrow() {
+                Ok(())
+            } else {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionAborted,
+                    "the connection was lost",
+                ))
+            }
+        }
+
+        fn reconnect(&self) {
+            self.connected.send_replace(true);
+        }
+    }
+
+    #[async_trait]
+    impl Vfs for Flaky {
+        fn capabilities(&self) -> crate::vfs::Capabilities {
+            self.inner.capabilities()
+        }
+        async fn home(&self) -> std::io::Result<VPath> {
+            self.up()?;
+            self.inner.home().await
+        }
+        async fn roots(&self) -> std::io::Result<Vec<crate::vfs::Root>> {
+            self.up()?;
+            self.inner.roots().await
+        }
+        async fn resolve(&self, input: &str, base: Option<&VPath>) -> std::io::Result<VPath> {
+            self.up()?;
+            self.inner.resolve(input, base).await
+        }
+        async fn canonicalize(&self, path: &VPath) -> std::io::Result<VPath> {
+            self.up()?;
+            self.inner.canonicalize(path).await
+        }
+        async fn list(&self, dir: &VPath) -> std::io::Result<Vec<crate::vfs::Entry>> {
+            self.up()?;
+            self.inner.list(dir).await
+        }
+        async fn stat(&self, path: &VPath) -> std::io::Result<crate::vfs::Meta> {
+            self.up()?;
+            self.inner.stat(path).await
+        }
+        async fn lstat(&self, path: &VPath) -> std::io::Result<crate::vfs::Meta> {
+            self.up()?;
+            self.inner.lstat(path).await
+        }
+        async fn mkdir(&self, path: &VPath) -> std::io::Result<()> {
+            self.up()?;
+            self.inner.mkdir(path).await
+        }
+        async fn rename(&self, from: &VPath, to: &VPath, overwrite: bool) -> std::io::Result<()> {
+            self.up()?;
+            self.inner.rename(from, to, overwrite).await
+        }
+        async fn remove(&self, path: &VPath, recursive: bool) -> std::io::Result<()> {
+            self.up()?;
+            self.inner.remove(path, recursive).await
+        }
+        async fn open_read(&self, path: &VPath, offset: u64) -> std::io::Result<crate::vfs::VRead> {
+            self.up()?;
+            if self.reads_before_drop.fetch_sub(1, Ordering::SeqCst) == 1 {
+                self.connected.send_replace(false);
+                self.up()?;
+            }
+            self.inner.open_read(path, offset).await
+        }
+        async fn open_write(
+            &self,
+            path: &VPath,
+            mode: crate::vfs::WriteMode,
+        ) -> std::io::Result<crate::vfs::VWrite> {
+            self.up()?;
+            self.inner.open_write(path, mode).await
+        }
+        async fn set_times(
+            &self,
+            path: &VPath,
+            modified: std::time::SystemTime,
+            accessed: Option<std::time::SystemTime>,
+        ) -> std::io::Result<()> {
+            self.up()?;
+            self.inner.set_times(path, modified, accessed).await
+        }
+        async fn set_mode(&self, path: &VPath, mode: u32) -> std::io::Result<()> {
+            self.up()?;
+            self.inner.set_mode(path, mode).await
+        }
+        async fn read_link(&self, path: &VPath) -> std::io::Result<VPath> {
+            self.inner.read_link(path).await
+        }
+        async fn symlink(&self, target: &VPath, link: &VPath, dir: bool) -> std::io::Result<()> {
+            self.inner.symlink(target, link, dir).await
+        }
+        fn is_connected(&self) -> bool {
+            *self.connected.borrow()
+        }
+        fn connection(&self) -> Option<watch::Receiver<bool>> {
+            Some(self.connected.subscribe())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_dropped_connection_pauses_the_job_and_it_carries_on_after_a_reconnect() {
+        let remote = Arc::new(MemFs::new());
+        remote.add_dir("/src");
+        for name in ["a.txt", "b.txt", "c.txt"] {
+            remote.add_file(&format!("/src/{name}"), name.as_bytes());
+        }
+        // The connection drops when the second file is opened.
+        let flaky = Flaky::new(remote.clone(), 2);
+        let local = Arc::new(MemFs::new());
+        local.add_dir("/dst");
+        let manager = TransferManager::default();
+        let (sink, mut events) = collector();
+        let request = TransferRequest {
+            kind: TransferKind::Copy,
+            sources: vec![location("remote", "/src")],
+            destination: location("m", "/dst"),
+            preserve_mode: true,
+        };
+        let view = manager
+            .start(request, flaky.clone(), local.clone(), sink)
+            .unwrap();
+
+        // Paused, not failed.
+        let mut seen = Vec::new();
+        loop {
+            let event = tokio::time::timeout(Duration::from_secs(5), events.recv())
+                .await
+                .expect("an event")
+                .expect("the job is running");
+            let paused = matches!(&event, TransferEvent::Paused { fs, .. } if fs.0 == "remote");
+            seen.push(event);
+            if paused {
+                break;
+            }
+        }
+        assert!(!seen
+            .iter()
+            .any(|e| matches!(e, TransferEvent::Failed { .. })));
+        assert_eq!(manager.list()[0].state, JobState::Paused);
+        assert_eq!(local.read("/dst/src/a.txt").unwrap(), b"a.txt");
+
+        flaky.reconnect();
+        let rest = until_finished(&mut events).await;
+        assert!(
+            matches!(rest.last(), Some(TransferEvent::Finished { .. })),
+            "{rest:?}"
+        );
+        assert!(
+            !rest
+                .iter()
+                .any(|e| matches!(e, TransferEvent::Conflict { .. })),
+            "nothing asked about the file copied before the drop"
+        );
+        for name in ["a.txt", "b.txt", "c.txt"] {
+            assert_eq!(
+                local.read(&format!("/dst/src/{name}")).unwrap(),
+                name.as_bytes()
+            );
+        }
+        // a.txt was not copied again: three files, three reads in all.
+        assert_eq!(remote.reads(), 3);
+        assert_eq!(manager.list()[0].id, view.id);
+        assert_eq!(manager.list()[0].state, JobState::Done);
+    }
+
+    #[tokio::test]
+    async fn a_job_queued_while_disconnected_waits_and_can_be_cancelled() {
+        let remote = Arc::new(MemFs::new());
+        remote.add_dir("/src");
+        remote.add_file("/src/a.txt", b"a");
+        let flaky = Flaky::new(remote, u64::MAX);
+        flaky.connected.send_replace(false);
+        let local = Arc::new(MemFs::new());
+        local.add_dir("/dst");
+        let manager = TransferManager::default();
+        let (sink, mut events) = collector();
+        let request = TransferRequest {
+            kind: TransferKind::Copy,
+            sources: vec![location("remote", "/src/a.txt")],
+            destination: location("m", "/dst"),
+            preserve_mode: true,
+        };
+        let view = manager.start(request, flaky, local.clone(), sink).unwrap();
+        loop {
+            let event = events.recv().await.unwrap();
+            if matches!(event, TransferEvent::Paused { .. }) {
+                break;
+            }
+            assert!(
+                !matches!(event, TransferEvent::Planning { .. }),
+                "nothing runs while down"
+            );
+        }
+        assert!(manager.cancel(&view.id));
+        let rest = until_finished(&mut events).await;
+        assert!(matches!(rest.last(), Some(TransferEvent::Cancelled { .. })));
+        assert!(!local.exists("/dst/a.txt"));
     }
 }
