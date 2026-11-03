@@ -474,7 +474,7 @@ export class App {
     this.updateStatus();
   }
 
-  /** `connectionId`: reuse that live connection (duplicate / reconnect) instead of logging in again. */
+  /** `connectionId`: reuse that live connection (Duplicate) instead of logging in again. */
   async newSsh(form: ConnForm, connectionId?: string): Promise<void> {
     const title = form.name || `${form.username}@${form.host}`;
     const session = new TerminalSession("ssh", title, "ssh");
@@ -546,9 +546,9 @@ export class App {
   private async relaunch(session: TerminalSession): Promise<void> {
     const spec = session.spec;
     if (!spec) return;
-    // Reattach to the same SSH connection if something else (another tab, a
-    // file panel) kept it up; the backend logs in afresh when it's gone.
-    const connectionId = session.info?.connectionId;
+    // Reconnect always logs in afresh (new group memberships, limits and
+    // expired passwords take effect), even if another tab kept the old
+    // connection up; only Duplicate shares it.
     if (session.info) {
       // Await teardown so the old backend session is gone before we spin up its
       // replacement — otherwise the close races the new create().
@@ -569,7 +569,7 @@ export class App {
         }
       } else if (spec.kind === "ssh") {
         session.attach(
-          await api.createSsh(this.sshOptions(spec.form, id, cols, rows, connectionId))
+          await api.createSsh(this.sshOptions(spec.form, id, cols, rows))
         );
       } else {
         session.attach(await api.createTelnet(this.telnetOptions(spec.form, id, cols, rows)));

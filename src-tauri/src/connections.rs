@@ -10,22 +10,30 @@ use std::{
     ops::Deref,
     path::PathBuf,
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
         Arc, Mutex, MutexGuard, RwLock, Weak,
     },
     time::Duration,
 };
 
 use russh::client::{self, AuthResult, DisconnectReason, Handle, Msg};
-use russh::keys::known_hosts::{check_known_hosts_path, learn_known_hosts_path};
+use russh::keys::known_hosts::{
+    check_known_hosts_path, known_host_keys_path, learn_known_hosts_path,
+};
 use russh::keys::{load_secret_key, ssh_key, Error as KeysError, PrivateKeyWithHashAlg};
 use russh::{Channel, Disconnect};
 use serde::{Deserialize, Serialize};
 use tauri::State;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+/// Password prompts and key checks; a server that never answers mustn't
+/// leave a tab (and its socket) stuck forever.
+const AUTH_TIMEOUT: Duration = Duration::from_secs(30);
+/// Opening a channel on a connection that may have died unnoticed.
+const OPEN_TIMEOUT: Duration = Duration::from_secs(if cfg!(test) { 3 } else { 10 });
 /// Keepalives notice a dead peer (and keep NAT/firewall state alive) on idle
-/// connections, such as an SFTP panel nobody is clicking in.
+/// connections, such as an SFTP panel nobody is clicking in. A peer that
+/// stops answering is declared lost after about (MAX + 1) × INTERVAL = 2 min.
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
 const KEEPALIVE_MAX: usize = 3;
 
@@ -95,26 +103,43 @@ pub struct SshConnection {
     pub host: String,
     pub port: u16,
     pub username: String,
+    /// Tells this connection apart from an earlier one under the same id.
+    generation: u64,
     handle: Handle<Client>,
     users: AtomicUsize,
 }
 
 impl SshConnection {
-    /// `user@host` (with `:port` when it isn't 22).
+    /// `user@host` (with `:port` when it isn't 22; IPv6 hosts in brackets).
     pub fn label(&self) -> String {
-        if self.port == 22 {
-            format!("{}@{}", self.username, self.host)
+        let host = if self.host.contains(':') {
+            format!("[{}]", self.host)
         } else {
-            format!("{}@{}:{}", self.username, self.host, self.port)
+            self.host.clone()
+        };
+        if self.port == 22 {
+            format!("{}@{host}", self.username)
+        } else {
+            format!("{}@{host}:{}", self.username, self.port)
         }
     }
 
-    /// A new session channel, for a shell or a subsystem such as SFTP.
+    /// A new session channel, for a shell or a subsystem such as SFTP. Times
+    /// out rather than wait for keepalives to notice a connection that died
+    /// quietly (a sleeping laptop, a VPN switch).
     pub async fn open_session(&self) -> Result<Channel<Msg>, String> {
-        self.handle
-            .channel_open_session()
-            .await
-            .map_err(|e| format!("could not open a channel on {}: {e}", self.label()))
+        match tokio::time::timeout(OPEN_TIMEOUT, self.handle.channel_open_session()).await {
+            Ok(Ok(channel)) => Ok(channel),
+            Ok(Err(e)) => Err(format!("could not open a channel on {}: {e}", self.label())),
+            Err(_) => Err(format!("{} is not responding", self.label())),
+        }
+    }
+
+    /// Whether this connection goes where `target` asks (credentials aside).
+    fn serves(&self, target: &SshTarget) -> bool {
+        self.host.eq_ignore_ascii_case(&target.host)
+            && self.port == target.port
+            && self.username == target.username
     }
 
     pub fn is_closed(&self) -> bool {
@@ -139,6 +164,7 @@ type EventSink = Arc<dyn Fn(ConnectionEvent) + Send + Sync>;
 struct Inner {
     connections: Mutex<HashMap<String, Arc<SshConnection>>>,
     events: RwLock<Option<EventSink>>,
+    generations: AtomicU64,
 }
 
 impl Inner {
@@ -146,11 +172,19 @@ impl Inner {
         self.connections.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// The server side ended `id`: forget it and tell the UI. A connection we
-    /// closed ourselves is already gone from the map, so it isn't reported.
-    fn lost(&self, id: &str, message: String) {
-        if self.connections().remove(id).is_none() {
-            return;
+    /// The server side ended connection `generation` of `id`: forget it and
+    /// tell the UI. A connection we closed ourselves is already gone from the
+    /// map, and a newer one under the same id is left alone.
+    fn lost(&self, id: &str, generation: u64, message: String) {
+        {
+            let mut connections = self.connections();
+            if connections
+                .get(id)
+                .is_none_or(|known| known.generation != generation)
+            {
+                return;
+            }
+            connections.remove(id);
         }
         let sink = self
             .events
@@ -187,15 +221,26 @@ impl ConnectionRegistry {
         host_keys: &HostKeys,
         progress: &(dyn Fn(String) + Send + Sync),
     ) -> Result<ConnectionLease, String> {
+        if self
+            .inner
+            .connections()
+            .get(&id)
+            .is_some_and(|known| !known.is_closed())
+        {
+            return Err(format!("connection {id} is already open"));
+        }
+        let generation = self.inner.generations.fetch_add(1, Ordering::SeqCst);
         let config = Arc::new(client::Config {
             keepalive_interval: Some(KEEPALIVE_INTERVAL),
             keepalive_max: KEEPALIVE_MAX,
+            preferred: preferred_algorithms(host_keys, &target.host, target.port),
             ..Default::default()
         });
         let reject_reason = Arc::new(Mutex::new(None::<String>));
         let trusted = Arc::new(Mutex::new(None::<String>));
         let handler = Client {
             id: id.clone(),
+            generation,
             host: target.host.clone(),
             port: target.port,
             host_keys: host_keys.clone(),
@@ -220,13 +265,17 @@ impl ConnectionRegistry {
         if let Some(fingerprint) = take(&trusted) {
             progress(format!("new host key trusted — {fingerprint}"));
         }
-        authenticate(&mut handle, target).await?;
+        match tokio::time::timeout(AUTH_TIMEOUT, authenticate(&mut handle, target)).await {
+            Ok(result) => result?,
+            Err(_) => return Err("the server didn't finish authentication in time".to_string()),
+        }
 
         let connection = Arc::new(SshConnection {
             id: id.clone(),
             host: target.host.clone(),
             port: target.port,
             username: target.username.clone(),
+            generation,
             handle,
             users: AtomicUsize::new(1),
         });
@@ -239,9 +288,23 @@ impl ConnectionRegistry {
 
     /// Share an existing connection (no new login), if it's still up.
     pub fn attach(&self, id: &str) -> Option<ConnectionLease> {
+        self.attach_if(id, |_| true)
+    }
+
+    /// [`Self::attach`], but only to a connection that goes to `target`'s
+    /// host and port as its user (a stale id never lands a shell elsewhere).
+    pub fn attach_to(&self, id: &str, target: &SshTarget) -> Option<ConnectionLease> {
+        self.attach_if(id, |connection| connection.serves(target))
+    }
+
+    fn attach_if(
+        &self,
+        id: &str,
+        suits: impl Fn(&SshConnection) -> bool,
+    ) -> Option<ConnectionLease> {
         let connections = self.inner.connections();
         let connection = connections.get(id)?;
-        if connection.is_closed() {
+        if connection.is_closed() || !suits(connection) {
             return None;
         }
         connection.users.fetch_add(1, Ordering::SeqCst);
@@ -360,6 +423,7 @@ fn ensure_safe_private_key_algorithm(algorithm: ssh_key::Algorithm) -> Result<()
 
 pub struct Client {
     id: String,
+    generation: u64,
     host: String,
     port: u16,
     host_keys: HostKeys,
@@ -404,7 +468,7 @@ impl client::Handler for Client {
                 }
                 DisconnectReason::Error(e) => format!("the connection was lost: {e}"),
             };
-            inner.lost(&self.id, message);
+            inner.lost(&self.id, self.generation, message);
         }
         match reason {
             DisconnectReason::ReceivedDisconnect(_) => Ok(()),
@@ -427,9 +491,26 @@ fn verify_host_key(
         // blindly accept a host key we can never verify against anything.
         return Err("cannot locate ~/.ssh/known_hosts to verify the host key — refused".into());
     };
+    if is_revoked(path, key) {
+        return Err("the server's host key is marked @revoked in known_hosts — refused".into());
+    }
     match check_known_hosts_path(host, port, key, path) {
         Ok(true) => Ok(None),
         Ok(false) => {
+            // Keys of another type are on record for this host: a server
+            // doesn't drop its old key type overnight, but an impostor that
+            // lacks it would offer something else. Refuse, as OpenSSH warns.
+            let known = known_host_keys_path(host, port, path)
+                .map_err(|e| format!("could not verify the host key — refused ({e})"))?;
+            if let Some((_, recorded)) = known.first() {
+                return Err(format!(
+                    "the server offered a {} host key, but a {} key is on record for it — \
+                     refused (possible MITM; remove the old entry from known_hosts if the \
+                     server really changed)",
+                    key.algorithm(),
+                    recorded.algorithm()
+                ));
+            }
             if let Some(directory) = path.parent() {
                 std::fs::create_dir_all(directory).map_err(|e| {
                     format!("could not prepare the SSH host-key store — refused ({e})")
@@ -445,6 +526,52 @@ fn verify_host_key(
         // closed — never silently trust a key we could not verify.
         Err(e) => Err(format!("could not verify the host key — refused ({e})")),
     }
+}
+
+/// Host-key types to negotiate: those on record for this host first, so a
+/// server with several keys presents the one we can verify.
+fn preferred_algorithms(host_keys: &HostKeys, host: &str, port: u16) -> russh::Preferred {
+    let mut preferred = russh::Preferred::default();
+    let recorded: Vec<ssh_key::Algorithm> = host_keys
+        .path
+        .as_ref()
+        .and_then(|path| known_host_keys_path(host, port, path).ok())
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(_, key)| key.algorithm())
+        .collect();
+    if !recorded.is_empty() {
+        let mut order: Vec<ssh_key::Algorithm> = Vec::new();
+        for algorithm in recorded.iter().chain(preferred.key.iter()) {
+            if preferred.key.contains(algorithm) && !order.contains(algorithm) {
+                order.push(algorithm.clone());
+            }
+        }
+        preferred.key = order.into();
+    }
+    preferred
+}
+
+/// `@revoked` lines (which russh's known_hosts reader skips): a revoked key is
+/// refused for every host.
+fn is_revoked(path: &std::path::Path, key: &ssh_key::PublicKey) -> bool {
+    let Ok(contents) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let offered = key.to_openssh().ok();
+    contents.lines().any(|line| {
+        let mut fields = line.split_whitespace();
+        if fields.next() != Some("@revoked") {
+            return false;
+        }
+        let (Some(_hosts), Some(kind), Some(data)) = (fields.next(), fields.next(), fields.next())
+        else {
+            return false;
+        };
+        offered
+            .as_deref()
+            .is_some_and(|offered| offered.split_whitespace().take(2).eq([kind, data]))
+    })
 }
 
 fn require_host_key_persisted<E: std::fmt::Display>(result: Result<(), E>) -> Result<(), String> {
@@ -474,16 +601,34 @@ pub(crate) mod tests {
         pub addr: std::net::SocketAddr,
         pub connections: Arc<AtomicU64>,
         pub closed: Arc<AtomicU64>,
+        /// Session channels the client closed (CHANNEL_CLOSE received).
+        pub channel_closes: Arc<AtomicU64>,
         /// Server-side handles of accepted sessions, to drop them from the server end.
         pub handles: Arc<Mutex<Vec<server::Handle>>>,
+    }
+
+    /// How a [`TestServer`] behaves beyond the basics.
+    #[derive(Default)]
+    pub(crate) struct ServerOptions {
+        pub key: Option<PrivateKey>,
+        /// Where the `sftp` subsystem runs; `None` refuses SFTP.
+        pub sftp_root: Option<PathBuf>,
+        /// Like sshd's MaxSessions: open session channels per connection.
+        pub max_sessions: Option<u64>,
+        /// The server's receive window (a small one makes a paste wait).
+        pub window_size: Option<u32>,
     }
 
     #[derive(Clone)]
     struct Handler {
         handles: Arc<Mutex<Vec<server::Handle>>>,
         channels: Arc<Mutex<HashMap<ChannelId, russh::Channel<ServerMsg>>>>,
-        /// Where the `sftp` subsystem runs; `None` refuses SFTP.
         sftp_root: Option<PathBuf>,
+        max_sessions: Option<u64>,
+        open_sessions: Arc<AtomicU64>,
+        channel_closes: Arc<AtomicU64>,
+        /// Channels running the echoing shell (not SFTP or exec).
+        shells: Arc<Mutex<std::collections::HashSet<ChannelId>>>,
     }
 
     impl server::Handler for Handler {
@@ -507,9 +652,76 @@ pub(crate) mod tests {
             reply: server::ChannelOpenHandle,
             session: &mut Session,
         ) -> Result<(), Self::Error> {
+            if self
+                .max_sessions
+                .is_some_and(|max| self.open_sessions.load(Ordering::SeqCst) >= max)
+            {
+                reply
+                    .reject(russh::ChannelOpenFailure::AdministrativelyProhibited)
+                    .await;
+                return Ok(());
+            }
+            self.open_sessions.fetch_add(1, Ordering::SeqCst);
             self.handles.lock().unwrap().push(session.handle());
             self.channels.lock().unwrap().insert(channel.id(), channel);
             reply.accept().await;
+            Ok(())
+        }
+
+        async fn channel_close(
+            &mut self,
+            channel: ChannelId,
+            _session: &mut Session,
+        ) -> Result<(), Self::Error> {
+            self.channels.lock().unwrap().remove(&channel);
+            self.channel_closes.fetch_add(1, Ordering::SeqCst);
+            self.open_sessions.fetch_sub(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        #[allow(clippy::too_many_arguments)] // the trait's signature
+        async fn pty_request(
+            &mut self,
+            channel: ChannelId,
+            _term: &str,
+            _cols: u32,
+            _rows: u32,
+            _pixel_width: u32,
+            _pixel_height: u32,
+            _modes: &[(russh::Pty, u32)],
+            session: &mut Session,
+        ) -> Result<(), Self::Error> {
+            session.channel_success(channel)?;
+            Ok(())
+        }
+
+        /// A "shell" that prints a prompt and echoes its input, as a tty does.
+        /// As with sshd and a PTY, EOF alone does not end it.
+        async fn shell_request(
+            &mut self,
+            channel: ChannelId,
+            session: &mut Session,
+        ) -> Result<(), Self::Error> {
+            // Unread channel objects would fill up and stall the session loop.
+            self.channels.lock().unwrap().remove(&channel);
+            self.shells.lock().unwrap().insert(channel);
+            session.channel_success(channel)?;
+            session.data(channel, b"$ ".to_vec())?;
+            Ok(())
+        }
+
+        async fn data(
+            &mut self,
+            channel: ChannelId,
+            data: &[u8],
+            session: &mut Session,
+        ) -> Result<(), Self::Error> {
+            if !self.shells.lock().unwrap().contains(&channel) {
+                return Ok(());
+            }
+            for chunk in data.chunks(1024) {
+                session.data(channel, chunk.to_vec())?;
+            }
             Ok(())
         }
 
@@ -553,6 +765,7 @@ pub(crate) mod tests {
             data: &[u8],
             session: &mut Session,
         ) -> Result<(), Self::Error> {
+            self.channels.lock().unwrap().remove(&channel);
             let mut reply = b"ok:".to_vec();
             reply.extend_from_slice(data);
             session.channel_success(channel)?;
@@ -565,27 +778,45 @@ pub(crate) mod tests {
     }
 
     pub(crate) async fn start_server(key: PrivateKey) -> TestServer {
-        start_with_sftp(key, None).await
+        start_with(ServerOptions {
+            key: Some(key),
+            ..ServerOptions::default()
+        })
+        .await
     }
 
     /// A test server whose `sftp` subsystem serves `root`.
     pub(crate) async fn start_sftp_server(root: PathBuf) -> TestServer {
-        start_with_sftp(host_key(), Some(root)).await
+        start_with(ServerOptions {
+            sftp_root: Some(root),
+            ..ServerOptions::default()
+        })
+        .await
     }
 
-    async fn start_with_sftp(key: PrivateKey, sftp_root: Option<PathBuf>) -> TestServer {
-        let config = Arc::new(server::Config {
+    pub(crate) async fn start_with(options: ServerOptions) -> TestServer {
+        let mut config = server::Config {
             auth_rejection_time: Duration::from_millis(10),
             inactivity_timeout: None,
-            keys: vec![key],
+            keys: vec![options.key.unwrap_or_else(host_key)],
             ..Default::default()
-        });
+        };
+        if let Some(window_size) = options.window_size {
+            config.window_size = window_size;
+        }
+        let config = Arc::new(config);
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let connections = Arc::new(AtomicU64::new(0));
         let closed = Arc::new(AtomicU64::new(0));
+        let channel_closes = Arc::new(AtomicU64::new(0));
         let handles = Arc::new(Mutex::new(Vec::new()));
-        let (count, done, kept) = (connections.clone(), closed.clone(), handles.clone());
+        let (count, done, kept, closes) = (
+            connections.clone(),
+            closed.clone(),
+            handles.clone(),
+            channel_closes.clone(),
+        );
         tokio::spawn(async move {
             while let Ok((socket, _)) = listener.accept().await {
                 count.fetch_add(1, Ordering::SeqCst);
@@ -593,7 +824,11 @@ pub(crate) mod tests {
                 let handler = Handler {
                     handles: kept.clone(),
                     channels: Arc::default(),
-                    sftp_root: sftp_root.clone(),
+                    sftp_root: options.sftp_root.clone(),
+                    max_sessions: options.max_sessions,
+                    open_sessions: Arc::default(),
+                    channel_closes: closes.clone(),
+                    shells: Arc::default(),
                 };
                 let done = done.clone();
                 tokio::spawn(async move {
@@ -608,6 +843,7 @@ pub(crate) mod tests {
             addr,
             connections,
             closed,
+            channel_closes,
             handles,
         }
     }
@@ -854,5 +1090,182 @@ pub(crate) mod tests {
         let error =
             verify_host_key(&HostKeys { path: None }, "h", 22, key.public_key()).unwrap_err();
         assert!(error.contains("refused"));
+    }
+
+    #[tokio::test]
+    async fn a_known_host_offering_a_different_key_type_is_refused() {
+        let genuine = start_server(host_key()).await;
+        let dir = tempfile::tempdir().unwrap();
+        let keys = temp_host_keys(&dir);
+        let registry = ConnectionRegistry::default();
+        drop(
+            registry
+                .connect("a".into(), &target(&genuine, "secret"), &keys, &|_| {})
+                .await
+                .unwrap(),
+        );
+        // An impostor on the recorded host:port with only an ECDSA key.
+        let ecdsa = PrivateKey::random(
+            &mut rand::rng(),
+            Algorithm::Ecdsa {
+                curve: russh::keys::ssh_key::EcdsaCurve::NistP256,
+            },
+        )
+        .unwrap();
+        let impostor = start_server(ecdsa).await;
+        let path = dir.path().join("known_hosts");
+        let known = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(
+            &path,
+            known.replace(
+                &genuine.addr.port().to_string(),
+                &impostor.addr.port().to_string(),
+            ),
+        )
+        .unwrap();
+        let error = registry
+            .connect("b".into(), &target(&impostor, "secret"), &keys, &|_| {})
+            .await
+            .err()
+            .unwrap();
+        assert!(error.contains("on record"), "{error}");
+        // Nothing new was learned.
+        let recorded = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(recorded.lines().filter(|l| !l.trim().is_empty()).count(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_revoked_host_key_is_refused() {
+        let key = host_key();
+        let public = key.public_key().to_openssh().unwrap();
+        let server = start_server(key).await;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("known_hosts"),
+            format!("@revoked * {public}\n"),
+        )
+        .unwrap();
+        let error = ConnectionRegistry::default()
+            .connect(
+                "a".into(),
+                &target(&server, "secret"),
+                &temp_host_keys(&dir),
+                &|_| {},
+            )
+            .await
+            .err()
+            .unwrap();
+        assert!(error.contains("@revoked"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn an_open_id_is_not_reused_and_attach_to_checks_the_destination() {
+        let server = start_server(host_key()).await;
+        let dir = tempfile::tempdir().unwrap();
+        let keys = temp_host_keys(&dir);
+        let registry = ConnectionRegistry::default();
+        let lease = registry
+            .connect("x".into(), &target(&server, "secret"), &keys, &|_| {})
+            .await
+            .unwrap();
+        let error = registry
+            .connect("x".into(), &target(&server, "secret"), &keys, &|_| {})
+            .await
+            .err()
+            .unwrap();
+        assert!(error.contains("already open"), "{error}");
+        assert_eq!(server.connections.load(Ordering::SeqCst), 1);
+
+        let same = target(&server, "other password: not compared");
+        assert!(registry.attach_to("x", &same).is_some());
+        let mut elsewhere = target(&server, "secret");
+        elsewhere.username = "root".into();
+        assert!(registry.attach_to("x", &elsewhere).is_none());
+        elsewhere = target(&server, "secret");
+        elsewhere.port += 1;
+        assert!(registry.attach_to("x", &elsewhere).is_none());
+        drop(lease);
+    }
+
+    /// A TCP relay to `upstream` that can stop forwarding (a dead Wi-Fi link:
+    /// sockets stay open, nothing gets through).
+    async fn relay(
+        upstream: std::net::SocketAddr,
+    ) -> (std::net::SocketAddr, Arc<std::sync::atomic::AtomicBool>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let frozen = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let freeze = frozen.clone();
+        tokio::spawn(async move {
+            let (mut client, _) = listener.accept().await.unwrap();
+            let mut server = tokio::net::TcpStream::connect(upstream).await.unwrap();
+            let (mut up, mut down) = (vec![0; 65536], vec![0; 65536]);
+            loop {
+                tokio::select! {
+                    read = client.read(&mut up) => match read {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) if !freeze.load(Ordering::SeqCst) => {
+                            if server.write_all(&up[..n]).await.is_err() { return; }
+                        }
+                        Ok(_) => {}
+                    },
+                    read = server.read(&mut down) => match read {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) if !freeze.load(Ordering::SeqCst) => {
+                            if client.write_all(&down[..n]).await.is_err() { return; }
+                        }
+                        Ok(_) => {}
+                    },
+                }
+            }
+        });
+        (addr, frozen)
+    }
+
+    #[tokio::test]
+    async fn opening_a_channel_gives_up_on_a_connection_that_stopped_answering() {
+        let server = start_server(host_key()).await;
+        let (addr, frozen) = relay(server.addr).await;
+        let dir = tempfile::tempdir().unwrap();
+        let registry = ConnectionRegistry::default();
+        let mut through_relay = target(&server, "secret");
+        through_relay.port = addr.port();
+        let lease = registry
+            .connect("c".into(), &through_relay, &temp_host_keys(&dir), &|_| {})
+            .await
+            .unwrap();
+        frozen.store(true, Ordering::SeqCst);
+        let shared = registry.attach("c").expect("not noticed as dead yet");
+        let started = std::time::Instant::now();
+        let error = shared.open_session().await.err().unwrap();
+        assert!(error.contains("not responding"), "{error}");
+        assert!(started.elapsed() < OPEN_TIMEOUT * 3);
+        drop((shared, lease));
+    }
+
+    #[tokio::test]
+    async fn hanging_up_deliberately_is_not_reported_as_lost() {
+        let server = start_server(host_key()).await;
+        let dir = tempfile::tempdir().unwrap();
+        let registry = ConnectionRegistry::default();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink = events.clone();
+        registry.set_events(Arc::new(move |event| sink.lock().unwrap().push(event)));
+        for i in 0..5 {
+            let lease = registry
+                .connect(
+                    format!("c{i}"),
+                    &target(&server, "secret"),
+                    &temp_host_keys(&dir),
+                    &|_| {},
+                )
+                .await
+                .unwrap();
+            drop(lease);
+        }
+        assert!(eventually(|| server.closed.load(Ordering::SeqCst) == 5).await);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(events.lock().unwrap().is_empty());
     }
 }

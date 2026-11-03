@@ -792,7 +792,8 @@ mod tests {
         assert!(!remote.path().join("project").exists());
     }
 
-    #[cfg(unix)]
+    // macOS (APFS) refuses names that aren't valid UTF-8, so only Linux can host one.
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn names_that_are_not_utf8_survive_listing_renaming_and_reading() {
         use std::os::unix::ffi::OsStrExt;
