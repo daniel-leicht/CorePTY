@@ -97,6 +97,8 @@ export class FileManagerTab implements AppTab, PanelHost {
   private customTitle: string | null = null;
   private opened = false;
   private disposed = false;
+  /** Filesystems being reconnected. */
+  private readonly reconnecting = new Set<string>();
   private activeSide: 0 | 1 = 0;
   private readonly panels: [PanelView, PanelView];
   private readonly queue: TransferQueue;
@@ -442,11 +444,14 @@ export class FileManagerTab implements AppTab, PanelHost {
 
   reconnect(panel: PanelView): void {
     const fs = panel.fs;
+    // Both panels may show it: one reconnect at a time.
+    if (this.reconnecting.has(fs)) return;
     const relogin = reloginFor(fs);
     if (!relogin) {
       this.toast("Open the connection again to reconnect", "warn");
       return;
     }
+    this.reconnecting.add(fs);
     void (async () => {
       try {
         const login = await relogin();
@@ -455,6 +460,8 @@ export class FileManagerTab implements AppTab, PanelHost {
         if (view.notice) this.toast(view.notice, "info");
       } catch (error) {
         this.toast(`Couldn't reconnect: ${error}`, "error");
+      } finally {
+        this.reconnecting.delete(fs);
       }
     })();
   }
@@ -694,11 +701,10 @@ export class FileManagerTab implements AppTab, PanelHost {
     // A context menu handles its own keys; the panel underneath stays put.
     if (event.defaultPrevented || modalOpen() || document.querySelector(".ctx-menu")) return;
     const target = event.target as HTMLElement;
-    // The Disconnected banner's button takes its own keys (Enter reconnects).
-    if (target.closest(".fm-offline")) return;
-    if (target.matches("input, textarea")) {
-      // Inputs keep their keys, but never let F-keys/Ctrl+R reach the webview
-      // (F5 / Ctrl+R would reload the whole app, F7 toggles caret browsing).
+    // Inputs and the Disconnected banner's button (Enter reconnects) keep
+    // their keys, but never let F-keys/Ctrl+R reach the webview (F5 / Ctrl+R
+    // would reload the whole app, F7 toggles caret browsing).
+    if (target.matches("input, textarea") || target.closest(".fm-offline")) {
       const refresh = (event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "r";
       if (/^F\d{1,2}$/.test(event.key) || refresh) event.preventDefault();
       if (refresh) void this.run("refresh");
@@ -968,8 +974,9 @@ export class FileManagerTab implements AppTab, PanelHost {
       return;
     }
     if (!destination) return;
+    // Modes are kept only from a POSIX side to a POSIX side.
     const permissions =
-      panel.capabilities.posixPermissions || this.other.capabilities.posixPermissions;
+      panel.capabilities.posixPermissions && this.other.capabilities.posixPermissions;
     const answer = await copyMoveDialog(
       { kind, what: describe(entries), destination: destination.display, permissions },
       this.dialogs

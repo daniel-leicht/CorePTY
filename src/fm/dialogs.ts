@@ -357,16 +357,25 @@ async function partialDialog(
 ): Promise<ConflictAnswer | null> {
   const have = conflict.target.size ?? 0;
   const total = conflict.source.size ?? 0;
+  // Changed since the partial copy was written: it's from another version
+  // of the file, and resuming would splice the two.
+  const changed = isNewer(conflict.source, conflict.target) === "source";
   const body = document.createElement("div");
   body.className = "fm-conflict";
   body.innerHTML = `
     <p class="fm-confirm__message"></p>
     <div class="fm-progress fm-conflict__partial" role="progressbar" aria-valuemin="0" aria-valuemax="100"><span></span></div>
-    <p class="fm-confirm__note"></p>
+    <p class="fm-confirm__note fm-conflict__dates"></p>
+    <p class="fm-confirm__note fm-conflict__warning" hidden>The file has changed since, so starting over is safer.</p>
+    <p class="fm-confirm__note fm-conflict__path"></p>
     <label class="check"><input type="checkbox" class="fm-conflict__all" /> Do this for all remaining partial copies</label>`;
   body.querySelector(".fm-confirm__message")!.textContent =
     `“${conflict.name}” was partly copied before: ${formatFileSize(have)} of ${formatFileSize(total)}.`;
-  body.querySelector(".fm-confirm__note")!.textContent = conflict.target.path;
+  body.querySelector(".fm-conflict__dates")!.textContent =
+    `Partial copy written ${formatModified(conflict.target.modified) || "at an unknown time"}; ` +
+    `the file was modified ${formatModified(conflict.source.modified) || "at an unknown time"}.`;
+  body.querySelector<HTMLElement>(".fm-conflict__warning")!.hidden = !changed;
+  body.querySelector(".fm-conflict__path")!.textContent = conflict.target.path;
   const percent = total ? Math.min(100, Math.round((have / total) * 100)) : 0;
   body.querySelector<HTMLElement>(".fm-conflict__partial span")!.style.width = `${percent}%`;
   body.querySelector(".fm-conflict__partial")!.setAttribute("aria-valuenow", String(percent));
@@ -380,8 +389,8 @@ async function partialDialog(
     buttons: [
       { value: "cancel", label: "Cancel transfer" },
       { value: "skip", label: "Skip" },
-      { value: "overwrite", label: "Start over" },
-      { value: "resume", label: "Resume", kind: "primary" },
+      { value: "overwrite", label: "Start over", kind: changed ? "primary" : undefined },
+      { value: "resume", label: "Resume", kind: changed ? undefined : "primary" },
     ],
   });
   let resolution: ConflictResolution;

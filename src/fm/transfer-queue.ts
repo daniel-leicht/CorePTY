@@ -12,6 +12,7 @@ import {
 } from "../ipc";
 import { conflictDialog, type DialogContext } from "./dialogs";
 import { formatDuration, formatFileSize, formatSpeed } from "./format";
+import { remoteLabel } from "./remote";
 
 type JobState =
   | "queued"
@@ -228,7 +229,7 @@ export class TransferQueue {
       case "paused":
         // The connection dropped: it carries on (where it stopped) after a reconnect.
         job.state = "paused";
-        job.message = event.message;
+        job.message = `${remoteLabel(event.fs) ?? "the server"} is disconnected — waiting to reconnect`;
         job.speed = 0;
         job.eta = null;
         break;
