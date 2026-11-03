@@ -66,9 +66,22 @@ export function reloginFor(fs: string): Known["relogin"] | null {
   return known.get(fs)?.relogin ?? null;
 }
 
-/** The provider badge: `LOCAL`, or `SFTP user@host`. */
+/** `LOCAL`, or `SFTP user@host` (the status bar, the badge's tooltip). */
 export function providerLabel(fs: string): string {
   if (!isRemote(fs)) return "LOCAL";
   const label = remoteLabel(fs);
   return label ? `SFTP ${label}` : "SFTP";
+}
+
+/** The badge itself, kept short: `SFTP deploy@edge-01` for `deploy@edge-01.example.net`. */
+export function providerBadge(fs: string): string {
+  if (!isRemote(fs)) return "LOCAL";
+  const label = remoteLabel(fs);
+  if (!label) return "SFTP";
+  // `user@host`, `user@host:2222`, `user@[::1]:2222`
+  const match = /^(.*@)?(\[[^\]]+\]|[^:]+)(:\d+)?$/.exec(label);
+  const host = match?.[2] ?? label;
+  // Names shorten to their first part; addresses stay whole.
+  const short = /^[\d.]+$/.test(host) || host.startsWith("[") ? host : host.split(".")[0];
+  return `SFTP ${match?.[1] ?? ""}${short}`;
 }

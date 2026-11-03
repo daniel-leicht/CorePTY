@@ -34,6 +34,7 @@ import { DRAG_TYPE, PanelView, type PanelHost } from "./panel-view";
 import {
   isRemote,
   learn,
+  providerLabel,
   reloginFor,
   remoteLabel,
   type RemoteSource,
@@ -170,12 +171,13 @@ export class FileManagerTab implements AppTab, PanelHost {
 
   statusInfo(): TabStatusInfo {
     const panel = this.active;
-    const fs = panel.fs === "local" ? "LOCAL" : panel.fs.toUpperCase();
+    const fs = providerLabel(panel.fs);
     const marked = panel.model.markedSummary();
     const { folders, files } = panel.model.totals;
     const items = folders + files;
     const parts = [
       marked.count ? `${marked.count} marked · ${formatFileSize(marked.bytes)}` : `${items} items`,
+      panel.offline ? "disconnected" : null,
       this.queue.summary(),
     ].filter(Boolean);
     return { kind: `FILES · ${fs}`, context: panel.location?.display, metrics: parts.join(" · ") };

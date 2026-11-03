@@ -6,6 +6,7 @@
 import { icon } from "../icons";
 import { fsApi, type FsCapabilities, type FsEntry, type FsLocationView } from "../ipc";
 import { formatFileSize, formatMode, formatModified, modeType } from "./format";
+import { isRemote, providerBadge, providerLabel } from "./remote";
 import { History, PanelModel, type SortKey } from "./panel-model";
 
 export const ROW_HEIGHT = 28;
@@ -134,6 +135,18 @@ export class PanelView {
     return this.model.location;
   }
 
+  /** The provider badge: `LOCAL`, or the server with a connection dot. */
+  private renderProvider(): void {
+    const badge = this.element.querySelector<HTMLElement>(".fm-provider")!;
+    const remote = isRemote(this.fs);
+    badge.classList.toggle("is-remote", remote);
+    badge.classList.toggle("is-offline", remote && this.offline);
+    badge.textContent = providerBadge(this.fs);
+    badge.title = remote
+      ? `${providerLabel(this.fs)} — ${this.offline ? "disconnected" : "connected"}`
+      : "This PC";
+  }
+
   /** Show (with why) or hide the "Disconnected — Reconnect" banner. */
   setOffline(message: string | null): void {
     const banner = this.element.querySelector<HTMLElement>(".fm-offline")!;
@@ -141,6 +154,7 @@ export class PanelView {
     banner.hidden = message === null;
     this.element.classList.toggle("is-offline", message !== null);
     banner.querySelector(".fm-offline__text span")!.textContent = message ?? "";
+    this.renderProvider();
     if (message !== null && wasHidden && this.element.classList.contains("is-active")) {
       // Keyboard users reach the button at once; Enter reconnects.
       banner.querySelector<HTMLButtonElement>("button")!.focus({ preventScroll: true });
@@ -243,8 +257,7 @@ export class PanelView {
     const { location } = this.model;
     this.pathInput.value = location?.display ?? "";
     this.pathInput.title = location?.display ?? "";
-    this.element.querySelector<HTMLElement>(".fm-provider")!.textContent =
-      location && location.fs !== "local" ? location.fs.toUpperCase() : "LOCAL";
+    this.renderProvider();
     this.element.classList.toggle("has-perms", this.capabilities.posixPermissions);
     // Owner names come with remote listings; local ones don't have them.
     this.element.classList.toggle(
