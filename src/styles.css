@@ -2441,6 +2441,22 @@ html.theme-starbase .tab-tip {
   position: fixed;
   z-index: 400;
   min-width: 184px;
+  max-height: calc(100vh - 16px);
+  overflow-y: auto;
+}
+.ctx-heading {
+  padding: 8px 9px 3px;
+  color: var(--text-3);
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.35px;
+  text-transform: uppercase;
+}
+.ctx-item__hint {
+  margin-left: auto;
+  padding-left: 14px;
+  color: var(--text-3);
+  font-size: 11px;
 }
 .ctx-item {
   display: flex;

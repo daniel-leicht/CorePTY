@@ -6,7 +6,11 @@ import { escapeHtml } from "./util";
 
 export type MenuItem =
   | "sep"
-  | { label: string; icon?: string; action: () => void; danger?: boolean };
+  /** A section title (not an item: arrows skip it). */
+  | { heading: string }
+  | { label: string; icon?: string; action: () => void; danger?: boolean; hint?: string };
+
+type Action = Extract<MenuItem, { label: string }>;
 
 /** Closes the open menu, listeners included. */
 let closeOpen: (() => void) | null = null;
@@ -18,13 +22,16 @@ export function contextMenu(x: number, y: number, items: MenuItem[]): void {
   menu.className = "ctx-menu pop";
   menu.setAttribute("role", "menu");
   menu.innerHTML = items
-    .map((it) =>
-      it === "sep"
-        ? '<div class="pop__sep" role="separator"></div>'
-        : `<button class="ctx-item ${it.danger ? "danger" : ""}" role="menuitem">${
-            it.icon ? icon(it.icon) : ""
-          }<span>${escapeHtml(it.label)}</span></button>`
-    )
+    .map((it) => {
+      if (it === "sep") return '<div class="pop__sep" role="separator"></div>';
+      if ("heading" in it) {
+        return `<div class="ctx-heading" role="presentation">${escapeHtml(it.heading)}</div>`;
+      }
+      const hint = it.hint ? `<span class="ctx-item__hint">${escapeHtml(it.hint)}</span>` : "";
+      return `<button class="ctx-item ${it.danger ? "danger" : ""}" role="menuitem">${
+        it.icon ? icon(it.icon) : ""
+      }<span>${escapeHtml(it.label)}</span>${hint}</button>`;
+    })
     .join("");
   document.body.appendChild(menu);
   const rect = menu.getBoundingClientRect();
@@ -33,8 +40,7 @@ export function contextMenu(x: number, y: number, items: MenuItem[]): void {
 
   const buttons = Array.from(menu.querySelectorAll<HTMLButtonElement>(".ctx-item"));
   let bi = 0;
-  for (const it of items) {
-    if (it === "sep") continue;
+  for (const it of items.filter((item): item is Action => item !== "sep" && "label" in item)) {
     buttons[bi++].addEventListener("click", () => {
       close(true); // the opener gets focus back first; the action may move it on
       it.action();

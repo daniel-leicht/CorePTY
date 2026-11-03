@@ -168,10 +168,13 @@ export async function promptText(
     selectStem?: boolean;
     /** More controls under the field (e.g. a checkbox). */
     extra?: Node;
+    /** A password: masked, and not trimmed. */
+    secret?: boolean;
   },
   context: DialogContext = {}
 ): Promise<string | null> {
   const { root, input } = field(options.label, options.value, options.hint);
+  if (options.secret) input.type = "password";
   const body = document.createElement("div");
   body.appendChild(root);
   if (options.extra) body.appendChild(options.extra);
@@ -192,7 +195,7 @@ export async function promptText(
     focus: input,
     enterValue: "ok",
   });
-  const value = input.value.trim();
+  const value = options.secret ? input.value : input.value.trim();
   return result === "ok" && value ? value : null;
 }
 

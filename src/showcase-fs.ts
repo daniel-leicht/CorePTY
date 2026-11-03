@@ -22,6 +22,11 @@ interface Job {
 }
 
 const HOME = "C:\\Users\\dev";
+/** A remote host the showcase pretends to have an SFTP session on. */
+export const REMOTE_FS = "sftp:showcase-edge";
+export const REMOTE_CONNECTION = "showcase-edge";
+export const REMOTE_LABEL = "deploy@edge-01.example.net";
+const REMOTE_HOME = "/home/deploy";
 const T0 = 1785516000000; // 31 Jul 2026, the demo's "today"
 
 export class ShowcaseFs {
@@ -58,6 +63,15 @@ export class ShowcaseFs {
     this.file(`${downloads}\\corepty-portable.zip`, 7218432, 1240);
     this.file(`${downloads}\\terminal-themes.png`, 1842205, 800);
     this.file(`${downloads}\\release-notes.txt`, 4821, 600, "CorePTY 0.3.8\n\n- Stabilized terminal UI\n- Installer upgrades\n");
+    // The remote host: POSIX paths.
+    for (const dir of ["/", "/home", REMOTE_HOME, `${REMOTE_HOME}/app`, `${REMOTE_HOME}/app/releases`, "/var", "/var/www", "/var/log"]) {
+      this.dir(dir, 900);
+    }
+    this.file(`${REMOTE_HOME}/.bashrc`, 3771, -2000, "# ~/.bashrc\n");
+    this.file(`${REMOTE_HOME}/app/config.yml`, 1820, 1200, "port: 8080\nworkers: 4\n");
+    this.file(`${REMOTE_HOME}/app/server.log`, 2_480_220, 1310, "started\n");
+    this.file(`${REMOTE_HOME}/deploy.sh`, 940, 1100, "#!/bin/sh\nset -e\n");
+    this.file("/var/www/index.html", 5120, 900, "<!doctype html>\n");
     if (options.bigFolder) {
       const big = "C:\\big";
       this.dir(big);
@@ -73,11 +87,38 @@ export class ShowcaseFs {
   handle(command: string, args: Record<string, unknown> | undefined): unknown {
     const a = (args ?? {}) as Record<string, any>;
     switch (command) {
+      case "sftp_connect":
+      case "sftp_reconnect":
+        return {
+          fs: REMOTE_FS,
+          connectionId: REMOTE_CONNECTION,
+          label: REMOTE_LABEL,
+          home: this.view(REMOTE_HOME),
+          notice: null,
+        };
+      case "sftp_close":
+        return null;
+      case "sftp_sessions":
+        return [{ fs: REMOTE_FS, connectionId: REMOTE_CONNECTION, label: REMOTE_LABEL, users: 1, connected: true }];
+      case "ssh_connections":
+        return [
+          { id: REMOTE_CONNECTION, label: REMOTE_LABEL, host: "edge-01.example.net", port: 22, username: "deploy", users: 1 },
+        ];
       case "fs_capabilities":
+        if (a.fs === REMOTE_FS) {
+          return { trash: false, openNative: false, posixPermissions: true, symlinks: true };
+        }
         return { trash: true, openNative: true, posixPermissions: false, symlinks: true };
       case "fs_home":
+        if (a.fs === REMOTE_FS) return this.view(REMOTE_HOME);
         return this.view(HOME);
       case "fs_roots":
+        if (a.fs === REMOTE_FS) {
+          return [
+            { label: "Home", location: this.view(REMOTE_HOME) },
+            { label: "Filesystem", location: this.view("/") },
+          ];
+        }
         return [
           { label: "Home", location: this.view(HOME) },
           { label: "C:", location: this.view("C:\\") },
@@ -167,7 +208,7 @@ export class ShowcaseFs {
   }
 
   private view(path: string) {
-    return { fs: "local", path: token(path), display: path };
+    return { fs: isPosix(path) ? REMOTE_FS : "local", path: token(path), display: path };
   }
 
   private entry(path: string) {
@@ -181,11 +222,11 @@ export class ShowcaseFs {
       isDirectory: node.dir,
       size: node.dir ? null : node.size,
       modified: node.modified,
-      mode: null,
+      mode: isPosix(path) ? (node.dir ? 0o755 : name.endsWith(".sh") ? 0o750 : 0o644) : null,
       readonly: false,
       hidden: name.startsWith("."),
-      owner: null,
-      group: null,
+      owner: isPosix(path) ? (path.startsWith("/var") ? "www-data" : "deploy") : null,
+      group: isPosix(path) ? "deploy" : null,
       error: null,
     };
   }
@@ -205,6 +246,16 @@ export class ShowcaseFs {
   }
 
   private resolve(input: string, base: string | null): string {
+    if (input.startsWith("/") || (base && isPosix(base))) {
+      const start = input.startsWith("/") ? input : `${base}/${input}`;
+      const parts: string[] = [];
+      for (const part of start.split("/")) {
+        if (part === "" || part === ".") continue;
+        if (part === "..") parts.pop();
+        else parts.push(part);
+      }
+      return this.existingDir(`/${parts.join("/")}`);
+    }
     let path = /^[A-Za-z]:/.test(input) ? input : join(base ?? HOME, input);
     path = path.replace(/\//g, "\\");
     const parts: string[] = [];
@@ -394,7 +445,17 @@ function untoken(value: string): string {
   return value.slice(2);
 }
 
+/** Remote (POSIX) paths start with "/"; the rest are Windows paths. */
+function isPosix(path: string): boolean {
+  return path.startsWith("/");
+}
+
 function parentOf(path: string): string | null {
+  if (isPosix(path)) {
+    if (path === "/") return null;
+    const index = path.lastIndexOf("/");
+    return index === 0 ? "/" : path.slice(0, index);
+  }
   if (/^[A-Za-z]:\\$/.test(path)) return null;
   const index = path.lastIndexOf("\\");
   const parent = path.slice(0, index);
@@ -402,15 +463,17 @@ function parentOf(path: string): string | null {
 }
 
 function nameOf(path: string): string {
-  return path.slice(path.lastIndexOf("\\") + 1);
+  return path.slice(path.lastIndexOf(isPosix(path) ? "/" : "\\") + 1);
 }
 
 function join(folder: string, name: string): string {
-  return folder.endsWith("\\") ? `${folder}${name}` : `${folder}\\${name}`;
+  const separator = isPosix(folder) ? "/" : "\\";
+  return folder.endsWith(separator) ? `${folder}${name}` : `${folder}${separator}${name}`;
 }
 
 function isInside(path: string, folder: string): boolean {
-  return path.startsWith(folder.endsWith("\\") ? folder : `${folder}\\`);
+  const separator = isPosix(folder) ? "/" : "\\";
+  return path.startsWith(folder.endsWith(separator) ? folder : `${folder}${separator}`);
 }
 
 function validName(name: string): string {

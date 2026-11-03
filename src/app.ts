@@ -36,6 +36,8 @@ import {
 } from "./profile";
 import { pasteIntoTerminal } from "./paste";
 import { FileManagerTab } from "./fm/file-manager-tab";
+import type { RemoteTarget } from "./fm/remote";
+import { appRemoteSource, type SshTab } from "./remote-source";
 import type { AppTab } from "./tab";
 
 /** App version, injected at build time by Vite (see vite.config.ts). */
@@ -507,12 +509,31 @@ export class App {
     this.updateStatus();
   }
 
-  newFileManager(initialLocations?: [FsLocationView | undefined, FsLocationView | undefined]): void {
+  newFileManager(
+    initialLocations?: [FsLocationView | undefined, FsLocationView | undefined],
+    openRemote?: { side: 0 | 1; target: RemoteTarget }
+  ): void {
     const tab = new FileManagerTab({
       toast: (message, kind) => this.toast(message, kind),
       initialLocations,
+      remote: this.remoteSource,
+      openRemote,
     });
     this.addTab(tab);
+  }
+
+  /** The file manager's view of the connections: saved ones and SSH tabs'. */
+  private readonly remoteSource = appRemoteSource(() => this.sshTabs());
+
+  private sshTabs(): SshTab[] {
+    const tabs: SshTab[] = [];
+    for (const tab of this.tabs) {
+      if (!(tab instanceof TerminalSession)) continue;
+      const connectionId = tab.info?.connectionId;
+      if (tab.spec?.kind !== "ssh" || !connectionId) continue;
+      tabs.push({ connectionId, title: tab.title, form: tab.spec.form });
+    }
+    return tabs;
   }
 
   private sshOptions(

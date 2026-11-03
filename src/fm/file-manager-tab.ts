@@ -12,6 +12,7 @@ import {
   type FsLocationView,
   type SftpConnectOptions,
   type SftpStatus,
+  type SftpView,
   type TransferKind,
   type TransferRequest,
 } from "../ipc";
@@ -30,6 +31,14 @@ import {
 import { formatFileSize } from "./format";
 import { commandFor, FUNCTION_KEYS, isQuickSearchKey, type FmCommand } from "./keymap";
 import { DRAG_TYPE, PanelView, type PanelHost } from "./panel-view";
+import {
+  isRemote,
+  learn,
+  reloginFor,
+  remoteLabel,
+  type RemoteSource,
+  type RemoteTarget,
+} from "./remote";
 import { TransferQueue } from "./transfer-queue";
 import { openViewer } from "./viewer";
 
@@ -40,6 +49,10 @@ export interface FileManagerOptions {
   toast: (message: string, kind?: "info" | "warn" | "error") => void;
   /** Start here (duplicating a tab) instead of the remembered folders. */
   initialLocations?: [FsLocationView | undefined, FsLocationView | undefined];
+  /** The connections the app knows (for the location menu and logins). */
+  remote?: RemoteSource;
+  /** Open this remote filesystem in a panel on start ("Open SFTP"). */
+  openRemote?: { side: 0 | 1; target: RemoteTarget };
 }
 
 interface Clipboard {
@@ -61,13 +74,6 @@ interface DragPayload {
 /** Shared by every file manager tab, like the OS clipboard. */
 let clipboard: Clipboard | null = null;
 
-/** How to log in again to each remote filesystem (set when one is opened). */
-const logins = new Map<string, SftpConnectOptions>();
-
-/** Remember how `fs` was opened, so a panel can reconnect it after a drop. */
-export function rememberLogin(fs: string, options: SftpConnectOptions): void {
-  logins.set(fs, options);
-}
 
 export class FileManagerTab implements AppTab, PanelHost {
   readonly tabType = "file-manager" as const;
@@ -89,6 +95,12 @@ export class FileManagerTab implements AppTab, PanelHost {
   private readonly panels: [PanelView, PanelView];
   private readonly queue: TransferQueue;
   private readonly initialLocations?: FileManagerOptions["initialLocations"];
+  private readonly remote?: RemoteSource;
+  private readonly openOnStart?: FileManagerOptions["openRemote"];
+  /** Remote filesystems this tab holds a reference to (one each, while a panel shows it). */
+  private readonly acquired = new Set<string>();
+  /** Remote filesystems being opened: held, but no panel shows them yet. */
+  private opening = 0;
   /** Source folder of each queued transfer, refreshed when it ends. */
   private readonly transferSources = new WeakMap<TransferRequest, FsLocationView | null>();
   /** Aborted on dispose: dismisses this tab's dialogs. */
@@ -109,6 +121,8 @@ export class FileManagerTab implements AppTab, PanelHost {
   constructor(options: FileManagerOptions) {
     this.toast = options.toast;
     this.initialLocations = options.initialLocations;
+    this.remote = options.remote;
+    this.openOnStart = options.openRemote;
     this.panels = [new PanelView(this, 0, this.uid), new PanelView(this, 1, this.uid)];
     this.queue = new TransferQueue({
       toast: (message, kind) => this.toast(message, kind),
@@ -195,6 +209,8 @@ export class FileManagerTab implements AppTab, PanelHost {
     for (const [type, listener] of this.windowListeners) window.removeEventListener(type, listener);
     this.windowListeners.length = 0;
     for (const panel of this.panels) panel.dispose();
+    for (const fs of this.acquired) void sftpApi.close(fs).catch(() => undefined);
+    this.acquired.clear();
     this.element.remove();
   }
 
@@ -232,6 +248,7 @@ export class FileManagerTab implements AppTab, PanelHost {
         writeStorage(`${LOCATION_KEY}${panel.side}.${location.fs}`, saved);
       }
     }
+    this.releaseUnused();
     this.onStatusChange?.();
   }
 
@@ -292,25 +309,65 @@ export class FileManagerTab implements AppTab, PanelHost {
 
   locationMenu(panel: PanelView, anchor: HTMLElement): void {
     void (async () => {
-      let roots;
+      const go = (location: FsLocationView) => () =>
+        void panel.navigate(location).then(() => panel.focus());
+      const items: MenuItem[] = [];
+      // This machine.
       try {
-        roots = await fsApi.roots(panel.fs);
+        const roots = await fsApi.roots("local");
+        items.push({ heading: "This PC" });
+        for (const root of roots) {
+          items.push({
+            label: root.label,
+            icon: root.label === "Home" ? "home" : "server",
+            action: go(root.location),
+          });
+        }
+        items.push({ label: "Choose folder…", icon: "folder", action: () => void this.chooseFolder(panel) });
       } catch (error) {
-        this.toast(`Couldn't list locations: ${error}`, "error");
-        return;
+        this.toast(`Couldn't list this PC's drives: ${error}`, "error");
       }
-      const items: MenuItem[] = roots.map((root) => ({
-        label: root.label,
-        icon: root.label === "Home" ? "home" : "server",
-        action: () => void panel.navigate(root.location).then(() => panel.focus()),
-      }));
-      if (panel.fs === "local") {
-        items.push("sep", {
-          label: "Choose folder…",
-          icon: "folder",
-          action: () => void this.chooseFolder(panel),
-        });
+      // The remote filesystem this panel shows.
+      if (isRemote(panel.fs)) {
+        try {
+          const roots = await fsApi.roots(panel.fs);
+          items.push({ heading: remoteLabel(panel.fs) ?? "This server" });
+          for (const root of roots) {
+            items.push({ label: root.label, icon: root.label === "Home" ? "home" : "server", action: go(root.location) });
+          }
+        } catch {
+          // Disconnected: the banner says so.
+        }
       }
+      if (this.remote) {
+        const [live, saved] = await Promise.all([
+          this.remote.live().catch(() => []),
+          this.remote.saved().catch(() => []),
+        ]);
+        if (live.length) {
+          items.push({ heading: "SSH tabs" });
+          for (const each of live) {
+            items.push({
+              label: each.label,
+              hint: each.title,
+              icon: "terminal",
+              action: () => void this.openRemote(panel, { kind: "live", connectionId: each.connectionId }),
+            });
+          }
+        }
+        if (saved.length) {
+          items.push({ heading: "Saved connections" });
+          for (const each of saved) {
+            items.push({
+              label: each.folder ? `${each.folder} / ${each.name}` : each.name,
+              hint: each.label,
+              icon: "server",
+              action: () => void this.openRemote(panel, { kind: "saved", id: each.id }),
+            });
+          }
+        }
+      }
+      if (this.disposed || !items.length) return;
       const bounds = anchor.getBoundingClientRect();
       contextMenu(bounds.left, bounds.bottom + 4, items);
     })();
@@ -352,19 +409,95 @@ export class FileManagerTab implements AppTab, PanelHost {
 
   reconnect(panel: PanelView): void {
     const fs = panel.fs;
-    const login = logins.get(fs);
-    if (!login) {
+    const relogin = reloginFor(fs);
+    if (!relogin) {
       this.toast("Open the connection again to reconnect", "warn");
       return;
     }
     void (async () => {
       try {
+        const login = await relogin();
+        if (!login || this.disposed) return;
         const view = await sftpApi.reconnect(fs, login);
         if (view.notice) this.toast(view.notice, "info");
       } catch (error) {
         this.toast(`Couldn't reconnect: ${error}`, "error");
       }
     })();
+  }
+
+  /** Show a remote filesystem in `panel` (logging in first if it needs to). */
+  private async openRemote(panel: PanelView, target: RemoteTarget): Promise<boolean> {
+    const remote = this.remote;
+    if (!remote) return false;
+    let options: SftpConnectOptions | null;
+    let relogin: () => Promise<SftpConnectOptions | null>;
+    if (target.kind === "live") {
+      options = { connectionId: target.connectionId };
+      relogin = () => remote.relogin(target.connectionId);
+    } else {
+      try {
+        options = await remote.login(target.id);
+      } catch (error) {
+        this.toast(`Couldn't log in: ${error}`, "error");
+        return false;
+      }
+      relogin = () => remote.login(target.id);
+    }
+    if (!options || this.disposed) return false;
+    let view: SftpView;
+    try {
+      view = await sftpApi.connect(options);
+    } catch (error) {
+      this.toast(`Couldn't open SFTP: ${error}`, "error");
+      return false;
+    }
+    if (view.notice) this.toast(view.notice, "info");
+    learn(view, relogin);
+    this.hold(view.fs);
+    if (this.disposed) return false;
+    this.opening += 1;
+    const shown = await panel.navigate(view.home).finally(() => (this.opening -= 1));
+    this.releaseUnused();
+    if (shown && panel === this.active) panel.focus();
+    return shown;
+  }
+
+  /** Keep the reference a successful `sftpApi.connect` took (one per filesystem per tab). */
+  private hold(fs: string): void {
+    if (this.acquired.has(fs) || this.disposed) {
+      void sftpApi.close(fs).catch(() => undefined);
+      return;
+    }
+    this.acquired.add(fs);
+  }
+
+  /** Let go of remote filesystems neither panel shows any more. */
+  private releaseUnused(): void {
+    if (this.opening > 0) return;
+    for (const fs of [...this.acquired]) {
+      if (this.panels.some((panel) => panel.fs === fs)) continue;
+      this.acquired.delete(fs);
+      void sftpApi.close(fs).catch(() => undefined);
+    }
+  }
+
+  /** A remembered or duplicated remote location: share its filesystem if it's still open. */
+  private async acquireExisting(fs: string): Promise<boolean> {
+    if (this.acquired.has(fs)) return true;
+    try {
+      const open = (await sftpApi.sessions()).find((each) => each.fs === fs && each.connected);
+      if (!open || this.disposed) return false;
+      const view = await sftpApi.connect({ connectionId: open.connectionId });
+      if (view.fs !== fs) {
+        void sftpApi.close(view.fs).catch(() => undefined);
+        return false;
+      }
+      this.hold(fs);
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   /** A remote filesystem dropped or came back: show it on its panels. */
@@ -420,8 +553,18 @@ export class FileManagerTab implements AppTab, PanelHost {
     // Both panels at once: an offline remembered share mustn't hold up the other.
     const results = await Promise.all(
       this.panels.map(async (panel) => {
+        if (this.openOnStart?.side === panel.side) {
+          if (await this.openRemote(panel, this.openOnStart.target)) return true;
+          if (this.disposed) return false;
+        }
         const wanted = this.initialLocations?.[panel.side] ?? readLocation(panel.side);
-        if (wanted && (await panel.navigate(wanted, { quiet: true }))) return true;
+        this.opening += 1;
+        try {
+          const usable = wanted && (!isRemote(wanted.fs) || (await this.acquireExisting(wanted.fs)));
+          if (usable && wanted && (await panel.navigate(wanted, { quiet: true }))) return true;
+        } finally {
+          this.opening -= 1;
+        }
         if (this.disposed) return false;
         try {
           return await panel.navigate(await homeFor());
@@ -432,6 +575,7 @@ export class FileManagerTab implements AppTab, PanelHost {
       })
     );
     if (this.disposed) return;
+    this.releaseUnused();
     this.status = results.some(Boolean) ? "connected" : "error";
     this.onStatusChange?.();
     this.focus();
