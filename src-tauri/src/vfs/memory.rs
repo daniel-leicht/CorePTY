@@ -39,6 +39,8 @@ pub struct MemFs {
     reads: AtomicU64,
     lstats: AtomicU64,
     first_read_hook: Mutex<Option<Hook>>,
+    /// The next reader fails after its first chunk (a dropped connection).
+    fail_after_first_chunk: std::sync::atomic::AtomicBool,
 }
 
 impl MemFs {
@@ -122,11 +124,18 @@ impl MemFs {
     pub fn on_first_read(&self, hook: impl Fn() + Send + Sync + 'static) {
         *self.first_read_hook.lock().unwrap() = Some(Arc::new(hook));
     }
+
+    /// Make the next reader fail after handing out its first chunk.
+    pub fn fail_next_read_midway(&self) {
+        self.fail_after_first_chunk.store(true, Ordering::SeqCst);
+    }
 }
 
 struct HookedReader {
     inner: std::io::Cursor<Vec<u8>>,
     hook: Option<Hook>,
+    fail_after_first_chunk: bool,
+    chunks: usize,
 }
 
 impl AsyncRead for HookedReader {
@@ -135,8 +144,15 @@ impl AsyncRead for HookedReader {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
+        if self.fail_after_first_chunk && self.chunks > 0 {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "the connection was lost",
+            )));
+        }
         let polled = Pin::new(&mut self.inner).poll_read(cx, buf);
         if matches!(polled, Poll::Ready(Ok(()))) {
+            self.chunks += 1;
             if let Some(hook) = self.hook.take() {
                 hook();
             }
@@ -361,6 +377,8 @@ impl Vfs for MemFs {
         Ok(Box::pin(HookedReader {
             inner: std::io::Cursor::new(data[start..].to_vec()),
             hook: self.first_read_hook.lock().unwrap().take(),
+            fail_after_first_chunk: self.fail_after_first_chunk.swap(false, Ordering::SeqCst),
+            chunks: 0,
         }))
     }
 

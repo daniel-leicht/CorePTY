@@ -1014,6 +1014,43 @@ mod tests {
         assert!(mine.meta.mode.is_some_and(|mode| mode & 0o400 != 0));
     }
 
+    #[tokio::test]
+    async fn an_interrupted_upload_resumes_on_the_server() {
+        use crate::transfer::engine::{tests::Scripted, Resolution};
+        use crate::vfs::memory::MemFs;
+        let remote_dir = tempdir().unwrap();
+        let Some((sftp, _server)) = local_sftp(remote_dir.path()).await else {
+            return;
+        };
+        let (side, sftp) = sftp_side(sftp);
+        let source = Arc::new(MemFs::new());
+        let data = pattern(3 * 1024 * 1024 + 5);
+        source.add_dir("/up");
+        source.add_file("/up/big.iso", &data);
+        let (sources, home) = ([MemFs::path("/up/big.iso")], at(&sftp, ""));
+        let upload = |resolver: Arc<Scripted>| {
+            engine::run(
+                TransferKind::Copy,
+                engine::memory(&source, "memory"),
+                side.clone(),
+                &sources,
+                &home,
+                resolver,
+            )
+        };
+
+        source.fail_next_read_midway();
+        assert!(upload(engine::no_conflicts()).await.result.is_err());
+        let partial = remote_dir.path().join("big.iso.filepart");
+        let have = fs::read(&partial).unwrap().len();
+        assert!(have > 0 && have < data.len(), "{have}");
+
+        let resumed = upload(Scripted::new(&[(Resolution::Resume, false)])).await;
+        assert_eq!(resumed.result, Ok(()));
+        assert_eq!(fs::read(remote_dir.path().join("big.iso")).unwrap(), data);
+        assert!(!partial.exists());
+    }
+
     #[test]
     fn pipelines_follow_the_server_limits() {
         // No limits given: the size every server must take, many in flight.

@@ -124,6 +124,9 @@ pub struct Conflict {
     pub name: String,
     pub source: ConflictSide,
     pub target: ConflictSide,
+    /// The target is a partial copy left by an earlier, interrupted transfer
+    /// (`<name>.filepart`): the choices are Resume, start over, or skip.
+    pub partial: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -140,6 +143,8 @@ pub enum Resolution {
     OverwriteIfNewer,
     /// Overwrite only when the sizes differ; otherwise skip.
     OverwriteIfDifferentSize,
+    /// Continue a partial copy from where it stopped.
+    Resume,
     Cancel,
 }
 
@@ -272,6 +277,10 @@ pub struct Engine {
     resolver: Arc<dyn ConflictResolver>,
     /// An "apply to all" answer, reused for later conflicts of the same kind.
     sticky: Option<Resolution>,
+    /// The same for partial copies (resume / start over / skip).
+    sticky_partial: Option<Resolution>,
+    /// The last partial-copy answer was "skip".
+    partial_skipped: bool,
     /// Planned totals of every walked folder, for counting renamed subtrees.
     folder_stats: HashMap<VPath, WorkStats>,
     /// Copy buffer, allocated once per job.
@@ -295,6 +304,8 @@ impl Engine {
             cancel,
             resolver,
             sticky: None,
+            sticky_partial: None,
+            partial_skipped: false,
             folder_stats: HashMap::new(),
             buffer: Vec::new(),
         }
@@ -572,8 +583,13 @@ impl Engine {
                         .await
                 }
                 Handling::File => {
-                    self.copy_file(source, &meta, &target, placement == Placement::Overwrite)
+                    let overwrite = placement == Placement::Overwrite;
+                    let copied = self
+                        .copy_file(&name, source, &meta, &target, overwrite)
                         .await?;
+                    if copied == Outcome::Skipped {
+                        return Ok(self.skip(source, &meta));
+                    }
                     self.finish_move(source, &walk).await
                 }
                 Handling::Link | Handling::Skip => unreachable!("handled above"),
@@ -650,6 +666,7 @@ impl Engine {
                         name: name.display(),
                         source: ConflictSide::new(source, meta),
                         target: ConflictSide::new(target, existing),
+                        partial: false,
                     })
                     .await;
                 if answer.apply_to_all {
@@ -671,7 +688,9 @@ impl Engine {
             }
         };
         Ok(match resolution {
-            Resolution::Overwrite => Decision::Overwrite,
+            // Resuming applies to partial copies only; for a name clash it
+            // means replacing what's there.
+            Resolution::Overwrite | Resolution::Resume => Decision::Overwrite,
             Resolution::Skip => Decision::Skip,
             Resolution::Cancel => return Err(TransferError::Cancelled),
             Resolution::OverwriteIfNewer => overwrite_if(matches!(
@@ -831,39 +850,127 @@ impl Engine {
         Ok(true)
     }
 
+    /// Where a file is written before it takes the target's name, and from
+    /// which offset. Big files go to `<name>.filepart` (WinSCP's convention),
+    /// so a copy cut short by a dropped connection can resume; small ones to
+    /// a hidden temporary. `None`: skip the file.
+    async fn staging(
+        &mut self,
+        name: &VName,
+        source: &VPath,
+        meta: &Meta,
+        target: &VPath,
+    ) -> Result<Option<(VPath, u64)>, TransferError> {
+        let size = meta.size.unwrap_or(0);
+        if size < RESUMABLE_SIZE {
+            return Ok(Some((temporary_beside(target, "part")?, 0)));
+        }
+        let partial = partial_beside(target)?;
+        let Some(existing) = self.target_meta(&partial).await? else {
+            return Ok(Some((partial, 0)));
+        };
+        if existing.kind != EntryKind::File {
+            // Not ours to touch (a folder by that name, say).
+            return Ok(Some((temporary_beside(target, "part")?, 0)));
+        }
+        let have = existing.size.unwrap_or(0);
+        let resumable = have > 0 && have < size;
+        let resume = resumable
+            && self
+                .ask_resume(name, source, meta, &partial, &existing)
+                .await?;
+        if resumable && !resume && self.partial_skipped {
+            return Ok(None);
+        }
+        if resume {
+            return Ok(Some((partial, have)));
+        }
+        // Start over: an empty or complete leftover, or the user's choice.
+        self.target
+            .fs
+            .remove(&partial, false)
+            .await
+            .map_err(|e| failed("replace", &partial, e))?;
+        Ok(Some((partial, 0)))
+    }
+
+    /// Resume the partial copy at `partial`? Sets `partial_skipped` when the
+    /// answer was to skip the file altogether.
+    async fn ask_resume(
+        &mut self,
+        name: &VName,
+        source: &VPath,
+        meta: &Meta,
+        partial: &VPath,
+        existing: &Meta,
+    ) -> Result<bool, TransferError> {
+        self.partial_skipped = false;
+        let resolution = match &self.sticky_partial {
+            Some(resolution) => resolution.clone(),
+            None => {
+                let answer = self
+                    .resolver
+                    .resolve(Conflict {
+                        name: name.display(),
+                        source: ConflictSide::new(source, meta),
+                        target: ConflictSide::new(partial, existing),
+                        partial: true,
+                    })
+                    .await;
+                if answer.apply_to_all {
+                    self.sticky_partial = Some(answer.resolution.clone());
+                }
+                answer.resolution
+            }
+        };
+        match resolution {
+            Resolution::Resume => Ok(true),
+            Resolution::Skip => {
+                self.partial_skipped = true;
+                Ok(false)
+            }
+            Resolution::Cancel => Err(TransferError::Cancelled),
+            // Anything else starts the file over.
+            _ => Ok(false),
+        }
+    }
+
+    /// Copy one file; `Skipped` when the user chose to leave it.
     async fn copy_file(
         &mut self,
+        name: &VName,
         source: &VPath,
         meta: &Meta,
         target: &VPath,
         overwrite: bool,
-    ) -> Result<(), TransferError> {
-        let temporary = temporary_beside(target, "part")?;
+    ) -> Result<Outcome, TransferError> {
+        let Some((temporary, offset)) = self.staging(name, source, meta, target).await? else {
+            return Ok(Outcome::Skipped);
+        };
+        let keeps_partial = offset > 0 || is_partial(&temporary);
         let mut buffer = std::mem::take(&mut self.buffer);
         buffer.resize(CHUNK_SIZE, 0);
-        let streamed = self.stream(source, &temporary, &mut buffer).await;
+        let streamed = self.stream(source, &temporary, offset, &mut buffer).await;
         self.buffer = buffer;
-        let result = match streamed {
-            Ok(()) => {
-                if let Some(modified) = meta.modified {
-                    // Best effort: some servers refuse it, and the copy is fine anyway.
-                    let _ = self
-                        .target
-                        .fs
-                        .set_times(&temporary, modified, meta.accessed)
-                        .await;
-                }
-                self.target
-                    .fs
-                    .rename(&temporary, target, overwrite)
-                    .await
-                    .map_err(|e| failed("finish", target, e))
+        if let Err(error) = streamed {
+            // A copy cut short keeps its .filepart to resume; a cancelled one
+            // (and any hidden temporary) is cleaned up.
+            if !keeps_partial || error == TransferError::Cancelled {
+                let _ = self.target.fs.remove(&temporary, false).await;
             }
-            Err(error) => Err(error),
-        };
-        if let Err(error) = result {
-            let _ = self.target.fs.remove(&temporary, false).await;
             return Err(error);
+        }
+        if let Some(modified) = meta.modified {
+            // Best effort: some servers refuse it, and the copy is fine anyway.
+            let _ = self
+                .target
+                .fs
+                .set_times(&temporary, modified, meta.accessed)
+                .await;
+        }
+        if let Err(e) = self.target.fs.rename(&temporary, target, overwrite).await {
+            let _ = self.target.fs.remove(&temporary, false).await;
+            return Err(failed("finish", target, e));
         }
 
         // Permissions last: a read-only file can't have its times set.
@@ -878,33 +985,53 @@ impl Engine {
             let _ = self.target.fs.set_mode(target, mode).await;
         }
         self.counters.add(WorkStats { items: 1, bytes: 0 });
-        Ok(())
+        Ok(Outcome::Done)
     }
 
+    /// Copy `source` into `temporary`, from `offset` on (resuming: the bytes
+    /// before it are already there).
     async fn stream(
         &self,
         source: &VPath,
         temporary: &VPath,
+        offset: u64,
         buffer: &mut [u8],
     ) -> Result<(), TransferError> {
         let mut reader = self
             .source
             .fs
-            .open_read(source, 0)
+            .open_read(source, offset)
             .await
             .map_err(|e| failed("open", source, e))?;
+        let mode = if offset > 0 {
+            WriteMode::Append
+        } else {
+            WriteMode::CreateNew
+        };
         let mut writer = self
             .target
             .fs
-            .open_write(temporary, WriteMode::CreateNew)
+            .open_write(temporary, mode)
             .await
             .map_err(|e| failed("create", temporary, e))?;
+        if offset > 0 {
+            self.counters.add(WorkStats {
+                items: 0,
+                bytes: offset,
+            });
+        }
         loop {
             self.check_cancelled()?;
-            let read = reader
-                .read(buffer)
-                .await
-                .map_err(|e| failed("read", source, e))?;
+            let read = match reader.read(buffer).await {
+                Ok(read) => read,
+                Err(e) => {
+                    // The source went away (a dropped connection): keep
+                    // everything that arrived, which is where a resume
+                    // continues. (Writes land in order, so it's a prefix.)
+                    let _ = writer.shutdown().await;
+                    return Err(failed("read", source, e));
+                }
+            };
             if read == 0 {
                 break;
             }
@@ -939,6 +1066,26 @@ impl Engine {
 /// skipped (their kind is Other).
 fn listed_meta(entry: &Entry) -> Meta {
     entry.meta.clone()
+}
+
+/// Files from this size on are copied via `<name>.filepart` (resumable).
+const RESUMABLE_SIZE: u64 = 1024 * 1024;
+const PARTIAL_SUFFIX: &str = ".filepart";
+
+/// `<name>.filepart` beside the target.
+fn partial_beside(target: &VPath) -> Result<VPath, TransferError> {
+    let folder = target.parent().unwrap_or_else(|| target.clone());
+    let name = target
+        .file_name()
+        .ok_or_else(|| TransferError::Failed(format!("{} has no name", target.display())))?;
+    folder
+        .join(&name.with_suffix(PARTIAL_SUFFIX))
+        .map_err(|e| TransferError::Failed(e.to_string()))
+}
+
+fn is_partial(path: &VPath) -> bool {
+    path.file_name()
+        .is_some_and(|name| name.display().ends_with(PARTIAL_SUFFIX))
 }
 
 /// `.corepty-<uuid>.<what>` in the target's folder (same volume, so the final
@@ -1010,7 +1157,7 @@ pub(crate) mod tests {
         }
     }
 
-    fn memory(fs: &Arc<MemFs>, id: &str) -> Side {
+    pub(crate) fn memory(fs: &Arc<MemFs>, id: &str) -> Side {
         Side {
             id: FsId(id.to_string()),
             fs: fs.clone(),
@@ -1805,5 +1952,147 @@ pub(crate) mod tests {
         assert_eq!(fs::read(copied.join("back_slash")).unwrap(), br"back\slash");
         // Nothing escaped the folder as a path.
         assert_eq!(fs::read_dir(&copied).unwrap().count(), 4);
+    }
+    fn movie(length: usize) -> Vec<u8> {
+        (0..length).map(|i| (i % 251) as u8 + 1).collect()
+    }
+
+    /// A remote folder with one big file; returns its bytes.
+    fn remote_movie(remote: &MemFs) -> Vec<u8> {
+        let data = movie(3 * CHUNK_SIZE + 17);
+        remote.add_dir("/src");
+        remote.add_file("/src/movie.mkv", &data);
+        data
+    }
+
+    async fn download_movie(remote: &Arc<MemFs>, to: &Path, resolver: Arc<Scripted>) -> Run {
+        run(
+            TransferKind::Copy,
+            memory(remote, "sftp:test"),
+            local(),
+            &[MemFs::path("/src/movie.mkv")],
+            &native(to),
+            resolver,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn an_interrupted_big_copy_keeps_its_filepart_and_resumes_from_there() {
+        let remote = Arc::new(MemFs::new());
+        let data = remote_movie(&remote);
+        let local_dir = tempdir().unwrap();
+        // The connection drops after the first chunk.
+        remote.fail_next_read_midway();
+        let first = download_movie(&remote, local_dir.path(), no_conflicts()).await;
+        assert!(first.result.is_err());
+        let partial = local_dir.path().join("movie.mkv.filepart");
+        let have = fs::read(&partial).expect("the partial copy is kept").len();
+        assert_eq!(have, CHUNK_SIZE);
+        assert!(!local_dir.path().join("movie.mkv").exists());
+        // Blank the partial: after resuming, these bytes show it was kept and
+        // appended to, not rewritten.
+        fs::write(&partial, vec![0; have]).unwrap();
+
+        let resolver = Scripted::new(&[(Resolution::Resume, false)]);
+        let second = download_movie(&remote, local_dir.path(), resolver.clone()).await;
+        assert_eq!(second.result, Ok(()));
+        let copied = fs::read(local_dir.path().join("movie.mkv")).unwrap();
+        assert_eq!(copied.len(), data.len());
+        assert!(copied[..have].iter().all(|&byte| byte == 0));
+        assert_eq!(&copied[have..], &data[have..]);
+        assert!(!partial.exists());
+        let asked = resolver.asked.lock().unwrap();
+        assert!(asked[0].partial);
+        assert_eq!(asked[0].target.size, Some(have as u64));
+        // Progress counts the whole file, the resumed part included.
+        assert_eq!(second.counters.snapshot().done.bytes, data.len() as u64);
+    }
+
+    #[tokio::test]
+    async fn starting_over_replaces_a_partial_copy_and_skipping_leaves_it() {
+        let remote = Arc::new(MemFs::new());
+        let data = remote_movie(&remote);
+        let local_dir = tempdir().unwrap();
+        let partial = local_dir.path().join("movie.mkv.filepart");
+
+        fs::write(&partial, vec![0; 1000]).unwrap();
+        let skipped = download_movie(
+            &remote,
+            local_dir.path(),
+            Scripted::new(&[(Resolution::Skip, false)]),
+        )
+        .await;
+        assert_eq!(skipped.result, Ok(()));
+        assert_eq!(skipped.counters.snapshot().skipped, 1);
+        assert_eq!(fs::read(&partial).unwrap().len(), 1000);
+        assert!(!local_dir.path().join("movie.mkv").exists());
+
+        let restarted = download_movie(
+            &remote,
+            local_dir.path(),
+            Scripted::new(&[(Resolution::Overwrite, false)]),
+        )
+        .await;
+        assert_eq!(restarted.result, Ok(()));
+        assert_eq!(fs::read(local_dir.path().join("movie.mkv")).unwrap(), data);
+        assert!(!partial.exists());
+    }
+
+    #[tokio::test]
+    async fn a_leftover_that_cannot_be_resumed_is_replaced_without_asking() {
+        let remote = Arc::new(MemFs::new());
+        let data = remote_movie(&remote);
+        let local_dir = tempdir().unwrap();
+        // As big as the source already: nothing left to resume.
+        fs::write(local_dir.path().join("movie.mkv.filepart"), &data).unwrap();
+        let resolver = no_conflicts();
+        let outcome = download_movie(&remote, local_dir.path(), resolver.clone()).await;
+        assert_eq!(outcome.result, Ok(()));
+        assert!(resolver.asked.lock().unwrap().is_empty());
+        assert_eq!(fs::read(local_dir.path().join("movie.mkv")).unwrap(), data);
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_big_copy_removes_its_filepart() {
+        let remote = Arc::new(MemFs::new());
+        remote_movie(&remote);
+        let local_dir = tempdir().unwrap();
+        let (cancel, receiver) = watch::channel(false);
+        remote.on_first_read(move || {
+            cancel.send_replace(true);
+        });
+        let outcome = run_with(
+            TransferKind::Copy,
+            memory(&remote, "sftp:test"),
+            local(),
+            &[MemFs::path("/src/movie.mkv")],
+            &native(local_dir.path()),
+            no_conflicts(),
+            receiver,
+        )
+        .await;
+        assert_eq!(outcome.result, Err(TransferError::Cancelled));
+        assert_eq!(fs::read_dir(local_dir.path()).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_small_file_cut_short_leaves_nothing_behind() {
+        let remote = Arc::new(MemFs::new());
+        remote.add_dir("/src");
+        remote.add_file("/src/note.txt", b"short");
+        let local_dir = tempdir().unwrap();
+        remote.fail_next_read_midway();
+        let outcome = run(
+            TransferKind::Copy,
+            memory(&remote, "sftp:test"),
+            local(),
+            &[MemFs::path("/src/note.txt")],
+            &native(local_dir.path()),
+            no_conflicts(),
+        )
+        .await;
+        assert!(outcome.result.is_err());
+        assert_eq!(fs::read_dir(local_dir.path()).unwrap().count(), 0);
     }
 }

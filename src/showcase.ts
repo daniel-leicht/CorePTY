@@ -19,10 +19,12 @@ const params = new URLSearchParams(location.search);
 const theme = params.get("theme") ?? "corepty-dark";
 const scene = params.get("scene") ?? "terminal";
 const sessionIds: string[] = [];
-// `?big=N` adds C:\big with N files; `?step=ms` paces simulated transfers.
+// `?big=N` adds C:\big with N files; `?step=ms` paces simulated transfers;
+// `?partial=1` presents clashes as partial copies (the Resume dialog).
 const showcaseFs = new ShowcaseFs({
   bigFolder: Number(params.get("big")) || 0,
   stepMs: Number(params.get("step")) || undefined,
+  partialConflicts: params.get("partial") === "1",
 });
 
 const folders = [

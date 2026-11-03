@@ -303,9 +303,10 @@ function detail(job: Job): string {
     case "planning":
       return "Counting files…";
     case "waiting":
-      return job.question
-        ? `“${job.question.conflict.name}” already exists — waiting for your answer`
-        : "Waiting for your answer…";
+      if (!job.question) return "Waiting for your answer…";
+      return job.question.conflict.partial
+        ? `“${job.question.conflict.name}” was partly copied before — resume it?`
+        : `“${job.question.conflict.name}” already exists — waiting for your answer`;
     case "done":
       return `Done · ${job.completedItems} ${job.completedItems === 1 ? "item" : "items"}${skipped}`;
     case "failed":

@@ -29,9 +29,12 @@ export class ShowcaseFs {
   private readonly jobs = new Map<string, Job>();
   private nextJob = 1;
   private readonly stepMs: number;
+  /** Present every clash as a partial copy (the Resume dialog). */
+  private readonly partialConflicts: boolean;
 
-  constructor(options: { bigFolder?: number; stepMs?: number } = {}) {
+  constructor(options: { bigFolder?: number; stepMs?: number; partialConflicts?: boolean } = {}) {
     this.stepMs = options.stepMs ?? 40;
+    this.partialConflicts = options.partialConflicts ?? false;
     this.dir("C:\\");
     this.dir("C:\\Users");
     this.dir(HOME);
@@ -360,7 +363,7 @@ export class ShowcaseFs {
         event: "conflict",
         id: job.id,
         conflictId,
-        conflict: { name: nameOf(source), source: side(source), target: side(target) },
+        conflict: { name: nameOf(source), source: side(source), target: side(target), partial: this.partialConflicts },
       });
     });
     job.pending = null;

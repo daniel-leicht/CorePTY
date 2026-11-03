@@ -268,6 +268,7 @@ export async function conflictDialog(
   conflict: TransferConflict,
   context: DialogContext = {}
 ): Promise<ConflictAnswer | null> {
+  if (conflict.partial) return partialDialog(conflict, context);
   const body = document.createElement("div");
   body.className = "fm-conflict";
   const newer = isNewer(conflict.source, conflict.target);
@@ -316,6 +317,63 @@ export async function conflictDialog(
     case "rename":
       // Keep both: the backend picks a free "name (copy N)".
       resolution = { action: "rename" };
+      break;
+    case "cancel":
+      resolution = { action: "cancel" };
+      break;
+    default:
+      return null;
+  }
+  return { resolution, applyToAll: applyToAll.checked && resolution.action !== "cancel" };
+}
+
+/**
+ * A partial copy (`<name>.filepart`) is there from a transfer that was cut
+ * short: resume it (the default — nothing is lost), start over, or skip.
+ */
+async function partialDialog(
+  conflict: TransferConflict,
+  context: DialogContext
+): Promise<ConflictAnswer | null> {
+  const have = conflict.target.size ?? 0;
+  const total = conflict.source.size ?? 0;
+  const body = document.createElement("div");
+  body.className = "fm-conflict";
+  body.innerHTML = `
+    <p class="fm-confirm__message"></p>
+    <div class="fm-progress fm-conflict__partial" role="progressbar" aria-valuemin="0" aria-valuemax="100"><span></span></div>
+    <p class="fm-confirm__note"></p>
+    <label class="check"><input type="checkbox" class="fm-conflict__all" /> Do this for all remaining partial copies</label>`;
+  body.querySelector(".fm-confirm__message")!.textContent =
+    `“${conflict.name}” was partly copied before: ${formatFileSize(have)} of ${formatFileSize(total)}.`;
+  body.querySelector(".fm-confirm__note")!.textContent = conflict.target.path;
+  const percent = total ? Math.min(100, Math.round((have / total) * 100)) : 0;
+  body.querySelector<HTMLElement>(".fm-conflict__partial span")!.style.width = `${percent}%`;
+  body.querySelector(".fm-conflict__partial")!.setAttribute("aria-valuenow", String(percent));
+  const applyToAll = body.querySelector<HTMLInputElement>(".fm-conflict__all")!;
+
+  const choice = await modal({
+    ...context,
+    title: "Resume the copy?",
+    className: "fm-confirm fm-conflict-dialog",
+    body,
+    buttons: [
+      { value: "cancel", label: "Cancel transfer" },
+      { value: "skip", label: "Skip" },
+      { value: "overwrite", label: "Start over" },
+      { value: "resume", label: "Resume", kind: "primary" },
+    ],
+  });
+  let resolution: ConflictResolution;
+  switch (choice) {
+    case "resume":
+      resolution = { action: "resume" };
+      break;
+    case "overwrite":
+      resolution = { action: "overwrite" };
+      break;
+    case "skip":
+      resolution = { action: "skip" };
       break;
     case "cancel":
       resolution = { action: "cancel" };

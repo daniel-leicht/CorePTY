@@ -199,6 +199,8 @@ export interface TransferConflict {
   name: string;
   source: ConflictSide;
   target: ConflictSide;
+  /** The target is a partial copy (`<name>.filepart`) from an interrupted transfer. */
+  partial: boolean;
 }
 
 export type ConflictResolution =
@@ -207,6 +209,7 @@ export type ConflictResolution =
   | { action: "rename"; name?: string }
   | { action: "overwrite_if_newer" }
   | { action: "overwrite_if_different_size" }
+  | { action: "resume" }
   | { action: "cancel" };
 
 export interface ConflictAnswer {

@@ -1234,10 +1234,18 @@ button {
 }
 .fm-job {
   display: grid;
-  grid-template-columns: auto minmax(0, 1fr) minmax(80px, 180px) auto;
+  /* icon, text, progress, "Answer…" (when a question waits), cancel/dismiss */
+  grid-template-columns: auto minmax(0, 1fr) minmax(80px, 180px) auto auto;
   align-items: center;
   gap: 10px;
   padding: 6px 8px 6px 11px;
+}
+.fm-job__answer {
+  padding: 4px 10px;
+}
+/* .btn sets display, which would override the hidden attribute. */
+.fm-job__answer[hidden] {
+  display: none;
 }
 .fm-job + .fm-job {
   border-top: 1px solid var(--line-soft);

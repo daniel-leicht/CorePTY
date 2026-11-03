@@ -214,6 +214,22 @@ impl VName {
             .map(|safe| Self::Native(OsString::from(safe)))
     }
 
+    /// This name with `suffix` appended, byte-exact (`movie.mkv.filepart`).
+    pub fn with_suffix(&self, suffix: &str) -> Self {
+        match self {
+            Self::Native(name) => {
+                let mut name = name.clone();
+                name.push(suffix);
+                Self::Native(name)
+            }
+            Self::Posix(bytes) => {
+                let mut bytes = bytes.clone();
+                bytes.extend_from_slice(suffix.as_bytes());
+                Self::Posix(bytes)
+            }
+        }
+    }
+
     /// `report.txt` → `report (copy).txt`, then `report (copy 2).txt`, …
     pub fn with_copy_suffix(&self, number: u32) -> Self {
         let suffix = if number <= 1 {
