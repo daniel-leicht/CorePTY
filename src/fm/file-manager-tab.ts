@@ -44,6 +44,7 @@ import {
 } from "./remote";
 import { TransferQueue } from "./transfer-queue";
 import { openViewer } from "./viewer";
+import { propertiesDialog } from "./properties";
 
 const LOCATION_KEY = "corepty.fm.location.";
 /** Remote files bigger than this ask before downloading to open. */
@@ -312,6 +313,9 @@ export class FileManagerTab implements AppTab, PanelHost {
           action: () => void this.run("deletePermanent"),
         }
       );
+    }
+    if (targets.length) {
+      items.push({ label: "Properties… (Alt+Enter)", icon: "more", action: () => void this.properties(panel) });
     }
     items.push(
       "sep",
@@ -779,6 +783,8 @@ export class FileManagerTab implements AppTab, PanelHost {
         return this.view(panel);
       case "edit":
         return this.edit(panel, model.cursorEntry(), true);
+      case "properties":
+        return this.properties(panel);
       case "copy":
       case "move":
         return this.transferToOther(command);
@@ -837,6 +843,27 @@ export class FileManagerTab implements AppTab, PanelHost {
       await fsApi.openNative({ fs: panel.fs, path: entry.path });
     } catch (error) {
       this.toast(`Couldn't open ${entry.name}: ${error}`, "error");
+    }
+  }
+
+  /** Alt+Enter: size, dates, owner, and (POSIX) permissions of the targets. */
+  private async properties(panel: PanelView): Promise<void> {
+    const entries = panel.model.targets();
+    if (!entries.length || !panel.location) return;
+    try {
+      const changed = await propertiesDialog(
+        {
+          fs: panel.fs,
+          entries,
+          folder: panel.location.display,
+          posix: panel.capabilities.posixPermissions,
+        },
+        this.dialogs
+      );
+      if (changed && !this.disposed) await this.refreshShowing(panel);
+    } catch (error) {
+      this.toast(`Couldn't change the permissions: ${error}`, "error");
+      if (!this.disposed) await this.refreshShowing(panel);
     }
   }
 

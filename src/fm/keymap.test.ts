@@ -41,6 +41,7 @@ describe("keymap", () => {
     ["Shift+F8", "deletePermanent"],
     ["Shift+Delete", "deletePermanent"],
     ["Alt+F1", "locationLeft"],
+    ["Alt+Enter", "properties"],
     ["Alt+F2", "locationRight"],
     ["Ctrl+a", "markAll"],
     ["Ctrl+u", "swapPanels"],

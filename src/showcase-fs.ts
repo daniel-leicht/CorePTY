@@ -96,6 +96,8 @@ export class ShowcaseFs {
           home: this.view(REMOTE_HOME),
           notice: null,
         };
+      case "fs_chmod":
+        return 1;
       case "sftp_close":
       case "fs_edit_resolve":
       case "fs_close_copies":

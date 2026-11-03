@@ -43,6 +43,7 @@ export type FmCommand =
   | "deletePermanent"
   | "locationLeft"
   | "locationRight"
+  | "properties"
   | "clear";
 
 export interface KeyLike {
@@ -75,6 +76,7 @@ export function commandFor(event: KeyLike): FmCommand | null {
     if (event.key === "ArrowRight") return "forward";
     if (event.key === "F1") return "locationLeft";
     if (event.key === "F2") return "locationRight";
+    if (event.key === "Enter") return "properties";
     return null;
   }
 

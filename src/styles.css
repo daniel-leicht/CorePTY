@@ -3927,3 +3927,78 @@ html.theme-starbase .brand {
 html.theme-starbase .side-scroll {
   padding-top: 10px;
 }
+
+/* Properties (Alt+Enter): facts, then the permissions grid tied to octal. */
+.modal.fm-props-dialog {
+  width: 460px;
+}
+.fm-props__facts {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: 6px 16px;
+  margin: 0 0 14px;
+  font-size: 12.5px;
+}
+.fm-props__facts dt {
+  color: var(--text-3);
+}
+.fm-props__facts dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+  color: var(--text-0);
+}
+.fm-perms {
+  padding-top: 12px;
+  border-top: 1px solid var(--line);
+}
+.fm-perms__grid {
+  display: grid;
+  grid-template-columns: max-content repeat(3, 72px);
+  gap: 6px 4px;
+  align-items: center;
+  font-size: 12px;
+}
+.fm-perms__head {
+  color: var(--text-3);
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.35px;
+  text-align: center;
+  text-transform: uppercase;
+}
+.fm-perms__who {
+  padding-right: 10px;
+  color: var(--text-1);
+}
+.fm-perms__cell {
+  display: grid;
+  place-items: center;
+}
+.fm-perms__special {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 14px;
+  margin: 12px 0 10px;
+  font-size: 12px;
+}
+.fm-perms__octal {
+  display: grid;
+  grid-template-columns: max-content 72px minmax(0, 1fr);
+  align-items: center;
+  gap: 10px;
+}
+.fm-perms__octal input {
+  font-family: var(--font-mono);
+}
+.fm-perms__octal input.is-invalid {
+  border-color: #f87171;
+}
+.fm-perms__text {
+  color: var(--text-3);
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+.fm-perms__recursive {
+  margin-top: 10px;
+  font-size: 12px;
+}
