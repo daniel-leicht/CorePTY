@@ -36,6 +36,11 @@ const OPEN_TIMEOUT: Duration = Duration::from_secs(if cfg!(test) { 3 } else { 10
 /// stops answering is declared lost after about (MAX + 1) × INTERVAL = 2 min.
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
 const KEEPALIVE_MAX: usize = 3;
+/// How much a server may send on a channel before we acknowledge it. russh's
+/// 2 MiB (topped up at half) held SFTP downloads to ~1 MiB per round trip:
+/// 23 MB/s at 40 ms. Readers always drain their channels, so a bigger window
+/// costs no memory beyond what each one asked for.
+const WINDOW_SIZE: u32 = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
@@ -233,6 +238,7 @@ impl ConnectionRegistry {
         let config = Arc::new(client::Config {
             keepalive_interval: Some(KEEPALIVE_INTERVAL),
             keepalive_max: KEEPALIVE_MAX,
+            window_size: WINDOW_SIZE,
             preferred: preferred_algorithms(host_keys, &target.host, target.port),
             ..Default::default()
         });

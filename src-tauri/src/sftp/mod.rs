@@ -10,3 +10,6 @@ pub mod protocol;
 
 #[cfg(test)]
 pub(crate) mod testing;
+
+#[cfg(test)]
+mod bench;

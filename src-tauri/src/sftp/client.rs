@@ -77,6 +77,14 @@ pub struct Extensions {
     pub expand_path: bool,
 }
 
+/// What `limits@openssh.com` reports (zero: no limit given).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Limits {
+    pub max_packet: u64,
+    pub max_read: u64,
+    pub max_write: u64,
+}
+
 pub struct SftpClient {
     shared: Arc<Shared>,
     outgoing: mpsc::UnboundedSender<Vec<u8>>,
@@ -428,6 +436,24 @@ impl SftpClient {
             })
             .await?;
         status(reply)
+    }
+
+    /// The largest packets, reads and writes the server accepts.
+    pub async fn limits(&self) -> io::Result<Limits> {
+        let reply = self
+            .send(fx::FXP_EXTENDED, 24, |packet| {
+                packet.bytes(b"limits@openssh.com");
+            })
+            .await?;
+        let Response::ExtendedReply(data) = reply else {
+            return Err(unexpected(reply));
+        };
+        let mut decoder = fx::Decoder::new(&data);
+        Ok(Limits {
+            max_packet: decoder.u64()?,
+            max_read: decoder.u64()?,
+            max_write: decoder.u64()?,
+        })
     }
 }
 

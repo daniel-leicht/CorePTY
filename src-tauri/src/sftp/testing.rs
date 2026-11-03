@@ -76,6 +76,84 @@ pub fn stdio(child: &mut Child) -> impl tokio::io::AsyncRead + tokio::io::AsyncW
     tokio::io::join(stdout, stdin)
 }
 
+/// A real sshd to test against, from the environment (for `#[ignore]` tests
+/// run by hand): `COREPTY_SSHD=host:port`, `COREPTY_SSHD_USER`,
+/// `COREPTY_SSHD_KEY` (an Ed25519/ECDSA private key file) and
+/// `COREPTY_SSHD_DIR` (a scratch folder on the server; tests stay inside it).
+pub struct RealServer {
+    pub host: String,
+    pub port: u16,
+    pub user: String,
+    pub key: String,
+    pub dir: Vec<u8>,
+}
+
+pub fn real_sshd() -> Option<RealServer> {
+    let address = std::env::var("COREPTY_SSHD").ok()?;
+    let (host, port) = address.rsplit_once(':')?;
+    Some(RealServer {
+        host: host.to_string(),
+        port: port.parse().ok()?,
+        user: std::env::var("COREPTY_SSHD_USER").ok()?,
+        key: std::env::var("COREPTY_SSHD_KEY").ok()?,
+        dir: std::env::var("COREPTY_SSHD_DIR").ok()?.into_bytes(),
+    })
+}
+
+/// A TCP relay to `upstream` that delays every chunk by `delay` each way: a
+/// long-distance link (latency without a bandwidth cap).
+pub async fn delayed_relay(
+    upstream: std::net::SocketAddr,
+    delay: std::time::Duration,
+) -> std::net::SocketAddr {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((client, _)) = listener.accept().await {
+            let Ok(server) = tokio::net::TcpStream::connect(upstream).await else {
+                continue;
+            };
+            let _ = client.set_nodelay(true);
+            let _ = server.set_nodelay(true);
+            let (client_read, client_write) = client.into_split();
+            let (server_read, server_write) = server.into_split();
+            for (mut from, mut to) in [
+                (
+                    Box::new(client_read) as Box<dyn tokio::io::AsyncRead + Send + Unpin>,
+                    Box::new(server_write) as Box<dyn tokio::io::AsyncWrite + Send + Unpin>,
+                ),
+                (Box::new(server_read), Box::new(client_write)),
+            ] {
+                let (queue, mut due) =
+                    tokio::sync::mpsc::unbounded_channel::<(tokio::time::Instant, Vec<u8>)>();
+                tokio::spawn(async move {
+                    let mut buffer = vec![0; 256 * 1024];
+                    while let Ok(read) = from.read(&mut buffer).await {
+                        if read == 0 {
+                            break;
+                        }
+                        let at = tokio::time::Instant::now() + delay;
+                        if queue.send((at, buffer[..read].to_vec())).is_err() {
+                            break;
+                        }
+                    }
+                });
+                tokio::spawn(async move {
+                    while let Some((at, data)) = due.recv().await {
+                        tokio::time::sleep_until(at).await;
+                        if to.write_all(&data).await.is_err() {
+                            break;
+                        }
+                    }
+                    let _ = to.shutdown().await;
+                });
+            }
+        }
+    });
+    address
+}
+
 /// An [`SftpFs`] over a local `sftp-server` rooted in `dir`, or `None` (skip)
 /// where there is no server.
 pub async fn local_sftp(dir: &Path) -> Option<(SftpFs, Child)> {

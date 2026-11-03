@@ -6,7 +6,7 @@ use super::{
 };
 use crate::connections::ConnectionLease;
 use crate::sftp::{
-    client::SftpClient,
+    client::{Limits, SftpClient},
     file::{Pipeline, SftpReader, SftpWriter},
     protocol::{self as fx, Attrs, NameEntry},
 };
@@ -39,15 +39,16 @@ impl SftpFs {
     {
         let client = Arc::new(SftpClient::start(stream).await?);
         let home = client.realpath(b".").await?;
-        let pipeline = Pipeline {
-            chunk: 32 * 1024,
-            depth: 16,
+        let limits = if client.extensions.limits {
+            client.limits().await.unwrap_or_default()
+        } else {
+            Limits::default()
         };
         Ok(Self {
             client,
             home,
-            read: pipeline,
-            write: pipeline,
+            read: pipeline_for(limits.max_read),
+            write: pipeline_for(limits.max_write),
             _lease: lease,
         })
     }
@@ -79,6 +80,39 @@ impl SftpFs {
 
     pub fn is_closed(&self) -> bool {
         self.client.is_closed()
+    }
+
+    /// Override the chunk sizes and pipeline depths (benchmarks).
+    #[cfg(test)]
+    pub fn set_pipelines(&mut self, read: Pipeline, write: Pipeline) {
+        self.read = read;
+        self.write = write;
+    }
+
+    #[cfg(test)]
+    pub fn pipelines(&self) -> (Pipeline, Pipeline) {
+        (self.read, self.write)
+    }
+}
+
+/// Every server must take 32 KiB reads and writes (the draft's minimum).
+const SAFE_CHUNK: u64 = 32 * 1024;
+/// OpenSSH takes up to 256 KiB packets; past that, bigger chunks gain nothing.
+const LARGEST_CHUNK: u64 = 255 * 1024;
+/// Bytes kept in flight per open file: enough for a long fast link (more than
+/// the SSH window adds nothing), bounded so memory stays small.
+const IN_FLIGHT: u64 = 8 * 1024 * 1024;
+
+/// Chunk size within the server's limit (`0`: none given, so the safe size),
+/// and as many in flight as make up [`IN_FLIGHT`].
+fn pipeline_for(limit: u64) -> Pipeline {
+    let chunk = match limit {
+        0 => SAFE_CHUNK,
+        limit => limit.min(LARGEST_CHUNK),
+    };
+    Pipeline {
+        chunk: chunk as u32,
+        depth: (IN_FLIGHT / chunk).clamp(4, 256) as usize,
     }
 }
 
@@ -978,6 +1012,32 @@ mod tests {
         assert!(!owner.is_empty(), "{:?}", mine.meta);
         assert!(mine.meta.group.is_some());
         assert!(mine.meta.mode.is_some_and(|mode| mode & 0o400 != 0));
+    }
+
+    #[test]
+    fn pipelines_follow_the_server_limits() {
+        // No limits given: the size every server must take, many in flight.
+        let safe = pipeline_for(0);
+        assert_eq!((safe.chunk, safe.depth), (32 * 1024, 256));
+        // OpenSSH's 255 KiB: capped there, about 8 MiB in flight.
+        let openssh = pipeline_for(261_120);
+        assert_eq!((openssh.chunk, openssh.depth), (255 * 1024, 32));
+        // A server with a small limit is respected.
+        assert_eq!(pipeline_for(16 * 1024).chunk, 16 * 1024);
+        assert_eq!(pipeline_for(1 << 30).chunk, 255 * 1024);
+    }
+
+    #[tokio::test]
+    async fn sftp_server_limits_pick_large_chunks() {
+        let dir = tempdir().unwrap();
+        let Some((sftp, _server)) = local_sftp(dir.path()).await else {
+            return;
+        };
+        let (read, write) = sftp.pipelines();
+        if sftp.client.extensions.limits {
+            assert!(read.chunk > 32 * 1024 && write.chunk > 32 * 1024);
+        }
+        assert!(u64::from(read.chunk) * read.depth as u64 >= 4 * 1024 * 1024);
     }
 
     #[test]
