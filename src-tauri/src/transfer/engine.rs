@@ -996,7 +996,7 @@ pub(crate) mod tests {
         }
     }
 
-    fn local() -> Side {
+    pub(crate) fn local() -> Side {
         Side {
             id: FsId::local(),
             fs: Arc::new(LocalFs),
@@ -1014,8 +1014,8 @@ pub(crate) mod tests {
         VPath::native(path)
     }
 
-    struct Run {
-        result: Result<(), TransferError>,
+    pub(crate) struct Run {
+        pub result: Result<(), TransferError>,
         counters: Arc<Counters>,
     }
 
@@ -1037,7 +1037,7 @@ pub(crate) mod tests {
         Run { result, counters }
     }
 
-    async fn run(
+    pub(crate) async fn run(
         kind: TransferKind,
         source: Side,
         target: Side,
@@ -1058,7 +1058,7 @@ pub(crate) mod tests {
         .await
     }
 
-    fn no_conflicts() -> Arc<Scripted> {
+    pub(crate) fn no_conflicts() -> Arc<Scripted> {
         Scripted::new(&[])
     }
 

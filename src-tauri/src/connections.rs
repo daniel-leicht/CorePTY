@@ -467,7 +467,9 @@ pub(crate) mod tests {
     use tokio::net::TcpListener;
 
     /// A tiny in-process SSH server: password "secret", answers `exec` with
-    /// "ok:<command>", and counts the TCP connections it accepted.
+    /// "ok:<command>", runs a real OpenSSH `sftp-server` for the `sftp`
+    /// subsystem (see [`start_sftp_server`]), and counts the TCP connections
+    /// it accepted.
     pub(crate) struct TestServer {
         pub addr: std::net::SocketAddr,
         pub connections: Arc<AtomicU64>,
@@ -479,6 +481,9 @@ pub(crate) mod tests {
     #[derive(Clone)]
     struct Handler {
         handles: Arc<Mutex<Vec<server::Handle>>>,
+        channels: Arc<Mutex<HashMap<ChannelId, russh::Channel<ServerMsg>>>>,
+        /// Where the `sftp` subsystem runs; `None` refuses SFTP.
+        sftp_root: Option<PathBuf>,
     }
 
     impl server::Handler for Handler {
@@ -498,12 +503,47 @@ pub(crate) mod tests {
 
         async fn channel_open_session(
             &mut self,
-            _channel: russh::Channel<ServerMsg>,
+            channel: russh::Channel<ServerMsg>,
             reply: server::ChannelOpenHandle,
             session: &mut Session,
         ) -> Result<(), Self::Error> {
             self.handles.lock().unwrap().push(session.handle());
+            self.channels.lock().unwrap().insert(channel.id(), channel);
             reply.accept().await;
+            Ok(())
+        }
+
+        async fn subsystem_request(
+            &mut self,
+            channel: ChannelId,
+            name: &str,
+            session: &mut Session,
+        ) -> Result<(), Self::Error> {
+            let taken = self.channels.lock().unwrap().remove(&channel);
+            let binary = crate::sftp::testing::sftp_server();
+            let (Some(open), Some(root), Some(binary), "sftp") =
+                (taken, self.sftp_root.clone(), binary, name)
+            else {
+                session.channel_failure(channel)?;
+                return Ok(());
+            };
+            session.channel_success(channel)?;
+            tokio::spawn(async move {
+                let mut child = crate::sftp::testing::spawn_server(&binary, &root);
+                let mut to_server = child.stdin.take().unwrap();
+                let mut from_server = child.stdout.take().unwrap();
+                let (mut from_client, mut to_client) = tokio::io::split(open.into_stream());
+                let up = async {
+                    let _ = tokio::io::copy(&mut from_client, &mut to_server).await;
+                    drop(to_server); // EOF: sftp-server exits
+                };
+                let down = async {
+                    let _ = tokio::io::copy(&mut from_server, &mut to_client).await;
+                    let _ = tokio::io::AsyncWriteExt::shutdown(&mut to_client).await;
+                };
+                tokio::join!(up, down);
+                let _ = child.wait().await;
+            });
             Ok(())
         }
 
@@ -525,6 +565,15 @@ pub(crate) mod tests {
     }
 
     pub(crate) async fn start_server(key: PrivateKey) -> TestServer {
+        start_with_sftp(key, None).await
+    }
+
+    /// A test server whose `sftp` subsystem serves `root`.
+    pub(crate) async fn start_sftp_server(root: PathBuf) -> TestServer {
+        start_with_sftp(host_key(), Some(root)).await
+    }
+
+    async fn start_with_sftp(key: PrivateKey, sftp_root: Option<PathBuf>) -> TestServer {
         let config = Arc::new(server::Config {
             auth_rejection_time: Duration::from_millis(10),
             inactivity_timeout: None,
@@ -543,6 +592,8 @@ pub(crate) mod tests {
                 let config = config.clone();
                 let handler = Handler {
                     handles: kept.clone(),
+                    channels: Arc::default(),
+                    sftp_root: sftp_root.clone(),
                 };
                 let done = done.clone();
                 tokio::spawn(async move {

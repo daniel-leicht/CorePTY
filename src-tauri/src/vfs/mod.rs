@@ -10,6 +10,7 @@ pub mod local;
 #[cfg(test)]
 pub mod memory;
 mod path;
+pub mod sftp;
 
 pub use path::{VName, VPath};
 
@@ -299,7 +300,6 @@ impl FsRegistry {
             .insert(id, fs);
     }
 
-    #[allow(dead_code)] // Used once remote connections register (Phase 5).
     pub fn unregister(&self, id: &FsId) {
         if !id.is_local() {
             self.filesystems

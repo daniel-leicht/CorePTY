@@ -287,6 +287,36 @@ export const transferApi = {
     invoke<void>("transfer_resolve", { id, conflictId, answer }),
 };
 
+/** Open SFTP on a live SSH connection (`connectionId`), or log in first. */
+export type SftpConnectOptions =
+  | { connectionId: string }
+  | { connectionId?: string; host: string; port: number; username: string; auth: SshAuth };
+
+export interface SftpView {
+  /** The filesystem id to browse (`sftp:<connectionId>`). */
+  fs: string;
+  connectionId: string;
+  label: string;
+  home: FsLocationView;
+  /** e.g. a newly trusted host key. */
+  notice: string | null;
+}
+
+export interface SftpSessionView {
+  fs: string;
+  connectionId: string;
+  label: string;
+  users: number;
+  connected: boolean;
+}
+
+export const sftpApi = {
+  /** Call `close` once for every successful `connect`. */
+  connect: (options: SftpConnectOptions) => invoke<SftpView>("sftp_connect", { options }),
+  close: (fs: string) => invoke<void>("sftp_close", { fs }),
+  sessions: () => invoke<SftpSessionView[]>("sftp_sessions"),
+};
+
 /** Just the addressing fields — views and entries carry extra display data. */
 function plain(location: FsLocation): FsLocation {
   return { fs: location.fs, path: location.path };

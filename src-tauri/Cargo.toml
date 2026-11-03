@@ -28,8 +28,6 @@ async-trait = "0.1.92"
 # the NASM assembler to build on Windows. RSA is intentionally disabled while
 # its pure-Rust implementation is affected by RUSTSEC-2023-0071.
 russh = { version = "0.62.4", default-features = false, features = ["ring", "flate2"] }
-# SFTP protocol over an SSH channel (protocol only: no russh or crypto dependency).
-russh-sftp = "3.0.1"
 # Base (mock) keystore; the real OS backend is selected per-platform below.
 keyring = { version = "3.6.3", default-features = false }
 toml = "1.0.7"
@@ -41,6 +39,8 @@ trash = "5.2.6"
 
 [dev-dependencies]
 tempfile = "3"
+# Tests talk to a real OpenSSH sftp-server process over its stdio.
+tokio = { version = "1.52.3", features = ["process"] }
 # Same version russh uses; generates host keys for the in-process test SSH server.
 rand = "0.10"
 
