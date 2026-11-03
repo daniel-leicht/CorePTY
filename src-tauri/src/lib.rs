@@ -81,6 +81,7 @@ pub fn run() {
             vfs::commands::fs_mkdir,
             vfs::commands::fs_rename,
             vfs::commands::fs_delete,
+            vfs::commands::fs_chmod,
             vfs::commands::fs_trash,
             vfs::commands::fs_open_native,
             vfs::commands::fs_read,

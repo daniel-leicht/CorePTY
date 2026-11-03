@@ -176,6 +176,50 @@ pub async fn fs_delete(
     Ok(())
 }
 
+/// Set POSIX permissions (the Properties dialog). Returns how many entries
+/// changed.
+#[tauri::command]
+pub async fn fs_chmod(
+    registry: State<'_, FsRegistry>,
+    location: Location,
+    mode: u32,
+    recursive: bool,
+) -> Result<u64, String> {
+    let fs = provider(&registry, &location.fs)?;
+    chmod(fs.as_ref(), &location.path, mode & 0o7777, recursive)
+        .await
+        .map_err(|e| failed("change the permissions of", &location.path, e))
+}
+
+/// Apply `mode` to `path`; with `recursive`, to everything inside it too.
+/// Recursively, folders also get `x` wherever `r` is set (so they stay
+/// openable), and links inside are left alone rather than followed out of
+/// the tree.
+pub async fn chmod(fs: &dyn Vfs, path: &VPath, mode: u32, recursive: bool) -> io::Result<u64> {
+    let top = fs.lstat(path).await?;
+    let mut pending = vec![(path.clone(), top, 0_usize)];
+    let mut changed = 0;
+    while let Some((path, meta, depth)) = pending.pop() {
+        if depth > 0 && meta.kind == EntryKind::Symlink {
+            continue;
+        }
+        let folder = meta.is_real_directory();
+        let wanted = if folder && recursive {
+            mode | ((mode & 0o444) >> 2)
+        } else {
+            mode
+        };
+        fs.set_mode(&path, wanted).await?;
+        changed += 1;
+        if folder && recursive {
+            for child in fs.list(&path).await? {
+                pending.push((child.path, child.meta, depth + 1));
+            }
+        }
+    }
+    Ok(changed)
+}
+
 #[tauri::command]
 pub async fn fs_trash(
     registry: State<'_, FsRegistry>,
@@ -322,5 +366,40 @@ mod tests {
                 bytes: 150
             }
         );
+    }
+
+    #[tokio::test]
+    async fn chmod_applies_down_a_folder_and_keeps_folders_openable() {
+        let fs = MemFs::new();
+        fs.add_dir("/site");
+        fs.add_file("/site/index.html", b"<html>");
+        fs.add_dir("/site/css");
+        fs.add_file("/site/css/app.css", b"*{}");
+        // Just the folder.
+        assert_eq!(
+            chmod(&fs, &MemFs::path("/site"), 0o750, false)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            fs.stat(&MemFs::path("/site/index.html"))
+                .await
+                .unwrap()
+                .mode,
+            Some(0o644)
+        );
+        // Everything in it: files get the mode as given.
+        let changed = chmod(&fs, &MemFs::path("/site"), 0o640, true)
+            .await
+            .unwrap();
+        assert_eq!(changed, 4);
+        for file in ["/site/index.html", "/site/css/app.css"] {
+            assert_eq!(
+                fs.stat(&MemFs::path(file)).await.unwrap().mode,
+                Some(0o640),
+                "{file}"
+            );
+        }
     }
 }

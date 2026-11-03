@@ -270,6 +270,9 @@ export const fsApi = {
     invoke<ArrayBuffer>("fs_read", { location: plain(location), offset, length }),
   folderSize: (location: FsLocation) =>
     invoke<FsFolderSize>("fs_dir_size", { location: plain(location) }),
+  /** Set POSIX permissions; `recursive` also inside a folder. Returns how many changed. */
+  chmod: (location: FsLocation, mode: number, recursive = false) =>
+    invoke<number>("fs_chmod", { location: plain(location), mode, recursive }),
 };
 
 export const transferApi = {

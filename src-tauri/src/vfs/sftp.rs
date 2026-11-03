@@ -885,6 +885,40 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn recursive_chmod_on_the_server_keeps_folders_openable_and_skips_links() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("site/css")).unwrap();
+        fs::write(dir.path().join("site/css/app.css"), b"*{}").unwrap();
+        fs::write(dir.path().join("outside.txt"), b"not mine").unwrap();
+        std::os::unix::fs::symlink(dir.path().join("outside.txt"), dir.path().join("site/link"))
+            .unwrap();
+        let Some((sftp, _server)) = local_sftp(dir.path()).await else {
+            return;
+        };
+        let mode = |path: &str| {
+            fs::metadata(dir.path().join(path))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777
+        };
+        let before = mode("outside.txt");
+        crate::vfs::commands::chmod(&sftp, &at(&sftp, "site"), 0o640, true)
+            .await
+            .unwrap();
+        assert_eq!(mode("site/css/app.css"), 0o640);
+        assert_eq!(mode("site/css"), 0o750);
+        assert_eq!(mode("site"), 0o750);
+        assert_eq!(
+            mode("outside.txt"),
+            before,
+            "the link's target is outside the tree"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn links_are_listed_with_their_targets_kind() {
         let dir = tempdir().unwrap();
         fs::create_dir(dir.path().join("folder")).unwrap();
