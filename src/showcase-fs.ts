@@ -97,7 +97,10 @@ export class ShowcaseFs {
           notice: null,
         };
       case "sftp_close":
+      case "fs_close_copies":
         return null;
+      case "fs_open_copy":
+        return { id: "copy-1", path: `C:\Users\dev\AppData\Local\Temp\CorePTY\open\copy-1\${nameOf(untoken(a.location.path))}` };
       case "sftp_sessions":
         return [{ fs: REMOTE_FS, connectionId: REMOTE_CONNECTION, label: REMOTE_LABEL, users: 1, connected: true }];
       case "ssh_connections":

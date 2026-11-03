@@ -268,6 +268,10 @@ export const fsApi = {
     invoke<void>("fs_delete", { locations: locations.map(plain) }),
   trash: (locations: FsLocation[]) => invoke<void>("fs_trash", { locations: locations.map(plain) }),
   openNative: (location: FsLocation) => invoke<void>("fs_open_native", { location: plain(location) }),
+  /** Download a remote file to a temp folder and open it there; `closeCopies` deletes it. */
+  openCopy: (location: FsLocation) =>
+    invoke<{ id: string; path: string }>("fs_open_copy", { location: plain(location) }),
+  closeCopies: (ids: string[]) => invoke<void>("fs_close_copies", { ids }),
   /** Raw bytes `[offset, offset + length)` (at most 4 MiB per call). */
   read: (location: FsLocation, offset: number, length: number) =>
     invoke<ArrayBuffer>("fs_read", { location: plain(location), offset, length }),

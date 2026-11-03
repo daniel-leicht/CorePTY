@@ -8,6 +8,7 @@
 mod broker;
 mod commands;
 mod connections;
+mod edit;
 mod session;
 mod sftp;
 mod store;
@@ -55,6 +56,7 @@ pub fn run() {
         .manage(FsRegistry::default())
         .manage(TransferManager::default())
         .manage(sftp::commands::SftpSessions::default())
+        .manage(edit::OpenedCopies::default())
         .invoke_handler(tauri::generate_handler![
             ping,
             commands::session_create_local,
@@ -83,6 +85,8 @@ pub fn run() {
             vfs::commands::fs_rename,
             vfs::commands::fs_delete,
             vfs::commands::fs_chmod,
+            edit::fs_open_copy,
+            edit::fs_close_copies,
             vfs::commands::fs_trash,
             vfs::commands::fs_open_native,
             vfs::commands::fs_read,

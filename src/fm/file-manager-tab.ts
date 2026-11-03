@@ -44,6 +44,8 @@ import { TransferQueue } from "./transfer-queue";
 import { openViewer } from "./viewer";
 
 const LOCATION_KEY = "corepty.fm.location.";
+/** Remote files bigger than this ask before downloading to open. */
+const LARGE_DOWNLOAD = 100 * 1024 * 1024;
 const SPLIT_KEY = "corepty.files.split";
 
 export interface FileManagerOptions {
@@ -98,6 +100,8 @@ export class FileManagerTab implements AppTab, PanelHost {
   private readonly initialLocations?: FileManagerOptions["initialLocations"];
   private readonly remote?: RemoteSource;
   private readonly openOnStart?: FileManagerOptions["openRemote"];
+  /** Downloaded copies of remote files this tab opened (deleted when it closes). */
+  private readonly copies: string[] = [];
   /** Remote filesystems this tab holds a reference to (one each, while a panel shows it). */
   private readonly acquired = new Set<string>();
   /** Remote filesystems being opened: held, but no panel shows them yet. */
@@ -212,6 +216,7 @@ export class FileManagerTab implements AppTab, PanelHost {
     this.windowListeners.length = 0;
     for (const panel of this.panels) panel.dispose();
     for (const fs of this.acquired) void sftpApi.close(fs).catch(() => undefined);
+    if (this.copies.length) void fsApi.closeCopies(this.copies.splice(0)).catch(() => undefined);
     this.acquired.clear();
     this.element.remove();
   }
@@ -780,11 +785,38 @@ export class FileManagerTab implements AppTab, PanelHost {
   private async edit(panel: PanelView, entry = panel.model.cursorEntry()): Promise<void> {
     if (!entry || entry.isDirectory) return;
     if (!panel.capabilities.openNative) {
-      this.toast("Editing remote files arrives with SFTP support", "info");
+      await this.openCopy(panel, entry);
       return;
     }
     try {
       await fsApi.openNative({ fs: panel.fs, path: entry.path });
+    } catch (error) {
+      this.toast(`Couldn't open ${entry.name}: ${error}`, "error");
+    }
+  }
+
+  /** A remote file: download a copy to a temp folder and open it there. */
+  private async openCopy(panel: PanelView, entry: FsEntry): Promise<void> {
+    const big = (entry.size ?? 0) > LARGE_DOWNLOAD;
+    if (big) {
+      const go = await confirmAction(
+        {
+          title: "Download to open?",
+          message: `“${entry.name}” is ${formatFileSize(entry.size ?? 0)}. It is downloaded to a temporary folder first.`,
+          action: "Download and open",
+        },
+        this.dialogs
+      );
+      if (!go || this.disposed) return;
+    }
+    this.toast(`Opening a copy of ${entry.name}…`, "info");
+    try {
+      const copy = await fsApi.openCopy({ fs: panel.fs, path: entry.path });
+      if (this.disposed) {
+        void fsApi.closeCopies([copy.id]);
+        return;
+      }
+      this.copies.push(copy.id);
     } catch (error) {
       this.toast(`Couldn't open ${entry.name}: ${error}`, "error");
     }
