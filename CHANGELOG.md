@@ -2,6 +2,11 @@
 
 ## 0.4.1 (unreleased)
 
+- Copy-on-select no longer copies an old selection again when you click back
+  into the terminal (on its margin or scrollbar, after switching tabs or
+  windows), overwriting what you had copied elsewhere since; only a selection
+  just made is copied.
+
 Fixes from a review of 0.4.0's remote editing and opening:
 
 - Opening a remote file with `Enter` asks first unless its type is one known

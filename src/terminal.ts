@@ -278,6 +278,12 @@ export class TerminalSession implements AppTab {
     return this.term.hasSelection();
   }
 
+  /** Where the selection is (null: none), to tell one selection from another. */
+  selectionKey(): string | null {
+    const at = this.term.getSelectionPosition();
+    return at ? `${at.start.x},${at.start.y}-${at.end.x},${at.end.y}` : null;
+  }
+
   getSelection(): string {
     return this.term.getSelection();
   }

@@ -1243,14 +1243,46 @@ export class App {
   // ---- terminal stage interactions (clipboard, focus) ---------------------
 
   private setupStageInteractions(): void {
-    this.stageEl.addEventListener("mouseup", () => {
-      if (!settings.copyOnSelect) return;
-      const s = this.active;
-      if (s instanceof TerminalSession && s.hasSelection()) {
+    // Copy-on-select copies what a left-button press in the terminal just
+    // selected (a drag, a double or triple click). A click that leaves an
+    // older selection in place (on the margin or the scrollbar, coming back
+    // to the window, in a program that takes the mouse) copies nothing, so it
+    // never overwrites what was copied elsewhere since.
+    // A press that starts a selection goes through xterm, which clears or
+    // replaces the old one at once; one that misses it leaves it as it was.
+    let press: { session: TerminalSession; before: string | null; touched: boolean } | null = null;
+    this.stageEl.addEventListener(
+      "mousedown",
+      (e) => {
+        const s = this.active;
+        if (e.button !== 0 || !(s instanceof TerminalSession)) {
+          press = null;
+          return;
+        }
+        const current = { session: s, before: s.selectionKey(), touched: false };
+        press = current;
+        // After xterm has handled the press (this listener runs first).
+        setTimeout(() => {
+          if (s.selectionKey() !== current.before) current.touched = true;
+        });
+      },
+      true
+    );
+    // On the window: a drag may end outside the terminal.
+    window.addEventListener(
+      "mouseup",
+      (e) => {
+        const done = press;
+        press = null;
+        if (!done || e.button !== 0 || !settings.copyOnSelect) return;
+        const s = done.session;
+        if (!s.hasSelection()) return;
+        if (!done.touched && s.selectionKey() === done.before) return; // the old selection
         const text = s.getSelection();
         if (text) navigator.clipboard.writeText(text).catch(() => {});
-      }
-    });
+      },
+      true
+    );
 
     this.stageEl.addEventListener("contextmenu", (e) => {
       e.preventDefault();
