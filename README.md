@@ -118,13 +118,21 @@ a security prompt on first launch.
 - Remote files that are opened or edited are downloaded into a per-file folder
   under the system temp directory (on Linux, one only you can enter), marked as
   downloaded on Windows (so SmartScreen and Office's Protected View apply), and
-  deleted when their tab closes, unless the server is missing changes you made:
-  then the copy is kept and you are told where. Opening a remote program or
-  script (or a name with text-reversing characters) asks first, since it would
-  run on this computer; `F4` opens files in an editor and never runs them.
+  deleted when their tab closes, unless they hold changes the server doesn't
+  have (a save that couldn't be uploaded, or edits to a copy opened with
+  `Enter`, which is never uploaded): then the copy is kept and you are told
+  where. Opening a remote file asks first unless its type is one known to be
+  safe to open (text, data, documents without macros, pictures, sound, video,
+  archives), and always when its name holds text-reversing characters: anything
+  else (a program, a script, a shortcut, a type an interpreter handles) could
+  run on this computer. `F4` opens files in an editor and never runs them.
 - Saving an edited file uploads it only after checking that the server's copy
-  didn't change meanwhile, keeps its permissions and owner, writes through links
-  to the file they point at, and never replaces a folder.
+  didn't change meanwhile (an upload of yours that was cut off isn't taken for
+  someone else's change). It keeps the file's permissions (set before any of
+  its contents are written) and owner, writes through links to the file they
+  point at, and doesn't replace a folder. Hard links and extended attributes
+  are kept only when the file is written in place (when its owner would change,
+  its folder takes no new files, or the server won't set permissions).
 - Telnet provides no transport encryption or server authentication. Use it only
   with systems and networks where cleartext access is acceptable.
 
@@ -172,7 +180,7 @@ Within a file-manager panel:
 | `Ctrl+C` / `Ctrl+X` / `Ctrl+V` | Copy, cut, or paste files |
 | `F2` / `Shift+F6` | Rename |
 | `F3` | View a text file or image |
-| `F4` | Edit: a local file opens with its app; a remote one in your editor (Settings › File manager; blank: Notepad on Windows, the default text editor elsewhere), uploaded on every save |
+| `F4` | Edit: a local file opens with its app; a remote one in your editor (Settings › File manager; blank: on Windows the type's editor for documents and pictures, else Notepad; elsewhere the desktop's text editor), uploaded on every save |
 | `F5` / `F6` | Copy or move to the other panel |
 | `F7` | Create a folder |
 | `F8` / `Delete` | Move to Trash or Recycle Bin (delete, after confirmation, on servers) |

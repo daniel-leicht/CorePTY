@@ -121,7 +121,8 @@ export class ShowcaseFs {
       case "sftp_retain":
         return a.fs === REMOTE_FS;
       case "fs_runs_code":
-        return /.(exe|bat|cmd|ps1|vbs|js|msi|lnk|sh|py)$/i.test(String(a.name));
+        // As the app decides: only types known to be safe open without asking.
+        return !/\.(txt|log|md|json|ya?ml|toml|ini|conf|csv|xml|pdf|docx|xlsx|pptx|png|jpe?g|gif|svg|mp3|mp4|zip|gz)$/i.test(String(a.name));
       case "fs_edit":
       case "fs_open_copy":
         return { id: "copy-1", path: `C:\\Users\\dev\\AppData\\Local\\Temp\\CorePTY\\open\\copy-1\\${nameOf(untoken(a.location.path))}` };

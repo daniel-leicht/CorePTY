@@ -111,7 +111,7 @@ export class SettingsDialog {
           </label>
           <div class="settings-section">File manager</div>
           <label class="field">
-            <span class="field__label">Editor for remote files <span class="muted">(F4; blank = the default editor, Notepad on Windows; {file} marks the file)</span></span>
+            <span class="field__label">Editor for remote files <span class="muted">(F4; blank = Notepad or the type's editor on Windows, the default text editor elsewhere; {file} marks the file)</span></span>
             <input data-role="externalEditor" value="${escAttr(s.externalEditor)}" placeholder="e.g. code --wait" spellcheck="false" />
           </label>
         </div>

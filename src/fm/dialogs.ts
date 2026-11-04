@@ -109,7 +109,11 @@ export function modal(options: ModalOptions): Promise<string | null> {
           // relying on the browser's synthesized click.
           event.preventDefault();
           target.click();
-        } else if (!target.matches("textarea") && options.enterValue !== undefined) {
+        } else if (
+          !target.matches("textarea") &&
+          options.enterValue !== undefined &&
+          !buttons.find((button) => button.dataset.value === options.enterValue)?.disabled
+        ) {
           event.preventDefault();
           finish(options.enterValue);
         }
@@ -199,20 +203,31 @@ export async function promptText(
   return result === "ok" && value ? value : null;
 }
 
+export interface ConfirmOptions {
+  title: string;
+  message: string;
+  detail?: string;
+  action: string;
+  /** The other button (default "Cancel"). */
+  cancel?: string;
+  danger?: boolean;
+  /** Focus the other button: Enter doesn't take the action. */
+  safeDefault?: boolean;
+}
+
 export async function confirmAction(
-  options: {
-    title: string;
-    message: string;
-    detail?: string;
-    action: string;
-    /** The other button (default "Cancel"). */
-    cancel?: string;
-    danger?: boolean;
-    /** Focus the other button: Enter doesn't take the action. */
-    safeDefault?: boolean;
-  },
+  options: ConfirmOptions,
   context: DialogContext = {}
 ): Promise<boolean> {
+  return (await confirmChoice(options, context)) === true;
+}
+
+/** Like `confirmAction`, but null when dismissed (Esc, the close button)
+ * rather than answered with the other button. */
+export async function confirmChoice(
+  options: ConfirmOptions,
+  context: DialogContext = {}
+): Promise<boolean | null> {
   const body = document.createElement("div");
   body.innerHTML = `<p class="fm-confirm__message"></p>`;
   body.querySelector("p")!.textContent = options.message;
@@ -235,9 +250,12 @@ export async function confirmAction(
     enterValue: options.safeDefault ? undefined : "ok",
   });
   if (options.safeDefault) {
-    document.querySelector<HTMLButtonElement>('.modal.fm-confirm [data-value="cancel"]')?.focus();
+    // The newest confirmation: others may be open underneath.
+    const dialogs = document.querySelectorAll<HTMLElement>(".modal.fm-confirm");
+    dialogs[dialogs.length - 1]?.querySelector<HTMLButtonElement>('[data-value="cancel"]')?.focus();
   }
-  return (await pending) === "ok";
+  const result = await pending;
+  return result === "ok" ? true : result === "cancel" ? false : null;
 }
 
 /**

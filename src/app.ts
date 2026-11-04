@@ -1323,12 +1323,18 @@ export class App {
   private wireWindowChrome(): void {
     // Edited remote files whose last saves aren't on the server yet: ask first.
     onCloseRequested(async () => {
-      const pending = await fsApi.editsPending().catch(() => [] as string[]);
-      if (!pending.length) return true;
+      const pending = () => fsApi.editsPending().catch(() => []);
+      let edits = await pending();
+      // An upload that's just running gets a moment to finish.
+      for (let wait = 0; edits.length && wait < 6; wait += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 400));
+        edits = await pending();
+      }
+      if (!edits.length) return true;
       return confirmAction({
         title: "Close CorePTY?",
-        message: `Your changes to ${pending.join(", ")} aren't on the server yet.`,
-        detail: "Their copies stay in the temp folder; open them again to upload.",
+        message: `Your changes to ${edits.map((edit) => edit.name).join(", ")} aren't on the server yet. Keep CorePTY open to let them upload.`,
+        detail: `If you close it, the copies stay at ${edits.map((edit) => edit.path).join("; ")}. Opening the file again downloads the server's version, so take your changes from there.`,
         action: "Close anyway",
         cancel: "Keep CorePTY open",
         danger: true,

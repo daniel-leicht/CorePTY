@@ -274,7 +274,7 @@ export const fsApi = {
   /** Delete copies; returns those kept because the server doesn't have all of them. */
   closeCopies: (ids: string[]) => invoke<KeptCopy[]>("fs_close_copies", { ids }),
   /** Edited files whose latest changes aren't on the server yet. */
-  editsPending: () => invoke<string[]>("fs_edits_pending"),
+  editsPending: () => invoke<Array<{ name: string; path: string }>>("fs_edits_pending"),
   /** Whether opening a file of this name may run code on this computer. */
   runsCode: (name: string) => invoke<boolean>("fs_runs_code", { name }),
   /** Edit a remote file: download, open in `editor` (blank: the default editor), upload each save. */
