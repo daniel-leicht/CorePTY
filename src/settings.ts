@@ -20,6 +20,8 @@ export interface Settings {
   bell: "none" | "visual" | "sound";
   /** Auto-adjust unreadable text to a minimum contrast against its cell background. */
   minContrast: "off" | "standard" | "high";
+  /** Command that edits remote files (F4); blank = the default app. `{file}` marks the file. */
+  externalEditor: string;
 }
 
 export const DEFAULTS: Settings = {
@@ -38,6 +40,7 @@ export const DEFAULTS: Settings = {
   // text that a program *intends* to be low-contrast — e.g. Claude Code's grey
   // autosuggest / ghost text — until it's indistinguishable from normal output.
   minContrast: "off",
+  externalEditor: "",
 };
 
 /** Live settings object. Mutated in place so importers see updates. */
@@ -148,6 +151,7 @@ function sanitize(raw: Record<string, unknown>): Partial<Settings> {
   if (raw.bell === "none" || raw.bell === "visual" || raw.bell === "sound") out.bell = raw.bell;
   if (raw.minContrast === "off" || raw.minContrast === "standard" || raw.minContrast === "high")
     out.minContrast = raw.minContrast;
+  if (typeof raw.externalEditor === "string") out.externalEditor = raw.externalEditor;
   return out;
 }
 

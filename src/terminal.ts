@@ -10,6 +10,7 @@ import { icon } from "./icons";
 import { ringBell, termOptions } from "./settings";
 import type { LaunchSpec } from "./spec";
 import { SgrDimFilter } from "./dimfix";
+import { parseOsc7 } from "./osc7";
 import { escapeHtml, uuid } from "./util";
 import type { AppTab, TabStatusInfo } from "./tab";
 
@@ -48,6 +49,11 @@ export class TerminalSession implements AppTab {
   private baseTitle: string;
   /** Latest OSC 0/2 title set by the program, shell prompt, or remote host. */
   osTitle = "";
+  /** The shell's working folder, when it reports it (OSC 7). */
+  cwd: string | null = null;
+  /** The host its shell names in OSC 7 (after an `ssh` inside, another one). */
+  cwdHost: string | null = null;
+  private readonly cwdListeners = new Set<(cwd: string, host: string) => void>();
   /** A manually pinned name. Once set it overrides everything, permanently. */
   private customTitle: string | null = null;
 
@@ -90,6 +96,15 @@ export class TerminalSession implements AppTab {
       this.osTitle = t || "";
       this.onTitleUpdate?.();
     });
+    this.term.parser.registerOscHandler(7, (data) => {
+      const folder = parseOsc7(data);
+      if (folder && (folder.path !== this.cwd || folder.host !== this.cwdHost)) {
+        this.cwd = folder.path;
+        this.cwdHost = folder.host;
+        for (const listener of this.cwdListeners) listener(folder.path, folder.host);
+      }
+      return true;
+    });
     this.term.onBell(() => ringBell(this.element));
     // Scrolling the scrollback (mouse wheel) exposes many rows at once; the WebGL
     // renderer can surface stale/partial cells from earlier in-place redraws
@@ -104,6 +119,12 @@ export class TerminalSession implements AppTab {
 
   get id(): string | null {
     return this.info?.id ?? null;
+  }
+
+  /** Hear about the working folder changing (and its host); returns the unsubscribe. */
+  watchCwd(listener: (cwd: string, host: string) => void): () => void {
+    this.cwdListeners.add(listener);
+    return () => this.cwdListeners.delete(listener);
   }
 
   /**

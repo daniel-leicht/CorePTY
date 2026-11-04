@@ -3,9 +3,11 @@
 import {
   api,
   b64ToBytes,
+  fsApi,
   onData,
   onExit,
   onStatus,
+  type FsLocationView,
   type LocalShell,
   type SavedSession,
   type SshConnectOptions,
@@ -26,7 +28,15 @@ import {
 } from "./settings";
 import { activeTheme, preloadThemeFonts } from "./themes";
 import { escapeHtml, uuid } from "./util";
-import { winClose, winMinimize, winSetDecorations, winStartResize, winToggleMaximize } from "./window";
+import {
+  onCloseRequested,
+  winClose,
+  winMinimize,
+  winSetDecorations,
+  winStartResize,
+  winToggleMaximize,
+} from "./window";
+import { confirmAction } from "./fm/dialogs";
 import {
   applyStoredSecret,
   buildSavedSession,
@@ -34,7 +44,9 @@ import {
   type SecretMutation,
 } from "./profile";
 import { pasteIntoTerminal } from "./paste";
-import { FileManagerTab } from "./file-manager";
+import { FileManagerTab } from "./fm/file-manager-tab";
+import type { RemoteTarget } from "./fm/remote";
+import { appRemoteSource, type SshTab } from "./remote-source";
 import type { AppTab } from "./tab";
 
 /** App version, injected at build time by Vite (see vite.config.ts). */
@@ -101,6 +113,7 @@ export class App {
     this.tree = new ConnectionsTree(this.connectionsEl, {
       onConnect: (s) => void this.connectSaved(s),
       onEdit: (s) => void this.openDialog(s),
+      onOpenSftp: (s) => this.openSftpForSaved(s),
       onNewConnection: (folderId) => void this.openDialog(undefined, { folderId }),
       toast: (m, k) => this.toast(m, k),
     });
@@ -151,7 +164,7 @@ export class App {
               <div class="quick">
                 <button class="quick__btn" id="open-files">
                   <span class="quick__icon">${icon("files")}</span>
-                  <span class="quick__text"><span class="quick__label">File Manager</span><span class="quick__hint">Dual-pane local files</span></span>
+                  <span class="quick__text"><span class="quick__label">File Manager</span><span class="quick__hint">Dual-pane, Commander style</span></span>
                   <span class="quick__go">${icon("plus")}</span>
                 </button>
               </div>
@@ -473,13 +486,14 @@ export class App {
     this.updateStatus();
   }
 
-  async newSsh(form: ConnForm): Promise<void> {
+  /** `connectionId`: reuse that live connection (Duplicate) instead of logging in again. */
+  async newSsh(form: ConnForm, connectionId?: string): Promise<void> {
     const title = form.name || `${form.username}@${form.host}`;
     const session = new TerminalSession("ssh", title, "ssh");
     session.spec = { kind: "ssh", form };
     const { id, cols, rows } = this.beginSession(session);
     try {
-      const info = await api.createSsh(this.sshOptions(form, id, cols, rows));
+      const info = await api.createSsh(this.sshOptions(form, id, cols, rows, connectionId));
       session.attach(info);
     } catch (err) {
       this.byId.delete(id);
@@ -505,15 +519,59 @@ export class App {
     this.updateStatus();
   }
 
-  newFileManager(initialPaths?: [string | undefined, string | undefined]): void {
+  newFileManager(
+    initialLocations?: [FsLocationView | undefined, FsLocationView | undefined],
+    openRemote?: { side: 0 | 1; target: RemoteTarget }
+  ): void {
     const tab = new FileManagerTab({
       toast: (message, kind) => this.toast(message, kind),
-      initialPaths,
+      initialLocations,
+      remote: this.remoteSource,
+      openRemote,
     });
     this.addTab(tab);
   }
 
-  private sshOptions(form: ConnForm, id: string, cols: number, rows: number): SshConnectOptions {
+  /** A file manager tab with this PC on the left and the server on the right. */
+  private openSftp(target: RemoteTarget): void {
+    this.newFileManager(undefined, { side: 1, target });
+  }
+
+  /** "Open SFTP" on a saved connection: on its tab's live connection if one is open. */
+  private openSftpForSaved(saved: SavedSession): void {
+    const live = this.sshTabs().find((tab) => tab.form.id === saved.id);
+    this.openSftp(live ? { kind: "live", connectionId: live.connectionId } : { kind: "saved", id: saved.id });
+  }
+
+  /** The file manager's view of the connections: saved ones and SSH tabs'. */
+  private readonly remoteSource = appRemoteSource(() => this.sshTabs());
+
+  private sshTabs(): SshTab[] {
+    const tabs: SshTab[] = [];
+    for (const tab of this.tabs) {
+      if (!(tab instanceof TerminalSession)) continue;
+      const connectionId = tab.info?.connectionId;
+      // A tab that dropped (or is reconnecting) has no usable connection.
+      if (tab.spec?.kind !== "ssh" || !connectionId || tab.status !== "connected") continue;
+      tabs.push({
+        connectionId,
+        title: tab.title,
+        form: tab.spec.form,
+        cwd: tab.cwd,
+        cwdHost: tab.cwdHost,
+        watchCwd: (listener) => tab.watchCwd(listener),
+      });
+    }
+    return tabs;
+  }
+
+  private sshOptions(
+    form: ConnForm,
+    id: string,
+    cols: number,
+    rows: number,
+    connectionId?: string
+  ): SshConnectOptions {
     const auth =
       form.authType === "key"
         ? { type: "key" as const, keyPath: form.keyPath, passphrase: form.passphrase || undefined }
@@ -527,6 +585,7 @@ export class App {
       cols,
       rows,
       title: form.name || `${form.username}@${form.host}`,
+      connectionId,
     };
   }
 
@@ -537,6 +596,9 @@ export class App {
   private async relaunch(session: TerminalSession): Promise<void> {
     const spec = session.spec;
     if (!spec) return;
+    // Reconnect always logs in afresh (new group memberships, limits and
+    // expired passwords take effect), even if another tab kept the old
+    // connection up; only Duplicate shares it.
     if (session.info) {
       // Await teardown so the old backend session is gone before we spin up its
       // replacement — otherwise the close races the new create().
@@ -556,7 +618,9 @@ export class App {
           session.attach(await api.createLocal({ id, shell: spec.shell, cols, rows }));
         }
       } else if (spec.kind === "ssh") {
-        session.attach(await api.createSsh(this.sshOptions(spec.form, id, cols, rows)));
+        session.attach(
+          await api.createSsh(this.sshOptions(spec.form, id, cols, rows))
+        );
       } else {
         session.attach(await api.createTelnet(this.telnetOptions(spec.form, id, cols, rows)));
       }
@@ -973,6 +1037,14 @@ export class App {
       },
       { label: "Rename…", icon: "pencil", action: () => this.startTabRename(session) },
     ];
+    const connectionId = session instanceof TerminalSession ? session.info?.connectionId : undefined;
+    if (session instanceof TerminalSession && session.spec?.kind === "ssh" && connectionId && session.alive) {
+      items.splice(1, 0, {
+        label: "Open SFTP",
+        icon: "files",
+        action: () => this.openSftp({ kind: "live", connectionId }),
+      });
+    }
     if (session.pinned) {
       items.push({
         label: "Reset name",
@@ -999,13 +1071,13 @@ export class App {
     if (spec.kind === "local") {
       if (spec.elevated) void this.newLocalElevated(spec.shell);
       else void this.newLocal(spec.shell);
-    } else if (spec.kind === "ssh") void this.newSsh(spec.form);
+    } else if (spec.kind === "ssh") void this.newSsh(spec.form, session.info?.connectionId);
     else void this.newTelnet(spec.form);
   }
 
   private duplicateTab(tab: AppTab): void {
     if (tab instanceof TerminalSession) this.duplicateSession(tab);
-    else if (tab instanceof FileManagerTab) this.newFileManager(tab.currentPaths());
+    else if (tab instanceof FileManagerTab) this.newFileManager(tab.currentLocations());
   }
 
   // ---- tab hover tooltip (theme-styled) -----------------------------------
@@ -1249,6 +1321,20 @@ export class App {
   }
 
   private wireWindowChrome(): void {
+    // Edited remote files whose last saves aren't on the server yet: ask first.
+    onCloseRequested(async () => {
+      const pending = await fsApi.editsPending().catch(() => [] as string[]);
+      if (!pending.length) return true;
+      return confirmAction({
+        title: "Close CorePTY?",
+        message: `Your changes to ${pending.join(", ")} aren't on the server yet.`,
+        detail: "Their copies stay in the temp folder; open them again to upload.",
+        action: "Close anyway",
+        cancel: "Keep CorePTY open",
+        danger: true,
+        safeDefault: true,
+      });
+    });
     this.root.querySelectorAll<HTMLButtonElement>(".win-btn[data-win]").forEach((btn) => {
       btn.addEventListener("click", () => {
         const act = btn.dataset.win;

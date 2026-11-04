@@ -45,6 +45,9 @@ pub struct SessionInfo {
     pub id: String,
     pub kind: SessionKind,
     pub title: String,
+    /// SSH sessions: the shared connection the shell runs on.
+    #[serde(rename = "connectionId", skip_serializing_if = "Option::is_none")]
+    pub connection_id: Option<String>,
 }
 
 struct SessionHandle {

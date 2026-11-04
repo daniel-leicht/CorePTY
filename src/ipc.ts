@@ -9,6 +9,8 @@ export interface SessionInfo {
   id: string;
   kind: SessionKind;
   title: string;
+  /** SSH: the shared connection the shell runs on (valid once connected). */
+  connectionId?: string;
 }
 
 /** A local shell id — dynamic per OS (see `api.listShells`); "custom" runs an arbitrary command. */
@@ -46,6 +48,20 @@ export interface SshConnectOptions {
   cols: number;
   rows: number;
   title?: string;
+  /** Open the shell on this connection (no new login) while it is still up. */
+  connectionId?: string;
+}
+
+/** A live SSH connection, shared by terminal tabs and file panels. */
+export interface SshConnectionView {
+  id: string;
+  /** `user@host` (with `:port` when not 22). */
+  label: string;
+  host: string;
+  port: number;
+  username: string;
+  /** Shells and file panels currently using it. */
+  users: number;
 }
 
 export interface TelnetConnectOptions {
@@ -79,74 +95,135 @@ export interface Folder {
   parentId?: string | null;
 }
 
-// ---- provider-neutral file manager ---------------------------------------
+// ---- filesystems (src-tauri/src/vfs) + transfers (src-tauri/src/transfer) ----
 
-export interface FileLocation {
-  provider: "local" | string;
-  /** Human-readable native path. Never use this value for path concatenation. */
+/** A path on a filesystem. `path` is an opaque token: never build or edit it. */
+export interface FsLocation {
+  /** "local", or a remote connection id. */
+  fs: string;
   path: string;
-  /** Opaque provider path passed back to the backend for every operation. */
-  token: string;
 }
 
-export interface FileRoot {
-  label: string;
-  location: FileLocation;
+/** A location plus its human-readable path. Can be passed wherever an FsLocation goes. */
+export interface FsLocationView extends FsLocation {
+  display: string;
 }
 
-export type FileEntryKind = "directory" | "file" | "symlink" | "other";
+export type FsEntryKind = "directory" | "file" | "symlink" | "other";
 
-export interface FileEntry {
+export interface FsEntry {
   name: string;
+  /** Opaque token of this entry's path (pair with the listing's `fs`). */
   path: string;
-  token: string;
-  kind: FileEntryKind;
+  display: string;
+  kind: FsEntryKind;
+  /** True for folders and for links that resolve to a folder. */
   isDirectory: boolean;
   size: number | null;
   /** Milliseconds since the Unix epoch. */
   modified: number | null;
-  hidden: boolean;
+  /** POSIX permission bits, where the filesystem has them. */
+  mode: number | null;
   readonly: boolean;
+  hidden: boolean;
+  owner: string | null;
+  group: string | null;
   /** Set when the entry was listed but could not be inspected. */
   error: string | null;
 }
 
-export interface DirectoryListing {
-  location: FileLocation;
-  parent: FileLocation | null;
-  entries: FileEntry[];
+export interface FsListing {
+  location: FsLocationView;
+  parent: FsLocationView | null;
+  entries: FsEntry[];
 }
 
-export interface FileConflict {
-  name: string;
-  path: string;
-  sameSource: boolean;
+export interface FsRoot {
+  label: string;
+  location: FsLocationView;
 }
 
-export interface FilePreview {
-  name: string;
-  path: string;
-  kind: "text" | "image" | "unavailable";
-  mime: string | null;
-  content: string | null;
-  size: number;
-  truncated: boolean;
-  message: string | null;
+export interface FsCapabilities {
+  trash: boolean;
+  openNative: boolean;
+  posixPermissions: boolean;
+  symlinks: boolean;
 }
 
-export type FileOperationKind = "copy" | "move";
-export type ConflictPolicy = "error" | "replace" | "skip" | "keep_both";
+export interface FsFolderSize {
+  items: number;
+  bytes: number;
+}
 
-export interface FileOperationRequest {
+export type TransferKind = "copy" | "move";
+
+export interface TransferRequest {
+  kind: TransferKind;
+  sources: FsLocation[];
+  /** The folder the sources go into. */
+  destination: FsLocation;
+  /** Give copies the source's permissions (default: yes). */
+  preserveMode?: boolean;
+}
+
+export type TransferState =
+  | "queued"
+  | "planning"
+  | "running"
+  | "waiting_for_user"
+  /** A filesystem it uses is disconnected; it carries on after a reconnect. */
+  | "paused"
+  | "done"
+  | "failed"
+  | "cancelled";
+
+export interface TransferJob {
   id: string;
-  kind: FileOperationKind;
-  sources: string[];
-  destination: string;
-  conflictPolicy: ConflictPolicy;
+  kind: TransferKind;
+  state: TransferState;
+  message: string | null;
+  source: FsLocationView;
+  sourceCount: number;
+  destination: FsLocationView;
+  totalItems: number;
+  totalBytes: number;
+  completedItems: number;
+  completedBytes: number;
+  skippedItems: number;
 }
 
-export type FileOperationEvent =
-  | { event: "started"; id: string }
+export interface ConflictSide {
+  path: string;
+  isDirectory: boolean;
+  size: number | null;
+  modified: number | null;
+}
+
+export interface TransferConflict {
+  name: string;
+  source: ConflictSide;
+  target: ConflictSide;
+  /** The target is a partial copy (`<name>.filepart`) from an interrupted transfer. */
+  partial: boolean;
+}
+
+export type ConflictResolution =
+  | { action: "overwrite" }
+  | { action: "skip" }
+  | { action: "rename"; name?: string }
+  | { action: "overwrite_if_newer" }
+  | { action: "overwrite_if_different_size" }
+  | { action: "resume" }
+  | { action: "cancel" };
+
+export interface ConflictAnswer {
+  resolution: ConflictResolution;
+  applyToAll: boolean;
+}
+
+export type TransferEvent =
+  | { event: "queued"; id: string }
+  | { event: "planning"; id: string }
   | { event: "planned"; id: string; totalItems: number; totalBytes: number }
   | {
       event: "progress";
@@ -156,7 +233,11 @@ export type FileOperationEvent =
       completedBytes: number;
       totalItems: number;
       totalBytes: number;
+      skippedItems: number;
+      bytesPerSecond: number;
+      etaSeconds: number | null;
     }
+  | { event: "conflict"; id: string; conflictId: number; conflict: TransferConflict }
   | {
       event: "finished";
       id: string;
@@ -164,13 +245,140 @@ export type FileOperationEvent =
       completedBytes: number;
       skippedItems: number;
     }
-  | { event: "failed"; id: string; message: string };
+  | { event: "failed"; id: string; message: string }
+  | { event: "cancelled"; id: string }
+  | { event: "paused"; id: string; fs: string; message: string };
 
-export interface FileOperationResult {
-  id: string;
-  completedItems: number;
-  completedBytes: number;
-  skippedItems: number;
+export const fsApi = {
+  capabilities: (fs: string) => invoke<FsCapabilities>("fs_capabilities", { fs }),
+  home: (fs: string) => invoke<FsLocationView>("fs_home", { fs }),
+  roots: (fs: string) => invoke<FsRoot[]>("fs_roots", { fs }),
+  /** Typed input (absolute, `~`, or relative to `base`) → an existing folder. */
+  resolve: (fs: string, input: string, base?: FsLocation) =>
+    invoke<FsLocationView>("fs_resolve", { fs, input, base: base ?? null }),
+  list: (location: FsLocation) => invoke<FsListing>("fs_list", { location: plain(location) }),
+  stat: (location: FsLocation) => invoke<FsEntry>("fs_stat", { location: plain(location) }),
+  mkdir: (parent: FsLocation, name: string) =>
+    invoke<FsLocationView>("fs_mkdir", { parent: plain(parent), name }),
+  /** Rename in place; never replaces an existing entry. */
+  rename: (location: FsLocation, name: string) =>
+    invoke<FsLocationView>("fs_rename", { location: plain(location), name }),
+  /** Permanently delete, folders included. */
+  remove: (locations: FsLocation[]) =>
+    invoke<void>("fs_delete", { locations: locations.map(plain) }),
+  trash: (locations: FsLocation[]) => invoke<void>("fs_trash", { locations: locations.map(plain) }),
+  openNative: (location: FsLocation) => invoke<void>("fs_open_native", { location: plain(location) }),
+  /** Download a remote file to a temp folder and open it there; `closeCopies` deletes it. */
+  openCopy: (location: FsLocation) =>
+    invoke<{ id: string; path: string }>("fs_open_copy", { location: plain(location) }),
+  /** Delete copies; returns those kept because the server doesn't have all of them. */
+  closeCopies: (ids: string[]) => invoke<KeptCopy[]>("fs_close_copies", { ids }),
+  /** Edited files whose latest changes aren't on the server yet. */
+  editsPending: () => invoke<string[]>("fs_edits_pending"),
+  /** Whether opening a file of this name may run code on this computer. */
+  runsCode: (name: string) => invoke<boolean>("fs_runs_code", { name }),
+  /** Edit a remote file: download, open in `editor` (blank: the default editor), upload each save. */
+  edit: (location: FsLocation, editor: string) =>
+    invoke<{ id: string; path: string }>("fs_edit", { location: plain(location), editor: editor || null }),
+  /** Answer an edit conflict: upload over the server's newer file, or keep it. */
+  editResolve: (id: string, overwrite: boolean) => invoke<void>("fs_edit_resolve", { id, overwrite }),
+  onEdit: (cb: (event: EditEvent) => void): Promise<UnlistenFn> =>
+    listen<EditEvent>("fs://edit", (e) => cb(e.payload)),
+  /** Raw bytes `[offset, offset + length)` (at most 4 MiB per call). */
+  read: (location: FsLocation, offset: number, length: number) =>
+    invoke<ArrayBuffer>("fs_read", { location: plain(location), offset, length }),
+  folderSize: (location: FsLocation) =>
+    invoke<FsFolderSize>("fs_dir_size", { location: plain(location) }),
+  /** Turn permission bits on (`set`) and off (`clear`), the rest as each entry has
+   * them; `recursive` also inside a folder. Returns how many changed. */
+  chmod: (location: FsLocation, set: number, clear: number, recursive = false) =>
+    invoke<number>("fs_chmod", { location: plain(location), set, clear, recursive }),
+};
+
+export const transferApi = {
+  /** Queue a copy/move; returns at once. Progress and questions arrive on `onEvent`. */
+  start: (request: TransferRequest, onEvent: (event: TransferEvent) => void) => {
+    const channel = new Channel<TransferEvent>();
+    channel.onmessage = onEvent;
+    return invoke<TransferJob>("transfer_start", {
+      request: {
+        kind: request.kind,
+        sources: request.sources.map(plain),
+        destination: plain(request.destination),
+        preserveMode: request.preserveMode ?? true,
+      },
+      onEvent: channel,
+    });
+  },
+  cancel: (id: string) => invoke<boolean>("transfer_cancel", { id }),
+  list: () => invoke<TransferJob[]>("transfer_list"),
+  resolve: (id: string, conflictId: number, answer: ConflictAnswer) =>
+    invoke<void>("transfer_resolve", { id, conflictId, answer }),
+};
+
+/** Open SFTP on a live SSH connection (`connectionId`), or log in first. */
+export type SftpConnectOptions =
+  | { connectionId: string }
+  | { connectionId?: string; host: string; port: number; username: string; auth: SshAuth };
+
+export interface SftpView {
+  /** The filesystem id to browse (`sftp:<connectionId>`). */
+  fs: string;
+  connectionId: string;
+  label: string;
+  home: FsLocationView;
+  /** e.g. a newly trusted host key. */
+  notice: string | null;
+}
+
+export interface SftpSessionView {
+  fs: string;
+  connectionId: string;
+  label: string;
+  users: number;
+  connected: boolean;
+}
+
+/** Sent when an SFTP filesystem drops or comes back. */
+export interface SftpStatus {
+  fs: string;
+  connected: boolean;
+  message: string | null;
+}
+
+export const sftpApi = {
+  /** Call `close` once for every successful `connect`. */
+  connect: (options: SftpConnectOptions) => invoke<SftpView>("sftp_connect", { options }),
+  /** Carry on with `fs` over a new session: panels and paused jobs continue. */
+  reconnect: (fs: string, options: SftpConnectOptions) =>
+    invoke<SftpView>("sftp_reconnect", { fs, options }),
+  onStatus: (cb: (status: SftpStatus) => void): Promise<UnlistenFn> =>
+    listen<SftpStatus>("sftp://status", (e) => cb(e.payload)),
+  close: (fs: string) => invoke<void>("sftp_close", { fs }),
+  /** One more reference to an open filesystem (false: it isn't open); `close` it later. */
+  retain: (fs: string) => invoke<boolean>("sftp_retain", { fs }),
+  sessions: () => invoke<SftpSessionView[]>("sftp_sessions"),
+};
+
+/** An edited copy kept when its tab closed: the server doesn't have all of it. */
+export interface KeptCopy {
+  name: string;
+  path: string;
+  reason: string;
+}
+
+/** Progress of an edited remote file's saves. */
+export type EditEvent =
+  | { event: "uploading"; id: string; name: string }
+  | { event: "uploaded"; id: string; name: string }
+  | { event: "conflict"; id: string; name: string }
+  | { event: "failed"; id: string; name: string; message: string }
+  /** No more uploads from this copy; it stays at `path`. */
+  | { event: "stopped"; id: string; name: string; path: string; reason: string };
+
+/** Just the addressing fields — views and entries carry extra display data. */
+function plain(location: FsLocation): FsLocation {
+  return { fs: location.fs, path: location.path };
 }
 
 export const api = {
@@ -193,30 +401,10 @@ export const api = {
 
   /** Local shells available on this OS. */
   listShells: () => invoke<ShellInfo[]>("list_local_shells"),
+  /** Live SSH connections (shared by terminal tabs and file panels). */
+  sshConnections: () => invoke<SshConnectionView[]>("ssh_connections"),
   /** Host OS: "windows" | "macos" | "linux" | … */
   hostOs: () => invoke<string>("host_os"),
-
-  filesHome: () => invoke<FileLocation>("files_home"),
-  filesRoots: () => invoke<FileRoot[]>("files_roots"),
-  filesResolve: (path: string, baseToken?: string) =>
-    invoke<FileLocation>("files_resolve", { path, baseToken }),
-  filesList: (token: string) => invoke<DirectoryListing>("files_list", { token }),
-  filesConflicts: (sources: string[], destination: string) =>
-    invoke<FileConflict[]>("files_conflicts", { sources, destination }),
-  filesCreateDirectory: (parent: string, name: string) =>
-    invoke<FileLocation>("files_create_directory", { parent, name }),
-  filesRename: (token: string, name: string) =>
-    invoke<FileLocation>("files_rename", { token, name }),
-  filesTrash: (tokens: string[]) => invoke<void>("files_trash", { tokens }),
-  filesDelete: (tokens: string[]) => invoke<void>("files_delete", { tokens }),
-  filesOpen: (token: string) => invoke<void>("files_open", { token }),
-  filesPreview: (token: string) => invoke<FilePreview>("files_preview", { token }),
-  filesOperate: (request: FileOperationRequest, onMessage: (event: FileOperationEvent) => void) => {
-    const onEvent = new Channel<FileOperationEvent>();
-    onEvent.onmessage = onMessage;
-    return invoke<FileOperationResult>("files_operate", { request, onEvent });
-  },
-  filesCancel: (id: string) => invoke<boolean>("files_cancel", { id }),
 
   secretSet: (id: string, secret: string) => invoke<void>("secret_set", { id, secret }),
   secretGet: (id: string) => invoke<string | null>("secret_get", { id }),

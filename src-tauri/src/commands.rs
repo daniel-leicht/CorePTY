@@ -3,6 +3,7 @@
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use tauri::{AppHandle, State};
 
+use crate::connections::ConnectionRegistry;
 use crate::session::{local, ssh, telnet, SessionInfo, SessionInput, SessionManager};
 
 #[tauri::command]
@@ -36,9 +37,10 @@ pub fn session_create_local_elevated(
 pub fn session_create_ssh(
     app: AppHandle,
     manager: State<SessionManager>,
+    connections: State<ConnectionRegistry>,
     options: ssh::SshOptions,
 ) -> Result<SessionInfo, String> {
-    ssh::connect(app, &manager, options)
+    ssh::connect(app, &manager, &connections, options)
 }
 
 #[tauri::command]

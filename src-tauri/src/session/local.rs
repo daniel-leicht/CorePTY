@@ -117,6 +117,7 @@ pub fn spawn(
         id: id.clone(),
         kind: SessionKind::Local,
         title,
+        connection_id: None,
     };
     let (tx, mut rx) = unbounded_channel::<SessionInput>();
     manager.register(info.clone(), tx);

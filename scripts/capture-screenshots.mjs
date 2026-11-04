@@ -106,6 +106,14 @@ async function main() {
     }
     process.stdout.write(`captured file manager (${Math.round(fileManagerSize / 1024)} KiB)\n`);
 
+    const sftpOutput = join(renderDir, "file-manager-sftp.png");
+    await capture(client, "corepty-dark", sftpOutput, "sftp");
+    const { size: sftpSize } = await stat(sftpOutput);
+    if (sftpSize < 10_000) {
+      throw new Error(`Screenshot looks incomplete: ${sftpOutput} (${sftpSize} bytes)`);
+    }
+    process.stdout.write(`captured file manager with SFTP (${Math.round(sftpSize / 1024)} KiB)\n`);
+
     // Stop the watcher before publishing images into docs/ so it cannot reload
     // a page during a later capture.
     vite.kill();
@@ -116,6 +124,7 @@ async function main() {
     }
     await copyFile(join(renderDir, "theme-corepty-dark.png"), join(docsDir, "screenshot.png"));
     await copyFile(fileManagerOutput, join(docsDir, "file-manager.png"));
+    await copyFile(sftpOutput, join(docsDir, "file-manager-sftp.png"));
     process.stdout.write("updated docs/screenshot.png\n");
   } finally {
     if (client) {

@@ -7,12 +7,20 @@
 #[cfg(windows)]
 mod broker;
 mod commands;
-mod file_manager;
+mod connections;
+mod edit;
 mod session;
+mod sftp;
 mod store;
+mod transfer;
+mod vfs;
 
-use file_manager::FileOperationManager;
+use connections::ConnectionRegistry;
 use session::SessionManager;
+use std::sync::Arc;
+use tauri::{Emitter, Manager};
+use transfer::queue::TransferManager;
+use vfs::FsRegistry;
 
 #[tauri::command]
 fn ping() -> String {
@@ -33,8 +41,24 @@ pub fn run() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .setup(|app| {
+            // A connection the server dropped is reported to the UI, which
+            // marks the tabs and panels using it.
+            let handle = app.handle().clone();
+            app.state::<ConnectionRegistry>()
+                .set_events(Arc::new(move |event| {
+                    let _ = handle.emit("ssh://connection", event);
+                }));
+            // Saves of remote files being edited are reported as they upload.
+            edit::forward_events(app.handle().clone(), &app.state::<edit::OpenedCopies>());
+            Ok(())
+        })
         .manage(SessionManager::default())
-        .manage(FileOperationManager::default())
+        .manage(ConnectionRegistry::default())
+        .manage(FsRegistry::default())
+        .manage(TransferManager::default())
+        .manage(sftp::commands::SftpSessions::default())
+        .manage(edit::OpenedCopies::default())
         .invoke_handler(tauri::generate_handler![
             ping,
             commands::session_create_local,
@@ -48,19 +72,36 @@ pub fn run() {
             commands::session_list,
             commands::list_local_shells,
             commands::host_os,
-            file_manager::files_home,
-            file_manager::files_roots,
-            file_manager::files_resolve,
-            file_manager::files_list,
-            file_manager::files_conflicts,
-            file_manager::files_create_directory,
-            file_manager::files_rename,
-            file_manager::files_trash,
-            file_manager::files_delete,
-            file_manager::files_open,
-            file_manager::files_preview,
-            file_manager::files_operate,
-            file_manager::files_cancel,
+            connections::ssh_connections,
+            sftp::commands::sftp_connect,
+            sftp::commands::sftp_close,
+            sftp::commands::sftp_reconnect,
+            sftp::commands::sftp_retain,
+            sftp::commands::sftp_sessions,
+            vfs::commands::fs_capabilities,
+            vfs::commands::fs_home,
+            vfs::commands::fs_roots,
+            vfs::commands::fs_resolve,
+            vfs::commands::fs_list,
+            vfs::commands::fs_stat,
+            vfs::commands::fs_mkdir,
+            vfs::commands::fs_rename,
+            vfs::commands::fs_delete,
+            vfs::commands::fs_chmod,
+            edit::fs_open_copy,
+            edit::fs_edit,
+            edit::fs_edit_resolve,
+            edit::fs_close_copies,
+            edit::fs_edits_pending,
+            edit::fs_runs_code,
+            vfs::commands::fs_trash,
+            vfs::commands::fs_open_native,
+            vfs::commands::fs_read,
+            vfs::commands::fs_dir_size,
+            transfer::transfer_start,
+            transfer::transfer_cancel,
+            transfer::transfer_list,
+            transfer::transfer_resolve,
             store::secret_set,
             store::secret_get,
             store::secret_delete,

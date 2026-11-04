@@ -1,16 +1,11 @@
-// SSH sessions via `russh` (pure-Rust SSH). Supports password and public-key
-// auth, host-key verification against ~/.ssh/known_hosts (trust-on-first-use),
-// an interactive PTY + shell, live resize, and streamed I/O.
+// SSH terminal sessions: an interactive PTY + shell on a shared connection
+// (see `connections`), with live resize and streamed I/O. Duplicated tabs and
+// file panels can share the same connection instead of logging in again.
 
-use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
-
-use russh::client::{self, AuthResult, Handle};
-use russh::keys::known_hosts::{check_known_hosts_path, learn_known_hosts_path};
-use russh::keys::{load_secret_key, ssh_key, Error as KeysError, PrivateKeyWithHashAlg};
-use russh::ChannelMsg;
+use russh::client::Msg;
+use russh::{Channel, ChannelMsg};
 use serde::Deserialize;
+use std::sync::Arc;
 use tauri::{AppHandle, Manager};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
 use uuid::Uuid;
@@ -18,6 +13,7 @@ use uuid::Uuid;
 use super::{
     emit_data, emit_exit, emit_status, SessionInfo, SessionInput, SessionKind, SessionManager,
 };
+use crate::connections::{ConnectionLease, ConnectionRegistry, HostKeys, SshAuth, SshTarget};
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -35,20 +31,21 @@ pub struct SshOptions {
     pub rows: u16,
     #[serde(default)]
     pub title: Option<String>,
+    /// Open the shell on this connection (no new login) while it is still up;
+    /// otherwise connect as usual.
+    #[serde(default)]
+    pub connection_id: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(tag = "type", rename_all = "camelCase")]
-pub enum SshAuth {
-    Password {
-        password: String,
-    },
-    Key {
-        #[serde(rename = "keyPath")]
-        path: String,
-        #[serde(default)]
-        passphrase: Option<String>,
-    },
+impl SshOptions {
+    fn target(&self) -> SshTarget {
+        SshTarget {
+            host: self.host.clone(),
+            port: self.port,
+            username: self.username.clone(),
+            auth: self.auth.clone(),
+        }
+    }
 }
 
 fn default_port() -> u16 {
@@ -67,6 +64,7 @@ fn default_rows() -> u16 {
 pub fn connect(
     app: AppHandle,
     manager: &SessionManager,
+    registry: &ConnectionRegistry,
     opts: SshOptions,
 ) -> Result<SessionInfo, String> {
     let id = opts
@@ -80,10 +78,22 @@ pub fn connect(
         .title
         .clone()
         .unwrap_or_else(|| format!("{}@{}", opts.username, opts.host));
+    // Share the requested connection if it's still up and goes where this tab
+    // asks to (decided now, so the returned info names the connection the
+    // shell will most likely use).
+    let shared = opts
+        .connection_id
+        .as_deref()
+        .and_then(|connection| registry.attach_to(connection, &opts.target()));
+    let connection_id = shared
+        .as_ref()
+        .map(|lease| lease.id.clone())
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
     let info = SessionInfo {
         id: id.clone(),
         kind: SessionKind::Ssh,
         title,
+        connection_id: Some(connection_id.clone()),
     };
 
     let (tx, rx) = unbounded_channel::<SessionInput>();
@@ -97,8 +107,26 @@ pub fn connect(
 
     let app_task = app.clone();
     let id_task = id.clone();
+    let registry = registry.clone();
     tauri::async_runtime::spawn(async move {
-        match run_session(app_task.clone(), id_task.clone(), opts, rx).await {
+        let progress = |message: String| {
+            emit_status(&app_task, &id_task, "connecting", Some(message));
+        };
+        let keys = HostKeys::user();
+        let opened = open_or_login(&registry, shared, connection_id, &opts, &keys, &progress).await;
+        let result = match opened {
+            Ok((lease, channel)) => {
+                emit_status(&app_task, &id_task, "connected", None);
+                let output = |data: &[u8]| emit_data(&app_task, &id_task, data);
+                let code = drive_shell(channel, rx, &output).await;
+                // The lease is held for the shell's lifetime; the connection
+                // hangs up when no one else uses it.
+                drop(lease);
+                Ok(code)
+            }
+            Err(e) => Err(e),
+        };
+        match result {
             Ok(code) => emit_exit(&app_task, &id_task, code, None),
             Err(e) => {
                 emit_status(&app_task, &id_task, "error", Some(e.clone()));
@@ -111,51 +139,40 @@ pub fn connect(
     Ok(info)
 }
 
-enum Action {
-    Read(Option<ChannelMsg>),
-    Input(Option<SessionInput>),
+/// A shell on the shared connection when there is one, else on a new login
+/// under `connection_id`.
+async fn open_or_login(
+    registry: &ConnectionRegistry,
+    shared: Option<ConnectionLease>,
+    connection_id: String,
+    opts: &SshOptions,
+    host_keys: &HostKeys,
+    progress: &(dyn Fn(String) + Send + Sync),
+) -> Result<(ConnectionLease, Channel<Msg>), String> {
+    let connection_id = match shared {
+        Some(lease) => match open_shell(&lease, opts).await {
+            Ok(channel) => return Ok((lease, channel)),
+            // The connection can't take another session (it died unnoticed,
+            // or the server limits sessions per connection): log in again,
+            // as a new tab would.
+            Err(reason) => {
+                drop(lease);
+                progress(format!("{reason} — logging in again"));
+                Uuid::new_v4().to_string()
+            }
+        },
+        None => connection_id,
+    };
+    let lease = registry
+        .connect(connection_id, &opts.target(), host_keys, progress)
+        .await?;
+    let channel = open_shell(&lease, opts).await?;
+    Ok((lease, channel))
 }
 
-async fn run_session(
-    app: AppHandle,
-    id: String,
-    opts: SshOptions,
-    mut rx: UnboundedReceiver<SessionInput>,
-) -> Result<Option<i32>, String> {
-    let config = Arc::new(client::Config::default());
-    let reject_reason = Arc::new(Mutex::new(None::<String>));
-    let handler = Client {
-        app: app.clone(),
-        id: id.clone(),
-        host: opts.host.clone(),
-        port: opts.port,
-        reject_reason: reject_reason.clone(),
-    };
-
-    let connect_fut = client::connect(config, (opts.host.as_str(), opts.port), handler);
-    let mut session = match tokio::time::timeout(Duration::from_secs(20), connect_fut).await {
-        Err(_) => return Err("connection timed out".to_string()),
-        Ok(Ok(session)) => session,
-        Ok(Err(e)) => {
-            // A rejected host key surfaces here as a generic handshake failure;
-            // prefer the specific reason (changed key / possible MITM / etc.).
-            if let Some(reason) = reject_reason
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .take()
-            {
-                return Err(reason);
-            }
-            return Err(format!("could not connect: {e}"));
-        }
-    };
-
-    authenticate(&mut session, &opts).await?;
-
-    let channel = session
-        .channel_open_session()
-        .await
-        .map_err(|e| format!("failed to open channel: {e}"))?;
+/// A session channel with a PTY and a shell running in it.
+async fn open_shell(lease: &ConnectionLease, opts: &SshOptions) -> Result<Channel<Msg>, String> {
+    let channel = lease.open_session().await?;
     channel
         .request_pty(
             false,
@@ -176,200 +193,257 @@ async fn run_session(
         .request_shell(true)
         .await
         .map_err(|e| format!("shell request failed: {e}"))?;
+    Ok(channel)
+}
 
-    emit_status(&app, &id, "connected", None);
-
-    let mut channel = channel;
-    let mut exit_code: Option<i32> = None;
-    loop {
-        let action = tokio::select! {
-            msg = channel.wait() => Action::Read(msg),
-            input = rx.recv() => Action::Input(input),
-        };
-        match action {
-            Action::Read(Some(ChannelMsg::Data { data })) => emit_data(&app, &id, &data[..]),
-            Action::Read(Some(ChannelMsg::ExtendedData { data, .. })) => {
-                emit_data(&app, &id, &data[..])
-            }
-            Action::Read(Some(ChannelMsg::ExitStatus { exit_status })) => {
-                exit_code = Some(exit_status as i32);
-            }
-            Action::Read(Some(ChannelMsg::Eof))
-            | Action::Read(Some(ChannelMsg::Close))
-            | Action::Read(None) => break,
-            Action::Read(_) => {}
-            Action::Input(Some(SessionInput::Data(bytes))) => {
-                if channel.data(&bytes[..]).await.is_err() {
-                    break;
+/// Run the shell until it exits or the tab closes; returns its exit code.
+async fn drive_shell(
+    channel: Channel<Msg>,
+    mut rx: UnboundedReceiver<SessionInput>,
+    output: &(dyn Fn(&[u8]) + Send + Sync),
+) -> Option<i32> {
+    // Keystrokes go out from their own task: a write waiting for window space
+    // must never stop this loop from reading, or the unread backlog stalls
+    // the whole shared connection (every tab and file panel on it).
+    let (mut reader, writer) = channel.split();
+    let writer = Arc::new(writer);
+    let mut input = tokio::spawn({
+        let writer = writer.clone();
+        async move {
+            while let Some(message) = rx.recv().await {
+                match message {
+                    SessionInput::Data(bytes) => {
+                        if writer.data(&bytes[..]).await.is_err() {
+                            break;
+                        }
+                    }
+                    SessionInput::Resize { cols, rows } => {
+                        let _ = writer.window_change(cols as u32, rows as u32, 0, 0).await;
+                    }
+                    SessionInput::Close => break,
                 }
             }
-            Action::Input(Some(SessionInput::Resize { cols, rows })) => {
-                let _ = channel.window_change(cols as u32, rows as u32, 0, 0).await;
-            }
-            Action::Input(Some(SessionInput::Close)) | Action::Input(None) => break,
+        }
+    });
+    let mut exit_code: Option<i32> = None;
+    loop {
+        tokio::select! {
+            message = reader.wait() => match message {
+                Some(ChannelMsg::Data { data }) => output(&data[..]),
+                Some(ChannelMsg::ExtendedData { data, .. }) => output(&data[..]),
+                Some(ChannelMsg::ExitStatus { exit_status }) => {
+                    exit_code = Some(exit_status as i32);
+                }
+                Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) | None => break,
+                Some(_) => {}
+            },
+            // The tab closed (or its input ended).
+            _ = &mut input => break,
         }
     }
+    input.abort();
 
-    let _ = channel.eof().await;
-    Ok(exit_code)
-}
-
-async fn authenticate(session: &mut Handle<Client>, opts: &SshOptions) -> Result<(), String> {
-    match &opts.auth {
-        SshAuth::Password { password } => {
-            let result = session
-                .authenticate_password(opts.username.as_str(), password.as_str())
-                .await
-                .map_err(|e| format!("authentication error: {e}"))?;
-            if !matches!(result, AuthResult::Success) {
-                return Err("authentication failed — check the username and password".into());
-            }
-        }
-        SshAuth::Key { path, passphrase } => {
-            let key = load_secret_key(path, passphrase.as_deref())
-                .map_err(|e| format!("could not load private key: {e}"))?;
-            ensure_safe_private_key_algorithm(key.algorithm())?;
-            let key = PrivateKeyWithHashAlg::new(Arc::new(key), None);
-            let result = session
-                .authenticate_publickey(opts.username.as_str(), key)
-                .await
-                .map_err(|e| format!("authentication error: {e}"))?;
-            if !matches!(result, AuthResult::Success) {
-                return Err("key rejected by server — is the public key installed?".into());
-            }
-        }
-    }
-    Ok(())
-}
-
-fn ensure_safe_private_key_algorithm(algorithm: ssh_key::Algorithm) -> Result<(), String> {
-    if algorithm.is_rsa() {
-        return Err(
-            "RSA private keys are disabled because the available implementation has an \
-             unresolved timing-side-channel advisory; use an Ed25519 or ECDSA key"
-                .into(),
-        );
-    }
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Host-key verification (known_hosts, trust-on-first-use)
-// ---------------------------------------------------------------------------
-
-struct Client {
-    app: AppHandle,
-    id: String,
-    host: String,
-    port: u16,
-    /// Set when we reject the server's host key, so the connect error carries the
-    /// specific reason instead of russh's generic handshake failure.
-    reject_reason: Arc<Mutex<Option<String>>>,
-}
-
-impl client::Handler for Client {
-    type Error = russh::Error;
-
-    async fn check_server_key(
-        &mut self,
-        server_public_key: &ssh_key::PublicKey,
-    ) -> Result<bool, Self::Error> {
-        match verify_host_key(
-            &self.app,
-            &self.id,
-            &self.host,
-            self.port,
-            server_public_key,
-        ) {
-            Ok(()) => Ok(true),
-            Err(reason) => {
-                *self.reject_reason.lock().unwrap_or_else(|p| p.into_inner()) = Some(reason);
-                Ok(false)
-            }
-        }
-    }
-}
-
-/// Decide whether to trust the server's host key. `Ok(())` trusts it; `Err(reason)`
-/// rejects it and carries a user-facing reason (so it isn't lost as a generic
-/// handshake error). Fails closed on anything it cannot positively verify.
-fn verify_host_key(
-    app: &AppHandle,
-    id: &str,
-    host: &str,
-    port: u16,
-    key: &ssh_key::PublicKey,
-) -> Result<(), String> {
-    let Some(path) = known_hosts_file() else {
-        // No home directory → nowhere to anchor trust. Fail closed rather than
-        // blindly accept a host key we can never verify against anything.
-        return Err("cannot locate ~/.ssh/known_hosts to verify the host key — refused".into());
-    };
-    match check_known_hosts_path(host, port, key, &path) {
-        Ok(true) => Ok(()),
-        Ok(false) => {
-            // First time we've seen this host: trust on first use and record it,
-            // surfacing the fingerprint so the user can at least eyeball it.
-            if let Some(directory) = path.parent() {
-                std::fs::create_dir_all(directory).map_err(|e| {
-                    format!("could not prepare the SSH host-key store — refused ({e})")
-                })?;
-            }
-            require_host_key_persisted(learn_known_hosts_path(host, port, key, &path))?;
-            let fp = key.fingerprint(ssh_key::HashAlg::Sha256);
-            emit_status(
-                app,
-                id,
-                "connecting",
-                Some(format!("new host key trusted — {fp}")),
-            );
-            Ok(())
-        }
-        Err(KeysError::KeyChanged { .. }) => {
-            Err("host key has CHANGED since last connect — refused (possible MITM)".into())
-        }
-        // An unexpected error (unreadable / corrupt known_hosts, etc.): fail
-        // closed — never silently trust a key we could not verify.
-        Err(e) => Err(format!("could not verify the host key — refused ({e})")),
-    }
-}
-
-fn require_host_key_persisted<E: std::fmt::Display>(result: Result<(), E>) -> Result<(), String> {
-    result.map_err(|e| format!("could not record the new host key — refused ({e})"))
-}
-
-fn home_dir() -> Option<PathBuf> {
-    std::env::var_os("USERPROFILE")
-        .or_else(|| std::env::var_os("HOME"))
-        .map(PathBuf::from)
-}
-
-fn known_hosts_file() -> Option<PathBuf> {
-    home_dir().map(|h| h.join(".ssh").join("known_hosts"))
+    // Close the channel, not just EOF: on a shared connection nothing else
+    // ends it, and sshd keeps a PTY shell running after EOF.
+    let _ = writer.eof().await;
+    let _ = writer.close().await;
+    exit_code
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{ensure_safe_private_key_algorithm, require_host_key_persisted};
-    use russh::keys::ssh_key::{Algorithm, HashAlg};
+    use super::*;
+    use crate::connections::tests::{start_with, temp_host_keys, ServerOptions, TestServer};
+    use std::sync::{atomic::Ordering, Mutex};
+    use std::time::Duration;
+    use tokio::sync::mpsc::UnboundedSender;
 
-    #[test]
-    fn unknown_host_is_rejected_when_its_key_cannot_be_recorded() {
-        let result = require_host_key_persisted::<&str>(Err("read-only file"));
-        assert_eq!(
-            result.unwrap_err(),
-            "could not record the new host key — refused (read-only file)"
-        );
+    fn options(server: &TestServer) -> SshOptions {
+        SshOptions {
+            id: None,
+            host: "127.0.0.1".into(),
+            port: server.addr.port(),
+            username: "tester".into(),
+            auth: SshAuth::Password {
+                password: "secret".into(),
+            },
+            cols: 80,
+            rows: 24,
+            title: None,
+            connection_id: None,
+        }
     }
 
-    #[test]
-    fn rsa_private_keys_are_rejected_until_the_timing_advisory_is_resolved() {
-        let rsa = Algorithm::Rsa {
-            hash: Some(HashAlg::Sha256),
-        };
-        assert!(ensure_safe_private_key_algorithm(rsa)
-            .unwrap_err()
-            .contains("timing-side-channel"));
-        assert!(ensure_safe_private_key_algorithm(Algorithm::Ed25519).is_ok());
+    async fn eventually(condition: impl FnMut() -> bool) -> bool {
+        within(Duration::from_secs(3), condition).await
+    }
+
+    async fn within(limit: Duration, mut condition: impl FnMut() -> bool) -> bool {
+        let deadline = tokio::time::Instant::now() + limit;
+        while tokio::time::Instant::now() < deadline {
+            if condition() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        condition()
+    }
+
+    /// A tab: its shell runs in the background; `output` collects what it shows.
+    struct Tab {
+        input: UnboundedSender<SessionInput>,
+        output: Arc<Mutex<Vec<u8>>>,
+        done: tokio::task::JoinHandle<Option<i32>>,
+    }
+
+    fn run_tab(channel: Channel<Msg>) -> Tab {
+        let (input, rx) = unbounded_channel();
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let shown = output.clone();
+        let done = tokio::spawn(async move {
+            let sink = move |data: &[u8]| shown.lock().unwrap().extend_from_slice(data);
+            drive_shell(channel, rx, &sink).await
+        });
+        Tab {
+            input,
+            output,
+            done,
+        }
+    }
+
+    #[tokio::test]
+    async fn closing_a_tab_closes_its_channel_and_leaves_the_shared_connection_up() {
+        let server = start_with(ServerOptions::default()).await;
+        let keys = tempfile::tempdir().unwrap();
+        let registry = ConnectionRegistry::default();
+        let opts = options(&server);
+        let (first, shell) = open_or_login(
+            &registry,
+            None,
+            "conn".into(),
+            &opts,
+            &temp_host_keys(&keys),
+            &|_| {},
+        )
+        .await
+        .unwrap();
+        let tab1 = run_tab(shell);
+        // Duplicate: same connection, its own shell.
+        let shared = registry.attach_to("conn", &opts.target());
+        let (second, shell) = open_or_login(
+            &registry,
+            shared,
+            "unused".into(),
+            &opts,
+            &temp_host_keys(&keys),
+            &|_| {},
+        )
+        .await
+        .unwrap();
+        let tab2 = run_tab(shell);
+        assert_eq!(server.connections.load(Ordering::SeqCst), 1);
+        assert!(eventually(|| tab2.output.lock().unwrap().starts_with(b"$ ")).await);
+
+        // Close the duplicate: the server must see its channel close.
+        tab2.input.send(SessionInput::Close).unwrap();
+        tab2.done.await.unwrap();
+        drop(second);
+        assert!(eventually(|| server.channel_closes.load(Ordering::SeqCst) == 1).await);
+        assert_eq!(server.closed.load(Ordering::SeqCst), 0);
+        assert_eq!(registry.list()[0].users, 1);
+
+        // The first tab still works.
+        tab1.input
+            .send(SessionInput::Data(b"still here".to_vec()))
+            .unwrap();
+        assert!(eventually(|| tab1.output.lock().unwrap().ends_with(b"still here")).await);
+        tab1.input.send(SessionInput::Close).unwrap();
+        tab1.done.await.unwrap();
+        drop(first);
+        assert!(eventually(|| server.closed.load(Ordering::SeqCst) == 1).await);
+    }
+
+    #[tokio::test]
+    async fn a_big_paste_does_not_stall_other_tabs_on_the_connection() {
+        // A small server window: the paste has to wait for window space.
+        let server = start_with(ServerOptions {
+            window_size: Some(64 * 1024),
+            ..ServerOptions::default()
+        })
+        .await;
+        let keys = tempfile::tempdir().unwrap();
+        let registry = ConnectionRegistry::default();
+        let opts = options(&server);
+        let (lease, shell) = open_or_login(
+            &registry,
+            None,
+            "conn".into(),
+            &opts,
+            &temp_host_keys(&keys),
+            &|_| {},
+        )
+        .await
+        .unwrap();
+        let tab = run_tab(shell);
+        let paste = vec![b'a'; 4 * 1024 * 1024];
+        tab.input.send(SessionInput::Data(paste)).unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Another tab on the same connection gets a command through meanwhile.
+        let other = registry.attach("conn").unwrap();
+        let ran = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut channel = other.open_session().await.unwrap();
+            channel.exec(true, "uptime").await.unwrap();
+            while channel.wait().await.is_some() {}
+        })
+        .await;
+        assert!(ran.is_ok(), "the connection stalled behind the paste");
+        // And the whole paste was echoed back in the end.
+        // (Echoing 4 MiB back through a 64 KiB window takes a while on slow CI.)
+        let echoed = || tab.output.lock().unwrap().len() >= 2 + 4 * 1024 * 1024;
+        assert!(within(Duration::from_secs(30), echoed).await);
+        tab.input.send(SessionInput::Close).unwrap();
+        tab.done.await.unwrap();
+        drop((lease, other));
+    }
+
+    #[tokio::test]
+    async fn a_duplicate_logs_in_again_when_the_connection_takes_no_more_sessions() {
+        // Network gear often allows one session per connection.
+        let server = start_with(ServerOptions {
+            max_sessions: Some(1),
+            ..ServerOptions::default()
+        })
+        .await;
+        let keys = tempfile::tempdir().unwrap();
+        let registry = ConnectionRegistry::default();
+        let opts = options(&server);
+        let (first, shell) = open_or_login(
+            &registry,
+            None,
+            "conn".into(),
+            &opts,
+            &temp_host_keys(&keys),
+            &|_| {},
+        )
+        .await
+        .unwrap();
+        let _tab1 = run_tab(shell);
+        let messages = Mutex::new(Vec::new());
+        let progress = |message: String| messages.lock().unwrap().push(message);
+        let shared = registry.attach_to("conn", &opts.target());
+        let (second, _shell) = open_or_login(
+            &registry,
+            shared,
+            "unused".into(),
+            &opts,
+            &temp_host_keys(&keys),
+            &progress,
+        )
+        .await
+        .unwrap();
+        assert_ne!(second.id, first.id);
+        assert_eq!(server.connections.load(Ordering::SeqCst), 2);
+        assert!(messages.lock().unwrap()[0].contains("logging in again"));
     }
 }

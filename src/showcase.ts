@@ -8,6 +8,7 @@ import "@xterm/xterm/css/xterm.css";
 import "../scripts/showcase.css";
 import { mockIPC, mockWindows } from "@tauri-apps/api/mocks";
 import type { ConnForm } from "./dialog";
+import { REMOTE_CONNECTION, ShowcaseFs } from "./showcase-fs";
 
 const markCaptureStage = (stage: string): void => {
   document.documentElement.dataset.captureStage = stage;
@@ -18,37 +19,15 @@ const params = new URLSearchParams(location.search);
 const theme = params.get("theme") ?? "corepty-dark";
 const scene = params.get("scene") ?? "terminal";
 const sessionIds: string[] = [];
-
-const leftLocation = {
-  provider: "local",
-  path: "C:\\Projects\\CorePTY",
-  token: "demo:left",
-};
-const rightLocation = {
-  provider: "local",
-  path: "C:\\Users\\dev\\Downloads",
-  token: "demo:right",
-};
-const demoEntries = {
-  "demo:left": [
-    demoEntry(".github", "directory", true, null, 1785517260000),
-    demoEntry("docs", "directory", true, null, 1785516840000),
-    demoEntry("src", "directory", true, null, 1785517320000),
-    demoEntry("src-tauri", "directory", true, null, 1785517140000),
-    demoEntry("package.json", "file", false, 1426, 1785517200000),
-    demoEntry("README.md", "file", false, 12184, 1785517100000),
-    demoEntry("LICENSE", "file", false, 35150, 1784090400000),
-    demoEntry("vite.config.ts", "file", false, 1173, 1785517020000),
-  ],
-  "demo:right": [
-    demoEntry("Screenshots", "directory", true, null, 1785516500000, "demo:right"),
-    demoEntry("Releases", "directory", true, null, 1785516200000, "demo:right"),
-    demoEntry("corepty-0.3.8-x64-setup.exe", "file", false, 8_734_912, 1785517300000, "demo:right"),
-    demoEntry("corepty-portable.zip", "file", false, 7_218_432, 1785517240000, "demo:right"),
-    demoEntry("terminal-themes.png", "file", false, 1_842_205, 1785516800000, "demo:right"),
-    demoEntry("release-notes.txt", "file", false, 4821, 1785516600000, "demo:right"),
-  ],
-} as const;
+// `?big=N` adds C:\big with N files; `?step=ms` paces simulated transfers;
+// `?partial=1` presents clashes as partial copies (the Resume dialog).
+// The SFTP scene holds its upload part-way, for a still frame.
+const showcaseFs = new ShowcaseFs({
+  bigFolder: Number(params.get("big")) || 0,
+  stepMs: Number(params.get("step")) || undefined,
+  partialConflicts: params.get("partial") === "1",
+  holdAt: scene === "sftp" ? 0.5 : undefined,
+});
 
 const folders = [
   { id: "production", name: "Production", parentId: null },
@@ -113,6 +92,8 @@ const sessions = [
 mockWindows("main");
 mockIPC(
   (command, args) => {
+    const filesystem = showcaseFs.handle(command, args as Record<string, unknown> | undefined);
+    if (filesystem !== undefined) return filesystem;
     switch (command) {
       case "settings_load":
         return { theme, fontSize: 14, lineHeight: 1.18, cursorBlink: false };
@@ -130,24 +111,6 @@ mockIPC(
         ];
       case "host_os":
         return "windows";
-      case "files_home":
-        return leftLocation;
-      case "files_roots":
-        return [
-          { label: "Home", location: leftLocation },
-          { label: "C:", location: { provider: "local", path: "C:\\", token: "demo:root" } },
-        ];
-      case "files_resolve": {
-        const path = (args as { path?: string } | undefined)?.path ?? "";
-        return path.includes("Downloads") ? rightLocation : leftLocation;
-      }
-      case "files_list": {
-        const token = (args as { token?: string } | undefined)?.token ?? "demo:left";
-        const location = token === "demo:right" ? rightLocation : leftLocation;
-        return { location, parent: null, entries: demoEntries[token as keyof typeof demoEntries] ?? [] };
-      }
-      case "files_conflicts":
-        return [];
       case "folders_load":
         return folders;
       case "sessions_load":
@@ -163,6 +126,8 @@ mockIPC(
           id,
           kind: command === "session_create_ssh" ? "ssh" : "local",
           title: options?.title ?? (command === "session_create_ssh" ? "edge-01" : "PowerShell 7"),
+          // The SSH tab shares its connection with SFTP panels.
+          connectionId: command === "session_create_ssh" ? REMOTE_CONNECTION : undefined,
         };
       }
       default:
@@ -181,21 +146,107 @@ try {
 const { App } = await import("./app");
 const root = document.querySelector<HTMLDivElement>("#app")!;
 const app = new App(root);
+// Scripted checks reach the app (its tabs and terminals) through this.
+(window as unknown as { __showcaseApp?: unknown }).__showcaseApp = app;
 await app.mount();
 markCaptureStage("app-mounted");
 
 if (scene === "files") await renderFileManagerShowcase();
+else if (scene === "sftp") await renderSftpShowcase();
 else await renderTerminalShowcase();
 
+/** Local downloads on the left, the server's releases on the right, an upload running. */
+async function renderSftpShowcase(): Promise<void> {
+  // "Open SFTP" comes from an SSH tab: the panel shares its connection.
+  await app.newSsh({
+    name: "edge-01",
+    kind: "ssh",
+    host: "edge-01.example.net",
+    port: 22,
+    username: "deploy",
+    authType: "key",
+    password: "",
+    keyPath: "C:\Users\dev\.ssh\id_ed25519",
+    passphrase: "",
+    saveSecret: false,
+    folderId: "production",
+  });
+  for (const session of (app as unknown as { tabs: Array<{ setStatus?: (status: "connected") => void }> }).tabs) {
+    session.setStatus?.("connected");
+  }
+  const local = { fs: "local", path: "m:C:\\Users\\dev\\Downloads", display: "C:\\Users\\dev\\Downloads" };
+  app.newFileManager([local, undefined], { side: 1, target: { kind: "live", connectionId: REMOTE_CONNECTION } });
+  markCaptureStage("sftp-opened");
+  const panel = (side: number) =>
+    document.querySelector<HTMLElement>(`.file-manager.is-active .fm-panel[data-panel="${side}"]`);
+  const rows = (side: number) => [...(panel(side)?.querySelectorAll<HTMLElement>(".fm-row") ?? [])];
+  const named = (side: number, name: string) =>
+    rows(side).find((row) => row.querySelector(".fm-row__name")?.textContent === name);
+  const waitUntil = async (test: () => boolean) => {
+    for (let attempt = 0; attempt < 120 && !test(); attempt += 1) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 25));
+    }
+  };
+  const need = <T>(value: T | null | undefined, what: string): T => {
+    if (value === null || value === undefined) {
+      const panels = [...document.querySelectorAll<HTMLElement>(".fm-panel")].map(
+        (each) => `${each.dataset.panel}:${each.querySelector<HTMLInputElement>(".fm-path")?.value}:${each.querySelectorAll(".fm-row").length}`
+      );
+      throw new Error(`SFTP scene: no ${what} (panels ${panels.join(", ")}; focus ${document.activeElement?.className})`);
+    }
+    return value;
+  };
+  await waitUntil(() => rows(0).length >= 5 && rows(1).length >= 3);
+  // The right panel goes to the releases folder.
+  const path = need(panel(1)?.querySelector<HTMLInputElement>(".fm-path"), "right path field");
+  path.value = "/home/deploy/app/releases";
+  path.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+  await waitUntil(() => !!named(1, "checksums.txt"));
+  // Mark the two packages and send them up (F5, then Enter in the prompt).
+  for (const name of ["corepty-0.4.0-x64-setup.exe", "corepty-portable.zip"]) {
+    named(0, name)?.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, button: 0, ctrlKey: true }));
+  }
+  const grid = need(panel(0)?.querySelector<HTMLElement>(".fm-grid"), "left grid");
+  grid.focus();
+  const press = (target: Element, key: string) =>
+    target.dispatchEvent(new KeyboardEvent("keydown", { key, code: key, bubbles: true, cancelable: true }));
+  press(grid, "F5");
+  await waitUntil(() => !!document.querySelector(".fm-prompt input"));
+  const prompt = need(document.querySelector<HTMLInputElement>(".fm-prompt input"), "copy prompt");
+  prompt.focus();
+  press(prompt, "Enter");
+  await waitUntil(() => /50%|of/.test(document.querySelector(".fm-job .fm-job__detail")?.textContent ?? ""));
+  await waitUntil(() => !!document.querySelector(".fm-job.is-running"));
+  // The cursor rests on a release folder, the left panel active.
+  named(1, "0.3.8")?.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, button: 0 }));
+  need(panel(0)?.querySelector<HTMLElement>(".fm-grid"), "left grid").focus();
+  await new Promise<void>((resolve) => setTimeout(resolve, 150));
+  await new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
+  markCaptureStage("sftp-ready");
+  document.documentElement.dataset.showcaseReady = "true";
+}
+
 async function renderFileManagerShowcase(): Promise<void> {
-  app.newFileManager([leftLocation.path, rightLocation.path]);
+  const at = (display: string) => ({ fs: "local", path: `m:${display}`, display });
+  app.newFileManager([at("C:\\Projects\\CorePTY"), at("C:\\Users\\dev\\Downloads")]);
   markCaptureStage("file-manager-opened");
   for (let attempt = 0; attempt < 80; attempt += 1) {
-    if (document.querySelectorAll(".fm-row").length >= 12) break;
+    if (document.querySelectorAll(".fm-row").length >= 14) break;
     await new Promise<void>((resolve) => setTimeout(resolve, 25));
   }
-  const firstSource = document.querySelector<HTMLElement>('.fm-panel[data-panel="0"] .fm-row:nth-child(3)');
-  firstSource?.click();
+  // Show the Commander look: the cursor on src-tauri with two files marked.
+  const left = '.fm-panel[data-panel="0"] .fm-row';
+  for (const name of ["package.json", "README.md"]) {
+    const row = [...document.querySelectorAll<HTMLElement>(left)].find(
+      (each) => each.querySelector(".fm-row__name")?.textContent === name
+    );
+    row?.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, button: 0, ctrlKey: true }));
+  }
+  const cursor = [...document.querySelectorAll<HTMLElement>(left)].find(
+    (each) => each.querySelector(".fm-row__name")?.textContent === "src-tauri"
+  );
+  cursor?.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, button: 0, ctrlKey: true }));
+  cursor?.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, button: 0, ctrlKey: true }));
   await new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
   markCaptureStage("file-manager-ready");
   document.documentElement.dataset.showcaseReady = "true";
@@ -271,28 +322,6 @@ active.term.refresh(0, active.term.rows - 1);
 // fit/repaint before the headless browser takes its screenshot.
 await new Promise<void>((resolve) => setTimeout(resolve, 350));
 document.documentElement.dataset.showcaseReady = "true";
-}
-
-function demoEntry(
-  name: string,
-  kind: "directory" | "file",
-  isDirectory: boolean,
-  size: number | null,
-  modified: number,
-  parent = "demo:left"
-) {
-  return {
-    name,
-    path: `${parent === "demo:left" ? leftLocation.path : rightLocation.path}\\${name}`,
-    token: `${parent}:${name}`,
-    kind,
-    isDirectory,
-    size,
-    modified,
-    hidden: name.startsWith("."),
-    readonly: false,
-    error: null,
-  };
 }
 
 function showcaseOutput(): string {

@@ -9,6 +9,8 @@ import { escapeHtml as esc, uuid as genId } from "./util";
 export interface TreeDeps {
   onConnect: (s: SavedSession) => void;
   onEdit: (s: SavedSession) => void;
+  /** Browse an SSH connection's files (local left, remote right). */
+  onOpenSftp: (s: SavedSession) => void;
   onNewConnection: (folderId: string | null) => void;
   toast: (msg: string, kind?: "info" | "warn" | "error") => void;
 }
@@ -287,6 +289,9 @@ export class ConnectionsTree {
   private sessionMenu(e: MouseEvent, s: SavedSession): void {
     contextMenu(e.clientX, e.clientY, [
       { label: "Connect", icon: "bolt", action: () => this.deps.onConnect(s) },
+      ...(s.kind === "ssh"
+        ? [{ label: "Open SFTP", icon: "files", action: () => this.deps.onOpenSftp(s) }]
+        : []),
       { label: "Edit", icon: "pencil", action: () => this.deps.onEdit(s) },
       { label: "Duplicate", icon: "copy", action: () => void this.duplicateSession(s) },
       "sep",

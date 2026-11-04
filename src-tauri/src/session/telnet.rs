@@ -84,6 +84,7 @@ pub fn connect(
         id: id.clone(),
         kind: SessionKind::Telnet,
         title,
+        connection_id: None,
     };
 
     let (tx, rx) = unbounded_channel::<SessionInput>();
