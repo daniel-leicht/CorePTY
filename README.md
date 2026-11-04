@@ -291,8 +291,9 @@ The exact bundle directory depends on the operating system and selected target.
 ## Release process
 
 The versions in `package.json`, `src-tauri/Cargo.toml`, and
-`src-tauri/tauri.conf.json` must match. Push a corresponding version tag to run
-the cross-platform release workflow:
+`src-tauri/tauri.conf.json` must match, and [`CHANGELOG.md`](CHANGELOG.md) lists
+what each release changes. Push a corresponding version tag to run the
+cross-platform release workflow:
 
 ```bash
 git tag v<version>

@@ -1,7 +1,7 @@
 {
   "name": "corepty",
   "private": true,
-  "version": "0.3.8",
+  "version": "0.4.0",
   "type": "module",
   "description": "CorePTY — a modern terminal workspace with SSH, Telnet, and dual-pane file management",
   "license": "GPL-3.0-or-later",
