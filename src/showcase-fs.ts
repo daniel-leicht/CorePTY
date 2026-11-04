@@ -114,8 +114,14 @@ export class ShowcaseFs {
         return 1;
       case "sftp_close":
       case "fs_edit_resolve":
-      case "fs_close_copies":
         return null;
+      case "fs_close_copies":
+      case "fs_edits_pending":
+        return [];
+      case "sftp_retain":
+        return a.fs === REMOTE_FS;
+      case "fs_runs_code":
+        return /.(exe|bat|cmd|ps1|vbs|js|msi|lnk|sh|py)$/i.test(String(a.name));
       case "fs_edit":
       case "fs_open_copy":
         return { id: "copy-1", path: `C:\\Users\\dev\\AppData\\Local\\Temp\\CorePTY\\open\\copy-1\\${nameOf(untoken(a.location.path))}` };

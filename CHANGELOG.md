@@ -20,8 +20,11 @@
   `.filepart` after an interruption, and jobs pause while a connection is down
   and carry on after Reconnect.
 - Remote files: `F3` views text and images in place, `Enter` opens a
-  downloaded copy, and `F4` edits one in your editor (Settings › File manager)
-  and uploads every save, after checking the server's copy didn't change.
+  downloaded copy (a program or script asks first), and `F4` edits one in
+  your editor (Settings › File manager) and uploads every save, after checking
+  the server's copy didn't change, keeping its permissions. A save that can't
+  be uploaded is tried again; a copy the server is missing changes from is
+  kept when its tab closes, and closing the app asks first.
 - Properties (`Alt+Enter`): size, dates, owner, and a permissions editor
   (chmod, optionally for everything inside a folder).
 - Keyboard-first marking kept apart from the cursor (`Insert`, `Space`,

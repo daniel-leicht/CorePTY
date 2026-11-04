@@ -205,7 +205,11 @@ export async function confirmAction(
     message: string;
     detail?: string;
     action: string;
+    /** The other button (default "Cancel"). */
+    cancel?: string;
     danger?: boolean;
+    /** Focus the other button: Enter doesn't take the action. */
+    safeDefault?: boolean;
   },
   context: DialogContext = {}
 ): Promise<boolean> {
@@ -218,19 +222,22 @@ export async function confirmAction(
     detail.textContent = options.detail;
     body.appendChild(detail);
   }
-  const result = await modal({
+  const pending = modal({
     ...context,
     title: options.title,
     className: "fm-confirm",
     role: "alertdialog",
     body,
     buttons: [
-      { value: "cancel", label: "Cancel" },
+      { value: "cancel", label: options.cancel ?? "Cancel" },
       { value: "ok", label: options.action, kind: options.danger ? "danger" : "primary" },
     ],
-    enterValue: "ok",
+    enterValue: options.safeDefault ? undefined : "ok",
   });
-  return result === "ok";
+  if (options.safeDefault) {
+    document.querySelector<HTMLButtonElement>('.modal.fm-confirm [data-value="cancel"]')?.focus();
+  }
+  return (await pending) === "ok";
 }
 
 /**

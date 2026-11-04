@@ -12,9 +12,10 @@ export interface SshTab {
   connectionId: string;
   title: string;
   form: ConnForm;
-  /** Its shell's working folder (OSC 7), if reported. */
+  /** Its shell's working folder (OSC 7), if reported, and the host it names. */
   cwd: string | null;
-  watchCwd: (listener: (cwd: string) => void) => () => void;
+  cwdHost: string | null;
+  watchCwd: (listener: (cwd: string, host: string) => void) => () => void;
 }
 
 function hostLabel(username: string, host: string, port: number): string {
@@ -98,7 +99,10 @@ export function appRemoteSource(sshTabs: () => SshTab[]): RemoteSource {
     async live(): Promise<LiveRemote[]> {
       const connections = (await api.sshConnections()) ?? [];
       const tabs = sshTabs();
-      return connections.map((connection) => ({
+      // Only connections a tab uses: an SFTP-only one has no login to fall back on.
+      return connections
+        .filter((connection) => tabs.some((tab) => tab.connectionId === connection.id))
+        .map((connection) => ({
         connectionId: connection.id,
         label: connection.label,
         title: tabs
@@ -106,7 +110,7 @@ export function appRemoteSource(sshTabs: () => SshTab[]): RemoteSource {
           .map((tab) => tab.title)
           .join(", "),
         folder: tabs.find((tab) => tab.connectionId === connection.id && tab.cwd)?.cwd ?? null,
-      }));
+        }));
     },
 
     async login(savedId: string): Promise<SftpConnectOptions | null> {
@@ -114,14 +118,22 @@ export function appRemoteSource(sshTabs: () => SshTab[]): RemoteSource {
       return session ? loginToSaved(session) : null;
     },
 
-    async relogin(connectionId: string): Promise<SftpConnectOptions | null> {
+    loginLater(connectionId: string) {
+      // Taken now: the tab may reconnect (a new connection id) or close later.
       const tab = sshTabs().find((each) => each.connectionId === connectionId);
-      return tab ? loginFromForm(tab.form) : null;
+      if (!tab) return null;
+      const form = { ...tab.form };
+      return async () => loginFromForm(form);
+    },
+
+    liveFor(savedId: string): string | null {
+      return sshTabs().find((tab) => tab.form.id === savedId)?.connectionId ?? null;
     },
 
     watchFolder(connectionId, onFolder) {
       const tab = sshTabs().find((each) => each.connectionId === connectionId);
-      return tab ? tab.watchCwd(onFolder) : null;
+      if (!tab) return null;
+      return { host: tab.cwdHost, stop: tab.watchCwd(onFolder) };
     },
   };
 }

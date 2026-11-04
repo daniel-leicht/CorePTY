@@ -2,13 +2,20 @@
 // `ESC ] 7 ; file://host/path ST` after each prompt (fish, zsh with vte.sh,
 // bash with a PROMPT_COMMAND). The file manager follows it on SSH tabs.
 
-/** The folder in an OSC 7 payload (`file://host/a%20b` → `/a b`), or null. */
-export function parseOsc7(data: string): string | null {
-  const match = /^file:\/\/[^/]*(\/.*)$/.exec(data.trim());
+export interface Osc7Folder {
+  /** The machine the shell runs on, as it names itself (often empty). */
+  host: string;
+  path: string;
+}
+
+/** The host and folder in an OSC 7 payload (`file://box/a%20b` → `box`, `/a b`), or null. */
+export function parseOsc7(data: string): Osc7Folder | null {
+  const match = /^file:\/\/([^/]*)(\/.*)$/i.exec(data.trim());
   if (!match) return null;
   try {
-    const path = decodeURIComponent(match[1]);
-    return path.includes("\0") ? null : path;
+    const host = decodeURIComponent(match[1]).toLowerCase();
+    const path = decodeURIComponent(match[2]);
+    return path.includes("\0") ? null : { host, path };
   } catch {
     return null;
   }

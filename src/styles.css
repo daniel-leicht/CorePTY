@@ -1570,7 +1570,7 @@ button {
   }
 }
 @container (max-width: 410px) {
-  .fm-provider,
+  .fm-provider:not(.is-remote),
   .fm-tool[data-act="roots"],
   .fm-tool[data-act="filter"] {
     display: none;
@@ -1589,12 +1589,27 @@ button {
   .fm-panel-status__hint {
     display: none;
   }
+  /* A remote panel keeps its connection dot (the name is in the tooltip). */
+  .fm-provider.is-remote {
+    font-size: 0;
+    padding: 3px 4px;
+  }
+  .fm-provider.is-remote::before {
+    margin-right: 0;
+  }
 }
 
 @media (max-width: 860px) {
-  .fm-provider,
+  .fm-provider:not(.is-remote),
   .fm-nav .fm-tool[data-act="forward"] {
     display: none;
+  }
+  .fm-provider.is-remote {
+    font-size: 0;
+    padding: 3px 4px;
+  }
+  .fm-provider.is-remote::before {
+    margin-right: 0;
   }
   .fm-key kbd {
     display: none;

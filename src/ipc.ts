@@ -271,8 +271,13 @@ export const fsApi = {
   /** Download a remote file to a temp folder and open it there; `closeCopies` deletes it. */
   openCopy: (location: FsLocation) =>
     invoke<{ id: string; path: string }>("fs_open_copy", { location: plain(location) }),
-  closeCopies: (ids: string[]) => invoke<void>("fs_close_copies", { ids }),
-  /** Edit a remote file: download, open in `editor` (blank: default app), upload each save. */
+  /** Delete copies; returns those kept because the server doesn't have all of them. */
+  closeCopies: (ids: string[]) => invoke<KeptCopy[]>("fs_close_copies", { ids }),
+  /** Edited files whose latest changes aren't on the server yet. */
+  editsPending: () => invoke<string[]>("fs_edits_pending"),
+  /** Whether opening a file of this name may run code on this computer. */
+  runsCode: (name: string) => invoke<boolean>("fs_runs_code", { name }),
+  /** Edit a remote file: download, open in `editor` (blank: the default editor), upload each save. */
   edit: (location: FsLocation, editor: string) =>
     invoke<{ id: string; path: string }>("fs_edit", { location: plain(location), editor: editor || null }),
   /** Answer an edit conflict: upload over the server's newer file, or keep it. */
@@ -284,9 +289,10 @@ export const fsApi = {
     invoke<ArrayBuffer>("fs_read", { location: plain(location), offset, length }),
   folderSize: (location: FsLocation) =>
     invoke<FsFolderSize>("fs_dir_size", { location: plain(location) }),
-  /** Set POSIX permissions; `recursive` also inside a folder. Returns how many changed. */
-  chmod: (location: FsLocation, mode: number, recursive = false) =>
-    invoke<number>("fs_chmod", { location: plain(location), mode, recursive }),
+  /** Turn permission bits on (`set`) and off (`clear`), the rest as each entry has
+   * them; `recursive` also inside a folder. Returns how many changed. */
+  chmod: (location: FsLocation, set: number, clear: number, recursive = false) =>
+    invoke<number>("fs_chmod", { location: plain(location), set, clear, recursive }),
 };
 
 export const transferApi = {
@@ -349,15 +355,26 @@ export const sftpApi = {
   onStatus: (cb: (status: SftpStatus) => void): Promise<UnlistenFn> =>
     listen<SftpStatus>("sftp://status", (e) => cb(e.payload)),
   close: (fs: string) => invoke<void>("sftp_close", { fs }),
+  /** One more reference to an open filesystem (false: it isn't open); `close` it later. */
+  retain: (fs: string) => invoke<boolean>("sftp_retain", { fs }),
   sessions: () => invoke<SftpSessionView[]>("sftp_sessions"),
 };
+
+/** An edited copy kept when its tab closed: the server doesn't have all of it. */
+export interface KeptCopy {
+  name: string;
+  path: string;
+  reason: string;
+}
 
 /** Progress of an edited remote file's saves. */
 export type EditEvent =
   | { event: "uploading"; id: string; name: string }
   | { event: "uploaded"; id: string; name: string }
   | { event: "conflict"; id: string; name: string }
-  | { event: "failed"; id: string; name: string; message: string };
+  | { event: "failed"; id: string; name: string; message: string }
+  /** No more uploads from this copy; it stays at `path`. */
+  | { event: "stopped"; id: string; name: string; path: string; reason: string };
 
 /** Just the addressing fields — views and entries carry extra display data. */
 function plain(location: FsLocation): FsLocation {

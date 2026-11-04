@@ -43,6 +43,8 @@ interface Job {
   question: { conflictId: number; conflict: TransferConflict } | null;
   /** The user dismissed the question: don't pop it up again by itself. */
   deferred: boolean;
+  /** Paused: the filesystem it waits for. */
+  waitingFor: string | null;
 }
 
 export interface QueueHost {
@@ -57,6 +59,8 @@ export interface QueueHost {
   dialogContext(): DialogContext;
   /** Give the keyboard back to the active panel. */
   focus(): void;
+  /** Reconnect a filesystem a paused job waits for (no panel may show it). */
+  reconnect(fs: string): void;
 }
 
 const DONE_ROW_MS = 5000;
@@ -159,6 +163,7 @@ export class TransferQueue {
       message: "",
       question: null,
       deferred: false,
+      waitingFor: null,
     };
     element.querySelector(".fm-job__action")!.addEventListener("click", () => {
       if (isActive(job.state)) {
@@ -168,8 +173,12 @@ export class TransferQueue {
       }
     });
     element.querySelector(".fm-job__answer")!.addEventListener("click", () => {
-      job.deferred = false;
-      this.ask(job);
+      if (job.question) {
+        job.deferred = false;
+        this.ask(job);
+      } else if (job.state === "paused" && job.waitingFor) {
+        this.host.reconnect(job.waitingFor);
+      }
     });
     this.jobs.add(job);
     this.list.prepend(element);
@@ -229,6 +238,7 @@ export class TransferQueue {
       case "paused":
         // The connection dropped: it carries on (where it stopped) after a reconnect.
         job.state = "paused";
+        job.waitingFor = event.fs;
         job.message = `${remoteLabel(event.fs) ?? "the server"} is disconnected — waiting to reconnect`;
         job.speed = 0;
         job.eta = null;
@@ -295,7 +305,11 @@ export class TransferQueue {
     element.querySelector<HTMLElement>(".fm-progress span")!.style.width = `${percent}%`;
     element.querySelector(".fm-progress")!.setAttribute("aria-valuenow", String(percent));
     element.querySelector(".fm-job__detail")!.textContent = detail(job);
-    element.querySelector<HTMLButtonElement>(".fm-job__answer")!.hidden = !job.question;
+    // Answer a waiting question, or reconnect what a paused job waits for.
+    const answer = element.querySelector<HTMLButtonElement>(".fm-job__answer")!;
+    const reconnect = !job.question && job.state === "paused" && job.waitingFor !== null;
+    answer.hidden = !job.question && !reconnect;
+    answer.textContent = reconnect ? "Reconnect" : "Answer…";
     const action = element.querySelector<HTMLButtonElement>(".fm-job__action")!;
     action.title = isActive(job.state) ? "Cancel" : "Dismiss";
     this.renderSummary();

@@ -29,7 +29,7 @@ import {
   promptText,
   type DialogContext,
 } from "./dialogs";
-import { formatFileSize } from "./format";
+import { formatFileSize, visibleName } from "./format";
 import { current as settings } from "../settings";
 import { commandFor, FUNCTION_KEYS, isQuickSearchKey, type FmCommand } from "./keymap";
 import { DRAG_TYPE, PanelView, type PanelHost } from "./panel-view";
@@ -45,6 +45,7 @@ import {
 import { TransferQueue } from "./transfer-queue";
 import { openViewer } from "./viewer";
 import { propertiesDialog } from "./properties";
+import { Claims } from "./claims";
 
 const LOCATION_KEY = "corepty.fm.location.";
 /** Remote files bigger than this ask before downloading to open. */
@@ -107,12 +108,27 @@ export class FileManagerTab implements AppTab, PanelHost {
   private readonly openOnStart?: FileManagerOptions["openRemote"];
   /** Downloaded copies of remote files this tab opened (deleted when it closes). */
   private readonly copies: string[] = [];
-  /** Remote filesystems this tab holds a reference to (one each, while a panel shows it). */
-  private readonly acquired = new Set<string>();
-  /** A panel following its SSH tab's working folder (OSC 7). */
-  private following: { side: 0 | 1; fs: string; connectionId: string; stop: () => void } | null = null;
-  /** Remote filesystems being opened: held, but no panel shows them yet. */
-  private opening = 0;
+  /** The filesystem each copy came from. */
+  private readonly copyFs = new Map<string, string>();
+  /** Remote filesystems this tab holds (a panel shows one, or is on its way). */
+  private readonly claims = new Claims(
+    {
+      retain: (fs) => sftpApi.retain(fs).catch(() => false),
+      close: (fs) => void sftpApi.close(fs).catch(() => undefined),
+    },
+    isRemote
+  );
+  /** A panel following its SSH tab's working folder (OSC 7), on the host first seen. */
+  private following: {
+    side: 0 | 1;
+    fs: string;
+    connectionId: string;
+    host: string | null;
+    stop: () => void;
+  } | null = null;
+  /** Edit conflicts waiting until this tab is in front to be asked. */
+  private readonly editQuestions: Array<Extract<EditEvent, { event: "conflict" }>> = [];
+  private askingEdit = false;
   /** Source folder of each queued transfer, refreshed when it ends. */
   private readonly transferSources = new WeakMap<TransferRequest, FsLocationView | null>();
   /** Aborted on dispose: dismisses this tab's dialogs. */
@@ -147,6 +163,7 @@ export class FileManagerTab implements AppTab, PanelHost {
       isActive: () => !this.disposed && this.element.classList.contains("is-active"),
       dialogContext: () => this.dialogs,
       focus: () => this.focus(),
+      reconnect: (fs) => this.reconnectFs(fs),
     });
     this.element = document.createElement("div");
     this.element.className = "file-manager";
@@ -212,6 +229,7 @@ export class FileManagerTab implements AppTab, PanelHost {
     if (this.disposed) return;
     this.active.focus();
     this.queue.resume(); // a question that came in while another tab was in front
+    this.askEditQuestion();
   }
 
   applySettings(): void {
@@ -228,9 +246,19 @@ export class FileManagerTab implements AppTab, PanelHost {
     this.windowListeners.length = 0;
     for (const panel of this.panels) panel.dispose();
     this.stopFollowing();
-    for (const fs of this.acquired) void sftpApi.close(fs).catch(() => undefined);
-    if (this.copies.length) void fsApi.closeCopies(this.copies.splice(0)).catch(() => undefined);
-    this.acquired.clear();
+    // Panels let go of theirs above; anything left was on its way to one.
+    this.claims.dispose();
+    if (this.copies.length) {
+      const toast = this.toast;
+      void fsApi
+        .closeCopies(this.copies.splice(0))
+        .then((kept) => {
+          for (const copy of kept) {
+            toast(`Kept your copy of ${copy.name} (${copy.reason}): ${copy.path}`, "warn");
+          }
+        })
+        .catch(() => undefined);
+    }
     this.element.remove();
   }
 
@@ -271,7 +299,6 @@ export class FileManagerTab implements AppTab, PanelHost {
     if (this.following && this.panels[this.following.side].fs !== this.following.fs) {
       this.stopFollowing();
     }
-    this.releaseUnused();
     this.onStatusChange?.();
   }
 
@@ -443,12 +470,18 @@ export class FileManagerTab implements AppTab, PanelHost {
   }
 
   reconnect(panel: PanelView): void {
-    const fs = panel.fs;
-    // Both panels may show it: one reconnect at a time.
+    this.reconnectFs(panel.fs);
+  }
+
+  private reconnectFs(fs: string): void {
+    // Both panels (and a paused job) may ask: one reconnect at a time.
     if (this.reconnecting.has(fs)) return;
     const relogin = reloginFor(fs);
     if (!relogin) {
-      this.toast("Open the connection again to reconnect", "warn");
+      this.toast(
+        `No login is known for ${remoteLabel(fs) ?? "this server"}: open it again from the locations (Alt+F1 / Alt+F2)`,
+        "warn"
+      );
       return;
     }
     this.reconnecting.add(fs);
@@ -474,11 +507,16 @@ export class FileManagerTab implements AppTab, PanelHost {
   ): Promise<boolean> {
     const remote = this.remote;
     if (!remote) return false;
+    // A saved connection with an SSH tab open uses the tab's connection.
+    if (target.kind === "saved") {
+      const live = remote.liveFor(target.id);
+      if (live) target = { kind: "live", connectionId: live };
+    }
     let options: SftpConnectOptions | null;
-    let relogin: () => Promise<SftpConnectOptions | null>;
+    let relogin: (() => Promise<SftpConnectOptions | null>) | null;
     if (target.kind === "live") {
       options = { connectionId: target.connectionId };
-      relogin = () => remote.relogin(target.connectionId);
+      relogin = remote.loginLater(target.connectionId);
     } else {
       try {
         options = await remote.login(target.id);
@@ -486,7 +524,8 @@ export class FileManagerTab implements AppTab, PanelHost {
         this.toast(`Couldn't log in: ${error}`, "error");
         return false;
       }
-      relogin = () => remote.login(target.id);
+      const id = target.id;
+      relogin = () => remote.login(id);
     }
     if (!options || this.disposed) return false;
     let view: SftpView;
@@ -498,21 +537,21 @@ export class FileManagerTab implements AppTab, PanelHost {
     }
     if (view.notice) this.toast(view.notice, "info");
     learn(view, relogin);
-    if (target.kind === "live") this.liveConnections.set(view.fs, target.connectionId);
-    this.hold(view.fs);
+    // The reference connect took: held from here until a panel shows it.
+    const claim = this.adopt(view.fs);
     if (this.disposed) return false;
+    const connectionId = target.kind === "live" ? target.connectionId : null;
+    if (connectionId) this.liveConnections.set(view.fs, connectionId);
     // An SSH tab's connection opens where its terminal is (when the shell says).
     let start = view.home;
-    if (target.kind === "live") {
+    if (connectionId) {
       const folder = (await remote.live().catch(() => [])).find(
-        (each) => each.connectionId === target.connectionId
+        (each) => each.connectionId === connectionId
       )?.folder;
       if (folder) start = (await fsApi.resolve(view.fs, folder).catch(() => null)) ?? view.home;
     }
-    this.opening += 1;
-    const shown = await panel.navigate(start).finally(() => (this.opening -= 1));
-    if (shown && target.kind === "live" && follow) this.follow(panel, target.connectionId);
-    this.releaseUnused();
+    const shown = await panel.navigate(start, { claim });
+    if (shown && connectionId && follow) this.follow(panel, connectionId);
     if (shown && panel === this.active) panel.focus();
     return shown;
   }
@@ -528,18 +567,27 @@ export class FileManagerTab implements AppTab, PanelHost {
   private follow(panel: PanelView, connectionId: string): void {
     this.stopFollowing();
     const fs = panel.fs;
-    const stop = this.remote?.watchFolder(connectionId, (folder) => {
-      if (this.disposed || panel.fs !== fs) return this.stopFollowing();
+    const watched = this.remote?.watchFolder(connectionId, (folder, host) => {
+      const following = this.following;
+      if (this.disposed || !following || panel.fs !== fs) return this.stopFollowing();
+      // The first host the shell names is this server; another one means an
+      // `ssh` inside the terminal: its folders aren't on this server.
+      following.host ??= host;
+      if (host !== following.host) {
+        this.stopFollowing();
+        this.toast(`Stopped following: the terminal is on ${host || "another host"} now`, "info");
+        return;
+      }
       void fsApi
         .resolve(fs, folder)
         .then((location) => panel.navigate(location, { quiet: true }))
         .catch(() => undefined);
     });
-    if (!stop) {
+    if (!watched) {
       this.toast("No SSH tab uses this connection any more", "warn");
       return;
     }
-    this.following = { side: panel.side, fs, connectionId, stop };
+    this.following = { side: panel.side, fs, connectionId, host: watched.host, stop: watched.stop };
   }
 
   private stopFollowing(): void {
@@ -547,41 +595,15 @@ export class FileManagerTab implements AppTab, PanelHost {
     this.following = null;
   }
 
-  /** Keep the reference a successful `sftpApi.connect` took (one per filesystem per tab). */
-  private hold(fs: string): void {
-    if (this.acquired.has(fs) || this.disposed) {
-      void sftpApi.close(fs).catch(() => undefined);
-      return;
-    }
-    this.acquired.add(fs);
+  /** PanelHost: keep `fs` open for a panel going there (back/forward, a
+   * remembered folder, swapping panels). Null when it isn't open any more. */
+  claim(fs: string): Promise<(() => void) | null> {
+    return this.claims.claim(fs);
   }
 
-  /** Let go of remote filesystems neither panel shows any more. */
-  private releaseUnused(): void {
-    if (this.opening > 0) return;
-    for (const fs of [...this.acquired]) {
-      if (this.panels.some((panel) => panel.fs === fs)) continue;
-      this.acquired.delete(fs);
-      void sftpApi.close(fs).catch(() => undefined);
-    }
-  }
-
-  /** A remembered or duplicated remote location: share its filesystem if it's still open. */
-  private async acquireExisting(fs: string): Promise<boolean> {
-    if (this.acquired.has(fs)) return true;
-    try {
-      const open = (await sftpApi.sessions()).find((each) => each.fs === fs && each.connected);
-      if (!open || this.disposed) return false;
-      const view = await sftpApi.connect({ connectionId: open.connectionId });
-      if (view.fs !== fs) {
-        void sftpApi.close(view.fs).catch(() => undefined);
-        return false;
-      }
-      this.hold(fs);
-      return true;
-    } catch {
-      return false;
-    }
+  /** The reference `sftpApi.connect` just took, with a claim on it. */
+  private adopt(fs: string): () => void {
+    return this.claims.adopt(fs);
   }
 
   /** An edited remote file's save: uploaded, failed, or clashing with the server's. */
@@ -590,30 +612,52 @@ export class FileManagerTab implements AppTab, PanelHost {
     switch (event.event) {
       case "uploaded": {
         this.toast(`Uploaded ${event.name}`, "info");
-        for (const panel of this.panels) if (isRemote(panel.fs)) void panel.refresh();
+        const edited = this.copyFs.get(event.id);
+        for (const panel of this.panels) if (panel.fs === edited) void panel.refresh();
         break;
       }
       case "failed":
         this.toast(`Couldn't upload ${event.name}: ${event.message}`, "error");
         break;
+      case "stopped":
+        this.toast(
+          `No longer uploading ${event.name} (${event.reason}). Your copy is at ${event.path}`,
+          "warn"
+        );
+        break;
       case "conflict":
-        void (async () => {
-          const overwrite = await confirmAction(
-            {
-              title: "Changed on the server",
-              message: `“${event.name}” changed on the server since you opened it. Upload your copy over it?`,
-              detail: "Keeping the server's version leaves your copy as it is; save it again to upload it.",
-              action: "Upload mine",
-              danger: true,
-            },
-            this.dialogs
-          );
-          void fsApi.editResolve(event.id, overwrite).catch(() => undefined);
-        })();
+        // Asked when this tab is in front, one at a time.
+        this.editQuestions.push(event);
+        this.askEditQuestion();
         break;
       case "uploading":
         break;
     }
+  }
+
+  private askEditQuestion(): void {
+    if (this.askingEdit || this.disposed || !this.element.classList.contains("is-active")) return;
+    const event = this.editQuestions.shift();
+    if (!event) return;
+    this.askingEdit = true;
+    void (async () => {
+      const overwrite = await confirmAction(
+        {
+          title: "Changed on the server",
+          message: `“${event.name}” changed on the server since you opened it. Upload your copy over it?`,
+          detail:
+            "Keeping the server's version stops uploading your copy (it stays where it is), so nothing of theirs is overwritten later.",
+          action: "Upload mine",
+          cancel: "Keep the server's",
+          danger: true,
+          safeDefault: true,
+        },
+        this.dialogs
+      );
+      if (!this.disposed) void fsApi.editResolve(event.id, overwrite).catch(() => undefined);
+      this.askingEdit = false;
+      this.askEditQuestion();
+    })();
   }
 
   /** A remote filesystem dropped or came back: show it on its panels. */
@@ -673,14 +717,9 @@ export class FileManagerTab implements AppTab, PanelHost {
           if (await this.openRemote(panel, this.openOnStart.target, true)) return true;
           if (this.disposed) return false;
         }
+        // A remembered remote folder works while its server is still open.
         const wanted = this.initialLocations?.[panel.side] ?? readLocation(panel.side);
-        this.opening += 1;
-        try {
-          const usable = wanted && (!isRemote(wanted.fs) || (await this.acquireExisting(wanted.fs)));
-          if (usable && wanted && (await panel.navigate(wanted, { quiet: true }))) return true;
-        } finally {
-          this.opening -= 1;
-        }
+        if (wanted && (await panel.navigate(wanted, { quiet: true }))) return true;
         if (this.disposed) return false;
         try {
           return await panel.navigate(await homeFor());
@@ -691,7 +730,6 @@ export class FileManagerTab implements AppTab, PanelHost {
       })
     );
     if (this.disposed) return;
-    this.releaseUnused();
     this.status = results.some(Boolean) ? "connected" : "error";
     this.onStatusChange?.();
     this.focus();
@@ -891,7 +929,6 @@ export class FileManagerTab implements AppTab, PanelHost {
     await openViewer(panel.fs, entry, this.dialogs);
   }
 
-  /** F4 / Enter on a file: open it with the OS default application. */
   /** Enter (or F4, `editing`) on a file: open it with the OS; a remote one
    * as a downloaded copy, which F4 keeps uploading as it's saved. */
   private async edit(
@@ -934,6 +971,21 @@ export class FileManagerTab implements AppTab, PanelHost {
 
   /** A remote file: download a copy to a temp folder and open it there. */
   private async openCopy(panel: PanelView, entry: FsEntry, editing = false): Promise<void> {
+    // Opening a program or script runs it here, with your rights.
+    if (!editing && (await fsApi.runsCode(entry.name).catch(() => true))) {
+      const run = await confirmAction(
+        {
+          title: "Run a file from the server?",
+          message: `Opening “${visibleName(entry.name)}” runs it on this computer, with your rights. Only do this if you trust where it came from.`,
+          detail: "F4 opens it in an editor instead.",
+          action: "Open and run",
+          danger: true,
+          safeDefault: true,
+        },
+        this.dialogs
+      );
+      if (!run || this.disposed) return;
+    }
     const big = (entry.size ?? 0) > LARGE_DOWNLOAD;
     if (big) {
       const go = await confirmAction(
@@ -946,10 +998,6 @@ export class FileManagerTab implements AppTab, PanelHost {
       );
       if (!go || this.disposed) return;
     }
-    this.toast(
-      editing ? `Editing ${entry.name} — saves are uploaded` : `Opening a copy of ${entry.name}…`,
-      "info"
-    );
     try {
       const location = { fs: panel.fs, path: entry.path };
       const copy = editing
@@ -960,6 +1008,8 @@ export class FileManagerTab implements AppTab, PanelHost {
         return;
       }
       this.copies.push(copy.id);
+      this.copyFs.set(copy.id, panel.fs);
+      if (editing) this.toast(`Editing ${entry.name}: each save is uploaded`, "info");
     } catch (error) {
       this.toast(`Couldn't open ${entry.name}: ${error}`, "error");
     }

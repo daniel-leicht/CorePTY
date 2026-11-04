@@ -1,6 +1,8 @@
 // Alt+Enter: an entry's properties — size (folders counted up), dates, owner —
 // and, on POSIX filesystems, its permissions as a checkbox grid tied to an
-// octal field. Applying runs chmod (recursively into folders, if asked).
+// octal field. For several entries a box is mixed until changed; applying
+// sets just the bits changed (each entry keeps the rest of its own mode), so
+// one dialog can't flatten different modes into one. Links are left alone.
 
 import { fsApi, type FsEntry } from "../ipc";
 import { modal, type DialogContext } from "./dialogs";
@@ -33,6 +35,19 @@ export function parseOctal(text: string): number | null {
   const trimmed = text.trim();
   if (!/^[0-7]{3,4}$/.test(trimmed)) return null;
   return parseInt(trimmed, 8);
+}
+
+/** What each permission bit is across entries: all on, all off, or mixed
+ * (a mode not known counts as mixed). */
+export function commonBits(modes: Array<number | null>): { on: number; off: number } {
+  let on = 0o7777;
+  let off = 0o7777;
+  for (const mode of modes) {
+    if (mode === null) return { on: 0, off: 0 };
+    on &= mode;
+    off &= ~mode;
+  }
+  return modes.length ? { on: on & 0o7777, off: off & 0o7777 } : { on: 0, off: 0 };
 }
 
 export interface PropertiesOptions {
@@ -96,12 +111,16 @@ export async function propertiesDialog(
     })();
   }
 
-  let original: number | null = null;
-  let current = 0;
+  // Links are left alone: changing one changes what it points at.
+  const targets = entries.filter((entry) => entry.kind !== "symlink");
+  const common = commonBits(targets.map((entry) => entry.mode));
+  /** Bits the user turned on and off. */
+  let set = 0;
+  let clear = 0;
+  let valid = true;
   let recursive: HTMLInputElement | null = null;
-  if (posix) {
-    original = one?.mode ?? entries.find((entry) => entry.mode !== null)?.mode ?? null;
-    current = original ?? 0o644;
+  let apply: () => void = () => undefined;
+  if (posix && targets.length) {
     const perms = document.createElement("div");
     perms.className = "fm-perms";
     perms.innerHTML = `
@@ -119,57 +138,95 @@ export async function propertiesDialog(
         (special) => `<label class="check"><input type="checkbox" data-bit="${special.bit}" /> ${special.label}</label>`
       ).join("")}</div>
       <label class="field fm-perms__octal"><span class="field__label">Octal</span><input inputmode="numeric" spellcheck="false" maxlength="4" /><span class="fm-perms__text"></span></label>
-      ${folders.length ? `<label class="check fm-perms__recursive"><input type="checkbox" /> Also everything inside ${folders.length === 1 ? "the folder" : "the folders"} (folders keep x where r is set)</label>` : ""}`;
+      ${folders.length ? `<label class="check fm-perms__recursive"><input type="checkbox" /> Also everything inside ${folders.length === 1 ? "the folder" : "the folders"} (folders keep x where r is set)</label>` : ""}
+      ${targets.length < entries.length ? `<p class="fm-confirm__note">Links are left as they are.</p>` : ""}`;
     body.appendChild(perms);
     const boxes = Array.from(perms.querySelectorAll<HTMLInputElement>("input[data-bit]"));
     const field = perms.querySelector<HTMLInputElement>(".fm-perms__octal input")!;
     const text = perms.querySelector<HTMLElement>(".fm-perms__text")!;
     recursive = perms.querySelector<HTMLInputElement>(".fm-perms__recursive input");
     const type = one ? modeType(one) : "-";
-    const show = (from: "boxes" | "field" | "start") => {
-      for (const box of boxes) box.checked = (current & Number(box.dataset.bit)) !== 0;
-      if (from !== "field") field.value = octal(current);
+    /** The mode every entry gets, when that's one mode for all; else null. */
+    const resulting = (): number | null => {
+      const on = (common.on & ~clear) | set;
+      const off = (common.off & ~set) | clear;
+      return (on | off) === 0o7777 ? on : null;
+    };
+    const show = (from: "boxes" | "field") => {
+      for (const box of boxes) {
+        const bit = Number(box.dataset.bit);
+        const on = ((common.on & ~clear) | set) & bit;
+        const off = ((common.off & ~set) | clear) & bit;
+        box.checked = on !== 0;
+        box.indeterminate = !on && !off;
+      }
+      const mode = resulting();
+      if (from !== "field") field.value = mode === null ? "" : octal(mode);
+      field.placeholder = mode === null ? "mixed" : "";
       field.classList.remove("is-invalid");
-      text.textContent = formatMode(current, type);
+      valid = true;
+      text.textContent =
+        mode !== null
+          ? formatMode(mode, type)
+          : targets.some((entry) => entry.mode === null)
+            ? "(not known: only what you change is set)"
+            : "(different on each: only what you change is set)";
+      apply();
     };
     for (const box of boxes) {
       box.addEventListener("change", () => {
         const bit = Number(box.dataset.bit);
-        current = box.checked ? current | bit : current & ~bit;
+        if (box.checked) {
+          set |= bit;
+          clear &= ~bit;
+        } else {
+          clear |= bit;
+          set &= ~bit;
+        }
         show("boxes");
       });
     }
     field.addEventListener("input", () => {
       const parsed = parseOctal(field.value);
       if (parsed === null) {
-        field.classList.add("is-invalid");
+        // Nothing is applied while the field holds something that isn't a mode.
+        field.classList.toggle("is-invalid", field.value.trim() !== "");
+        valid = field.value.trim() === "";
+        apply();
         return;
       }
-      current = parsed;
+      set = parsed;
+      clear = ~parsed & 0o7777;
       show("field");
     });
-    show("start");
-    if (original === null) text.textContent = "(not known: shown as 644)";
+    show("boxes");
   }
 
-  const choice = await modal({
+  const pending = modal({
     ...context,
     title: one ? `${one.name} — properties` : "Properties",
     className: "fm-props-dialog",
     body,
-    buttons: posix
-      ? [
-          { value: "cancel", label: "Cancel" },
-          { value: "apply", label: "Apply", kind: "primary" },
-        ]
-      : [{ value: "cancel", label: "Close", kind: "primary" }],
-    enterValue: posix ? "apply" : "cancel",
+    buttons:
+      posix && targets.length
+        ? [
+            { value: "cancel", label: "Cancel" },
+            { value: "apply", label: "Apply", kind: "primary" },
+          ]
+        : [{ value: "cancel", label: "Close", kind: "primary" }],
+    enterValue: posix && targets.length ? "apply" : "cancel",
   });
-  if (choice !== "apply" || !posix) return false;
+  // Apply only once something changed (and the octal field holds a mode).
+  const applyButton = document.querySelector<HTMLButtonElement>('.fm-props-dialog [data-value="apply"]');
+  apply = () => {
+    if (applyButton) applyButton.disabled = !valid || (set === 0 && clear === 0);
+  };
+  apply();
+  const choice = await pending;
+  if (choice !== "apply" || !posix || !valid || (set === 0 && clear === 0)) return false;
   const deep = recursive?.checked ?? false;
-  if (current === original && !deep) return false;
-  for (const entry of entries) {
-    await fsApi.chmod({ fs: options.fs, path: entry.path }, current, deep && entry.isDirectory);
+  for (const entry of targets) {
+    await fsApi.chmod({ fs: options.fs, path: entry.path }, set, clear, deep && entry.isDirectory);
   }
   return true;
 }

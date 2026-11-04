@@ -6,7 +6,7 @@
 import { icon } from "../icons";
 import { fsApi, type FsCapabilities, type FsEntry, type FsLocationView } from "../ipc";
 import { formatFileSize, formatMode, formatModified, modeType } from "./format";
-import { isRemote, providerBadge, providerLabel } from "./remote";
+import { isRemote, providerBadge, providerLabel, remoteLabel } from "./remote";
 import { History, PanelModel, type SortKey } from "./panel-model";
 
 export const ROW_HEIGHT = 28;
@@ -28,6 +28,11 @@ export interface PanelHost {
   toast(message: string, kind?: "info" | "warn" | "error"): void;
   /** The panel's remote filesystem dropped; the user asked to reconnect. */
   reconnect(panel: PanelView): void;
+  /**
+   * Keep `fs` open for a panel going there (local ones always are): resolves
+   * with the function that lets go, or null when it isn't open any more.
+   */
+  claim(fs: string): Promise<(() => void) | null>;
 }
 
 export interface NavigateOptions {
@@ -40,6 +45,8 @@ export interface NavigateOptions {
   keepState?: boolean;
   /** Fail silently (e.g. a remembered folder that no longer exists). */
   quiet?: boolean;
+  /** A claim on the location's filesystem already taken (a server just opened). */
+  claim?: () => void;
 }
 
 export class PanelView {
@@ -69,6 +76,8 @@ export class PanelView {
   private navigating = false;
   private quickText = "";
   private quickTimer: number | null = null;
+  /** The remote filesystem shown, kept open while it is (see `PanelHost.claim`). */
+  private held: { fs: string; release: () => void } | null = null;
 
   constructor(
     private readonly host: PanelHost,
@@ -182,7 +191,18 @@ export class PanelView {
     const sequence = ++this.loadSequence;
     this.navigating = !options.keepState;
     this.element.classList.add("is-loading");
+    // Another filesystem (back/forward, a menu, a remembered folder): hold it
+    // first, and let go of this one only once the new folder is shown.
+    let claim = options.claim ?? null;
     try {
+      if (!claim && location.fs !== (this.held?.fs ?? "local")) {
+        claim = await this.host.claim(location.fs);
+        if (!claim) {
+          throw new Error(
+            `${remoteLabel(location.fs) ?? location.fs} isn't open any more; open it again from the locations (Alt+F${this.side + 1})`
+          );
+        }
+      }
       const [listing, capabilities] = await Promise.all([
         fsApi.list(location),
         location.fs === this.model.location?.fs
@@ -205,6 +225,13 @@ export class PanelView {
         focusPath: options.focusPath,
       });
       if ((options.history ?? "push") === "push") this.history.visit(listing.location);
+      if (claim) {
+        this.held?.release();
+        this.held = { fs: location.fs, release: claim };
+        claim = null;
+      }
+      // It answered: whatever the banner said, it's reachable now.
+      if (this.offline) this.setOffline(null);
       this.render();
       if (options.keepState) this.list.scrollTop = scrollTop;
       else this.list.scrollTop = 0;
@@ -217,6 +244,7 @@ export class PanelView {
       }
       return false;
     } finally {
+      claim?.(); // not shown after all: give it back
       if (sequence === this.loadSequence) {
         this.navigating = false;
         this.element.classList.remove("is-loading");
@@ -422,6 +450,8 @@ export class PanelView {
 
   dispose(): void {
     this.clearQuickSearch();
+    this.held?.release();
+    this.held = null;
   }
 
   private createRow(index: number): HTMLElement {

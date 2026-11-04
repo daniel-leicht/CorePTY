@@ -51,7 +51,9 @@ export class TerminalSession implements AppTab {
   osTitle = "";
   /** The shell's working folder, when it reports it (OSC 7). */
   cwd: string | null = null;
-  private readonly cwdListeners = new Set<(cwd: string) => void>();
+  /** The host its shell names in OSC 7 (after an `ssh` inside, another one). */
+  cwdHost: string | null = null;
+  private readonly cwdListeners = new Set<(cwd: string, host: string) => void>();
   /** A manually pinned name. Once set it overrides everything, permanently. */
   private customTitle: string | null = null;
 
@@ -95,10 +97,11 @@ export class TerminalSession implements AppTab {
       this.onTitleUpdate?.();
     });
     this.term.parser.registerOscHandler(7, (data) => {
-      const cwd = parseOsc7(data);
-      if (cwd && cwd !== this.cwd) {
-        this.cwd = cwd;
-        for (const listener of this.cwdListeners) listener(cwd);
+      const folder = parseOsc7(data);
+      if (folder && (folder.path !== this.cwd || folder.host !== this.cwdHost)) {
+        this.cwd = folder.path;
+        this.cwdHost = folder.host;
+        for (const listener of this.cwdListeners) listener(folder.path, folder.host);
       }
       return true;
     });
@@ -118,16 +121,16 @@ export class TerminalSession implements AppTab {
     return this.info?.id ?? null;
   }
 
-  /**
-   * Effective tab label. A user-pinned name wins over everything; otherwise the
-   * program-set OSC title wins over the default label.
-   */
-  /** Hear about the working folder changing; returns the unsubscribe. */
-  watchCwd(listener: (cwd: string) => void): () => void {
+  /** Hear about the working folder changing (and its host); returns the unsubscribe. */
+  watchCwd(listener: (cwd: string, host: string) => void): () => void {
     this.cwdListeners.add(listener);
     return () => this.cwdListeners.delete(listener);
   }
 
+  /**
+   * Effective tab label. A user-pinned name wins over everything; otherwise the
+   * program-set OSC title wins over the default label.
+   */
   get title(): string {
     return this.customTitle ?? (this.osTitle || this.baseTitle);
   }

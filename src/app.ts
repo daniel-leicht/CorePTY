@@ -3,6 +3,7 @@
 import {
   api,
   b64ToBytes,
+  fsApi,
   onData,
   onExit,
   onStatus,
@@ -27,7 +28,15 @@ import {
 } from "./settings";
 import { activeTheme, preloadThemeFonts } from "./themes";
 import { escapeHtml, uuid } from "./util";
-import { winClose, winMinimize, winSetDecorations, winStartResize, winToggleMaximize } from "./window";
+import {
+  onCloseRequested,
+  winClose,
+  winMinimize,
+  winSetDecorations,
+  winStartResize,
+  winToggleMaximize,
+} from "./window";
+import { confirmAction } from "./fm/dialogs";
 import {
   applyStoredSecret,
   buildSavedSession,
@@ -542,12 +551,14 @@ export class App {
     for (const tab of this.tabs) {
       if (!(tab instanceof TerminalSession)) continue;
       const connectionId = tab.info?.connectionId;
-      if (tab.spec?.kind !== "ssh" || !connectionId) continue;
+      // A tab that dropped (or is reconnecting) has no usable connection.
+      if (tab.spec?.kind !== "ssh" || !connectionId || tab.status !== "connected") continue;
       tabs.push({
         connectionId,
         title: tab.title,
         form: tab.spec.form,
         cwd: tab.cwd,
+        cwdHost: tab.cwdHost,
         watchCwd: (listener) => tab.watchCwd(listener),
       });
     }
@@ -1310,6 +1321,20 @@ export class App {
   }
 
   private wireWindowChrome(): void {
+    // Edited remote files whose last saves aren't on the server yet: ask first.
+    onCloseRequested(async () => {
+      const pending = await fsApi.editsPending().catch(() => [] as string[]);
+      if (!pending.length) return true;
+      return confirmAction({
+        title: "Close CorePTY?",
+        message: `Your changes to ${pending.join(", ")} aren't on the server yet.`,
+        detail: "Their copies stay in the temp folder; open them again to upload.",
+        action: "Close anyway",
+        cancel: "Keep CorePTY open",
+        danger: true,
+        safeDefault: true,
+      });
+    });
     this.root.querySelectorAll<HTMLButtonElement>(".win-btn[data-win]").forEach((btn) => {
       btn.addEventListener("click", () => {
         const act = btn.dataset.win;

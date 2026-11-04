@@ -116,9 +116,15 @@ a security prompt on first launch.
   SSH tab reuses that tab's authenticated connection; a saved connection logs in
   with its keychain secret or asks for the password.
 - Remote files that are opened or edited are downloaded into a per-file folder
-  under the system temp directory and deleted when their tab closes. Opening one
-  hands it to the application your system associates with its type, as opening
-  it locally would.
+  under the system temp directory (on Linux, one only you can enter), marked as
+  downloaded on Windows (so SmartScreen and Office's Protected View apply), and
+  deleted when their tab closes, unless the server is missing changes you made:
+  then the copy is kept and you are told where. Opening a remote program or
+  script (or a name with text-reversing characters) asks first, since it would
+  run on this computer; `F4` opens files in an editor and never runs them.
+- Saving an edited file uploads it only after checking that the server's copy
+  didn't change meanwhile, keeps its permissions and owner, writes through links
+  to the file they point at, and never replaces a folder.
 - Telnet provides no transport encryption or server authentication. Use it only
   with systems and networks where cleartext access is acceptable.
 
@@ -155,7 +161,7 @@ Within a file-manager panel:
 | Numpad `+` / `-` / `*` | Mark or unmark files by a mask, invert the marks |
 | Typing a name | Jump to it (quick search) |
 | `Esc` | End a quick search, close the filter, or clear the marks |
-| `Enter` / double-click | Open a folder, or open a file (a remote one as a downloaded copy) |
+| `Enter` / double-click | Open a folder, or open a file (a remote one as a downloaded copy; programs and scripts ask first) |
 | `Backspace` / `Alt+Up` | Open the parent folder |
 | `Ctrl+\` | Go to the root folder |
 | `Alt+Left` / `Alt+Right` | Navigate folder history |
@@ -166,7 +172,7 @@ Within a file-manager panel:
 | `Ctrl+C` / `Ctrl+X` / `Ctrl+V` | Copy, cut, or paste files |
 | `F2` / `Shift+F6` | Rename |
 | `F3` | View a text file or image |
-| `F4` | Edit: open with the default app; a remote file uploads on every save |
+| `F4` | Edit: a local file opens with its app; a remote one in your editor (Settings › File manager; blank: Notepad on Windows, the default text editor elsewhere), uploaded on every save |
 | `F5` / `F6` | Copy or move to the other panel |
 | `F7` | Create a folder |
 | `F8` / `Delete` | Move to Trash or Recycle Bin (delete, after confirmation, on servers) |
