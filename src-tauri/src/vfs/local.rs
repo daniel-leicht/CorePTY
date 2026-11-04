@@ -525,6 +525,30 @@ mod tests {
         assert!(find(".hidden").meta.hidden);
     }
 
+    /// B2: one entry that can't be inspected doesn't fail the whole listing.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_entry_that_cannot_be_inspected_is_listed_with_its_error() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempdir().unwrap();
+        let dir = temp.path().join("dir");
+        fs::create_dir(&dir).unwrap();
+        fs::write(dir.join("a.txt"), b"a").unwrap();
+        // Readable but not searchable: the names list, the entries can't be statted.
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o644)).unwrap();
+        let blocked = fs::symlink_metadata(dir.join("a.txt")).is_err();
+        let listed = LocalFs.list(&vpath(&dir)).await;
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+        if !blocked {
+            return; // running as root: permissions don't apply
+        }
+        let listed = listed.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].name.display(), "a.txt");
+        assert!(listed[0].error.is_some());
+        assert_eq!(listed[0].meta.kind, EntryKind::Other);
+    }
+
     #[tokio::test]
     async fn streams_round_trip_and_reads_resume_from_an_offset() {
         let temp = tempdir().unwrap();
