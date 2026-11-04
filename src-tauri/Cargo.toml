@@ -1,6 +1,6 @@
 [package]
 name = "corepty"
-version = "0.4.0"
+version = "0.4.1"
 description = "CorePTY — a modern terminal workspace with SSH, Telnet, and dual-pane file management"
 authors = ["Daniel Leicht"]
 license = "GPL-3.0-or-later"

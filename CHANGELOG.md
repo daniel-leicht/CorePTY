@@ -1,5 +1,34 @@
 # Changelog
 
+## 0.4.1 (unreleased)
+
+Fixes from a review of 0.4.0's remote editing and opening:
+
+- Opening a remote file with `Enter` asks first unless its type is one known
+  to be safe to open; 0.4.0 asked only for a list of program and script types,
+  which missed some an interpreter or client runs (`.pyc`, `.rdp`,
+  `.diagcab`, …).
+- On Linux, `F4` with no editor set opens the desktop's text editor, not the
+  file type's app (which could run a `.jar` or `.desktop` file); on Windows,
+  only known-safe types use their own editor, others open in Notepad.
+- An upload cut off while writing the server's file in place is redone
+  without asking, instead of being taken for someone else's change.
+- A failed upload is retried every 15 seconds (and when the connection comes
+  back), not re-sent on every check; a server that won't set permissions gets
+  the file written in place instead of no upload at all.
+- An edited file's permissions are set before its contents go up, so a
+  private file is never readable on the way.
+- Closing the app counts a save made just before, and lets a running upload
+  finish; its question says where the copies are. A copy opened with `Enter`
+  and changed is kept when its tab closes.
+- A folder that appears where an edited file was is never replaced; a
+  temporary file a dropped upload leaves on the server is removed later.
+- Edit conflicts wait while another question is open, and putting one off
+  (Esc) no longer counts as keeping the server's version; the Properties
+  dialog no longer offers changes it can't make to files of unknown mode.
+- Reconnecting with a login for another server is refused before it logs in;
+  editors started through a `.cmd` file get no console window.
+
 ## 0.4.0 (2026-11-04)
 
 ### New: a dual-pane file manager, local and SFTP
