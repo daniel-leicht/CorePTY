@@ -1,29 +1,38 @@
 //! Opening remote files in local apps (WinSCP style). A copy is downloaded
 //! into its own temp folder and opened there. When editing, the copy is
 //! watched: each save is uploaded back, after checking that the file on the
-//! server hasn't changed since (if it has, the user decides). The folder goes
-//! when the file manager tab that opened it closes, after a last upload.
+//! server hasn't changed since (if it has, the user decides). A save that
+//! can't be uploaded is tried again (at once when the connection comes back).
+//! When the tab closes, a copy is deleted only if the server has everything
+//! in it; otherwise it's kept, and the user told where.
 
-use crate::vfs::{epoch_millis, FsRegistry, Location, Meta, VName, VPath, Vfs, WriteMode};
+use crate::sftp::commands::{SessionUse, SftpSessions};
+use crate::vfs::{
+    epoch_millis, EntryKind, FsRegistry, Location, Meta, VName, VPath, Vfs, WriteMode,
+};
 use serde::Serialize;
 use std::{
     collections::HashMap,
     io,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, MutexGuard, RwLock},
-    time::{Duration, SystemTime},
+    sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock},
+    time::{Duration, Instant, SystemTime},
 };
 use tauri::{AppHandle, Emitter, State};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    sync::{mpsc, watch},
+    sync::{mpsc, oneshot, watch},
 };
 
 /// How often an edited copy is checked for saves.
 const POLL: Duration = Duration::from_millis(if cfg!(test) { 40 } else { 1000 });
+/// How often a save that couldn't be uploaded is tried again (and at once
+/// when the connection comes back).
+const RETRY: Duration = Duration::from_millis(if cfg!(test) { 300 } else { 15_000 });
+/// How long closing a tab waits for a last upload.
+const CLOSE_WAIT: Duration = Duration::from_secs(if cfg!(test) { 5 } else { 30 });
 
-/// Size and modified time (to the second, as SFTP keeps it): what tells a
-/// changed file from an unchanged one.
+/// The server's file: size and modified time to the second, as SFTP keeps it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Stamp {
     size: Option<u64>,
@@ -34,21 +43,28 @@ impl Stamp {
     fn of(meta: &Meta) -> Self {
         Self {
             size: meta.size,
-            seconds: meta.modified.and_then(seconds),
+            seconds: meta
+                .modified
+                .and_then(epoch_millis)
+                .map(|millis| millis / 1000),
         }
-    }
-
-    fn of_local(path: &Path) -> Option<Self> {
-        let metadata = std::fs::metadata(path).ok()?;
-        Some(Self {
-            size: Some(metadata.len()),
-            seconds: metadata.modified().ok().and_then(seconds),
-        })
     }
 }
 
-fn seconds(time: SystemTime) -> Option<u64> {
-    epoch_millis(time).map(|millis| millis / 1000)
+/// The copy: size and modified time at full precision, so two saves within
+/// one second (with the same size) still count as two.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LocalStamp {
+    size: u64,
+    modified: Option<SystemTime>,
+}
+
+fn local_stamp(path: &Path) -> Option<LocalStamp> {
+    let metadata = std::fs::metadata(path).ok()?;
+    Some(LocalStamp {
+        size: metadata.len(),
+        modified: metadata.modified().ok(),
+    })
 }
 
 /// Sent as `fs://edit` while an edited copy is synced.
@@ -73,18 +89,38 @@ pub enum EditEvent {
         id: String,
         name: String,
     },
+    /// A save couldn't be uploaded; it's tried again.
     Failed {
         id: String,
         name: String,
         message: String,
     },
+    /// No more uploads from this copy (the user kept the server's version, or
+    /// the server's file isn't a file any more). The copy stays at `path`.
+    Stopped {
+        id: String,
+        name: String,
+        path: String,
+        reason: String,
+    },
 }
 
 pub type EditSink = Arc<dyn Fn(EditEvent) + Send + Sync>;
 
+/// A copy that was kept when its tab closed: the server doesn't have all of it.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct KeptCopy {
+    pub name: String,
+    pub path: String,
+    pub reason: String,
+}
+
 /// A downloaded copy of a remote file.
 struct Copy {
     dir: PathBuf,
+    local: PathBuf,
+    name: String,
     /// Set while it's being edited.
     watcher: Option<Watcher>,
 }
@@ -92,6 +128,10 @@ struct Copy {
 struct Watcher {
     stop: watch::Sender<bool>,
     answers: mpsc::UnboundedSender<bool>,
+    /// What became of the copy once the watcher stopped.
+    done: oneshot::Receiver<Option<KeptCopy>>,
+    /// Whether the copy has changes the server doesn't (for the exit prompt).
+    unsynced: watch::Receiver<bool>,
 }
 
 /// Tauri-managed state: the copies opened this session, by id.
@@ -128,15 +168,23 @@ impl OpenedCopies {
         let name = path
             .file_name()
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "that has no file name"))?;
+        let shown = name.display();
         let name = name.storable_here().unwrap_or(name);
         let id = uuid::Uuid::new_v4().simple().to_string();
         let dir = root.join(&id);
-        tokio::fs::create_dir_all(&dir).await?;
+        private_dir(&dir)?;
         let local = dir.join(&*name.to_native());
         match download(fs, path, &local).await {
             Ok(meta) => {
-                self.copies()
-                    .insert(id.clone(), Copy { dir, watcher: None });
+                self.copies().insert(
+                    id.clone(),
+                    Copy {
+                        dir,
+                        local: local.clone(),
+                        name: shown,
+                        watcher: None,
+                    },
+                );
                 Ok((id, local, meta))
             }
             Err(e) => {
@@ -147,15 +195,22 @@ impl OpenedCopies {
     }
 
     /// Download `path` and keep uploading the copy's saves back to it.
+    /// `keep_open` (the server's session) lives as long as the watcher.
     async fn edit(
         &self,
         fs: Arc<dyn Vfs>,
         path: &VPath,
         root: &Path,
+        keep_open: Option<SessionUse>,
     ) -> io::Result<(String, PathBuf)> {
         let (id, local, meta) = self.download(fs.as_ref(), path, root).await?;
+        // Saves go to the file itself: through a link, to what it points at
+        // (replacing the link would leave the real file unchanged).
+        let remote = fs.canonicalize(path).await.unwrap_or_else(|_| path.clone());
         let (stop, stopped) = watch::channel(false);
         let (answers, answered) = mpsc::unbounded_channel();
+        let (done_tx, done) = oneshot::channel();
+        let (unsynced_tx, unsynced) = watch::channel(false);
         let session = Session {
             id: id.clone(),
             name: path
@@ -163,20 +218,31 @@ impl OpenedCopies {
                 .map(|name| name.display())
                 .unwrap_or_default(),
             fs,
-            remote: path.clone(),
+            remote,
             local: local.clone(),
-            remote_stamp: Stamp::of(&meta),
-            local_stamp: Stamp::of_local(&local),
+            original: Original::of(&meta),
+            remote_stamp: Some(Stamp::of(&meta)),
+            synced: local_stamp(&local),
+            pending: None,
+            conflicted: false,
+            stopped: None,
             sink: self.sink(),
+            unsynced: unsynced_tx,
+            _keep_open: keep_open,
         };
         let dir = match self.copies().get_mut(&id) {
             Some(copy) => {
-                copy.watcher = Some(Watcher { stop, answers });
+                copy.watcher = Some(Watcher {
+                    stop,
+                    answers,
+                    done,
+                    unsynced,
+                });
                 copy.dir.clone()
             }
             None => return Err(io::Error::other("the copy went away")),
         };
-        tokio::spawn(session.watch(dir, stopped, answered));
+        tokio::spawn(session.watch(dir, stopped, answered, done_tx));
         Ok((id, local))
     }
 
@@ -191,22 +257,61 @@ impl OpenedCopies {
         }
     }
 
+    /// Edited copies with changes the server doesn't have yet (by name).
+    fn unsynced(&self) -> Vec<String> {
+        self.copies()
+            .values()
+            .filter(|copy| copy.watcher.as_ref().is_some_and(|w| *w.unsynced.borrow()))
+            .map(|copy| copy.name.clone())
+            .collect()
+    }
+
     /// Delete copies (their apps may still have them open: best effort). An
-    /// edited one uploads a last unsaved change first, then goes.
-    fn close(&self, ids: &[String]) {
+    /// edited one uploads a last change first; one the server doesn't have
+    /// all of is kept instead, and returned.
+    async fn close(&self, ids: &[String]) -> Vec<KeptCopy> {
         let removed: Vec<Copy> = {
             let mut copies = self.copies();
             ids.iter().filter_map(|id| copies.remove(id)).collect()
         };
+        let mut kept = Vec::new();
         for copy in removed {
             match copy.watcher {
                 Some(watcher) => {
                     watcher.stop.send_replace(true);
+                    match tokio::time::timeout(CLOSE_WAIT, watcher.done).await {
+                        Ok(Ok(Some(copy))) => kept.push(copy),
+                        Ok(_) => {}
+                        Err(_) => kept.push(KeptCopy {
+                            name: copy.name,
+                            path: copy.local.to_string_lossy().into_owned(),
+                            reason: "its last upload hasn't finished".to_string(),
+                        }),
+                    }
                 }
                 None => {
-                    let _ = std::fs::remove_dir_all(&copy.dir);
+                    let _ = tokio::fs::remove_dir_all(&copy.dir).await;
                 }
             }
+        }
+        kept
+    }
+}
+
+/// What the server's file was like, to keep it so on upload.
+#[derive(Debug, Clone, Default)]
+struct Original {
+    mode: Option<u32>,
+    owner: Option<String>,
+    group: Option<String>,
+}
+
+impl Original {
+    fn of(meta: &Meta) -> Self {
+        Self {
+            mode: meta.mode,
+            owner: meta.owner.clone(),
+            group: meta.group.clone(),
         }
     }
 }
@@ -216,13 +321,40 @@ struct Session {
     id: String,
     name: String,
     fs: Arc<dyn Vfs>,
+    /// Where saves go (links resolved).
     remote: VPath,
     local: PathBuf,
-    /// The server's file as last downloaded or uploaded.
-    remote_stamp: Stamp,
-    /// The copy as last synced.
-    local_stamp: Option<Stamp>,
+    original: Original,
+    /// The server's file as last downloaded or uploaded (`None`: not known,
+    /// an upload landed but couldn't be checked).
+    remote_stamp: Option<Stamp>,
+    /// The copy as last uploaded (or downloaded).
+    synced: Option<LocalStamp>,
+    /// A save that couldn't be uploaded, and why.
+    pending: Option<String>,
+    /// The tab closed while the user was asked about a conflict.
+    conflicted: bool,
+    /// No more uploads, and why.
+    stopped: Option<String>,
     sink: EditSink,
+    unsynced: watch::Sender<bool>,
+    _keep_open: Option<SessionUse>,
+}
+
+/// Resolves when the connection comes back (never, for one that can't drop).
+async fn came_back(connection: &mut Option<watch::Receiver<bool>>) {
+    loop {
+        let Some(receiver) = connection.as_mut() else {
+            return std::future::pending().await;
+        };
+        if receiver.changed().await.is_err() {
+            *connection = None;
+            continue;
+        }
+        if *receiver.borrow_and_update() {
+            return;
+        }
+    }
 }
 
 impl Session {
@@ -231,87 +363,164 @@ impl Session {
         dir: PathBuf,
         mut stop: watch::Receiver<bool>,
         mut answers: mpsc::UnboundedReceiver<bool>,
+        done: oneshot::Sender<Option<KeptCopy>>,
     ) {
+        let mut connection = self.fs.connection();
+        let mut retry_at: Option<Instant> = None;
         loop {
             let stopping = tokio::select! {
                 _ = tokio::time::sleep(POLL) => false,
                 _ = stop.wait_for(|stop| *stop) => true,
+                _ = came_back(&mut connection) => {
+                    retry_at = Some(Instant::now());
+                    false
+                }
             };
-            if let Some(now) = self.saved() {
-                // Wait for the editor to finish writing before uploading.
-                tokio::time::sleep(POLL / 2).await;
-                if Stamp::of_local(&self.local) == Some(now) {
-                    self.sync(now, &mut answers, &mut stop).await;
+            if self.stopped.is_none() {
+                let mut due =
+                    self.pending.is_some() && retry_at.is_some_and(|at| Instant::now() >= at);
+                if let Some(now) = self.saved() {
+                    // Wait for the editor to finish writing before uploading.
+                    tokio::time::sleep(POLL / 2).await;
+                    due |= local_stamp(&self.local) == Some(now);
+                }
+                if due || (stopping && self.has_changes()) {
+                    self.sync(&mut answers, &mut stop).await;
+                    retry_at = self.pending.as_ref().map(|_| Instant::now() + RETRY);
                 }
             }
+            self.unsynced
+                .send_replace(self.has_changes() || self.conflicted);
             if stopping || *stop.borrow() {
-                let _ = tokio::fs::remove_dir_all(&dir).await;
+                let kept = self.kept();
+                if kept.is_none() {
+                    let _ = tokio::fs::remove_dir_all(&dir).await;
+                }
+                let _ = done.send(kept);
                 return;
             }
         }
     }
 
-    /// The copy's stamp, if it changed since the last sync.
-    fn saved(&self) -> Option<Stamp> {
-        let now = Stamp::of_local(&self.local)?;
-        (Some(now) != self.local_stamp).then_some(now)
+    /// The copy's stamp, if it changed since the last upload.
+    fn saved(&self) -> Option<LocalStamp> {
+        let now = local_stamp(&self.local)?;
+        (Some(now) != self.synced).then_some(now)
+    }
+
+    /// Changes the server doesn't have.
+    fn has_changes(&self) -> bool {
+        self.pending.is_some() || self.saved().is_some()
+    }
+
+    /// Kept on close, and why (`None`: the server has it all, it can go).
+    fn kept(&self) -> Option<KeptCopy> {
+        let reason = if self.conflicted {
+            "it changed on the server too, and the question wasn't answered".to_string()
+        } else if let Some(reason) = &self.stopped {
+            // Nothing new since it stopped: it can go.
+            self.saved()?;
+            reason.clone()
+        } else if let Some(error) = &self.pending {
+            format!("it couldn't be uploaded ({error})")
+        } else if self.saved().is_some() {
+            "its last save couldn't be uploaded".to_string()
+        } else {
+            return None;
+        };
+        Some(KeptCopy {
+            name: self.name.clone(),
+            path: self.local.to_string_lossy().into_owned(),
+            reason,
+        })
+    }
+
+    fn failed(&mut self, message: String) {
+        // Told once per run of failures, not on every retry.
+        if self.pending.is_none() {
+            (self.sink)(EditEvent::Failed {
+                id: self.id.clone(),
+                name: self.name.clone(),
+                message: format!("{message}. It's tried again, and when the connection is back."),
+            });
+        }
+        self.pending = Some(message);
+    }
+
+    fn stop_syncing(&mut self, reason: &str) {
+        (self.sink)(EditEvent::Stopped {
+            id: self.id.clone(),
+            name: self.name.clone(),
+            path: self.local.to_string_lossy().into_owned(),
+            reason: reason.to_string(),
+        });
+        self.stopped = Some(reason.to_string());
+        self.pending = None;
     }
 
     async fn sync(
         &mut self,
-        now: Stamp,
         answers: &mut mpsc::UnboundedReceiver<bool>,
         stop: &mut watch::Receiver<bool>,
     ) {
+        let Some(now) = local_stamp(&self.local) else {
+            return; // the copy is gone (an editor saved elsewhere): nothing to send
+        };
         let (id, name) = (self.id.clone(), self.name.clone());
         let on_server = match self.fs.stat(&self.remote).await {
-            Ok(meta) => Some(Stamp::of(&meta)),
+            Ok(meta) => Some(meta),
             Err(e) if e.kind() == io::ErrorKind::NotFound => None,
-            Err(e) => {
-                self.local_stamp = Some(now);
-                (self.sink)(EditEvent::Failed {
-                    id,
-                    name,
-                    message: format!("couldn't check the file on the server: {e}"),
-                });
-                return;
-            }
+            Err(e) => return self.failed(format!("couldn't check the file on the server: {e}")),
         };
-        if on_server != Some(self.remote_stamp) {
-            // Changed (or deleted) on the server since it was opened.
+        if let Some(meta) = &on_server {
+            if meta.kind != EntryKind::File {
+                // A folder (say) by that name now: never put a file over it.
+                return self.stop_syncing("on the server it isn't a file any more");
+            }
+        }
+        let changed = match (&on_server, self.remote_stamp) {
+            (None, _) => true, // deleted on the server
+            (Some(meta), Some(known)) => Stamp::of(meta) != known,
+            (Some(_), None) => false,
+        };
+        if changed {
             (self.sink)(EditEvent::Conflict {
                 id: id.clone(),
                 name: name.clone(),
             });
             while answers.try_recv().is_ok() {}
             let overwrite = tokio::select! {
-                answer = answers.recv() => answer.unwrap_or(false),
-                // Closing the tab while asked: keep the server's file.
-                _ = stop.wait_for(|stop| *stop) => false,
+                answer = answers.recv() => answer,
+                // The tab closed while asked: nothing is uploaded, the copy stays.
+                _ = stop.wait_for(|stop| *stop) => None,
             };
-            if !overwrite {
-                self.local_stamp = Some(now);
-                if let Some(stamp) = on_server {
-                    self.remote_stamp = stamp;
+            match overwrite {
+                None => {
+                    self.conflicted = true;
+                    return;
                 }
-                return;
+                Some(false) => {
+                    return self.stop_syncing("you kept the server's version");
+                }
+                Some(true) => {}
             }
+        }
+        if let Some(meta) = &on_server {
+            self.original = Original::of(meta);
         }
         (self.sink)(EditEvent::Uploading {
             id: id.clone(),
             name: name.clone(),
         });
-        self.local_stamp = Some(now);
-        match upload(self.fs.as_ref(), &self.local, &self.remote).await {
+        match upload(self.fs.as_ref(), &self.local, &self.remote, &self.original).await {
             Ok(stamp) => {
                 self.remote_stamp = stamp;
+                self.synced = Some(now);
+                self.pending = None;
+                self.conflicted = false;
                 (self.sink)(EditEvent::Uploaded { id, name });
             }
-            Err(e) => (self.sink)(EditEvent::Failed {
-                id,
-                name,
-                message: e.to_string(),
-            }),
+            Err(e) => self.failed(e.to_string()),
         }
     }
 }
@@ -330,6 +539,8 @@ async fn download(fs: &dyn Vfs, path: &VPath, local: &Path) -> io::Result<Meta> 
     tokio::io::copy(&mut reader, &mut file).await?;
     file.flush().await?;
     drop(file);
+    // Before the time: writing the mark counts as changing the file.
+    mark_as_downloaded(local);
     if let Some(modified) = meta.modified {
         let local = local.to_path_buf();
         let _ = tokio::task::spawn_blocking(move || {
@@ -343,37 +554,85 @@ async fn download(fs: &dyn Vfs, path: &VPath, local: &Path) -> io::Result<Meta> 
     Ok(meta)
 }
 
-/// Upload the copy over the server's file in one step: written beside it
-/// under a temporary name, then renamed over it (a failure leaves the old one).
-async fn upload(fs: &dyn Vfs, local: &Path, remote: &VPath) -> io::Result<Stamp> {
+async fn send_file(local: &Path, writer: &mut crate::vfs::VWrite) -> io::Result<()> {
+    let mut source = tokio::fs::File::open(local).await?;
+    let mut buffer = vec![0; 256 * 1024];
+    loop {
+        let read = source.read(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+        writer.write_all(&buffer[..read]).await?;
+    }
+    writer.shutdown().await
+}
+
+/// Upload the copy over the server's file. Usually in one step, as editors
+/// save: written beside it under a temporary name with the file's mode, then
+/// renamed over it (a failure leaves the old one). In place instead when that
+/// would change the file's owner, or the folder takes no new files: the
+/// file itself is kept (owner, links to it, attributes), at the cost of a
+/// half-written file if the connection drops mid-way.
+/// Returns the new stamp, `None` if the file couldn't be checked afterwards.
+async fn upload(
+    fs: &dyn Vfs,
+    local: &Path,
+    remote: &VPath,
+    original: &Original,
+) -> io::Result<Option<Stamp>> {
     let folder = remote.parent().unwrap_or_else(|| remote.clone());
     let temporary = folder.join(&VName::for_path(
         &folder,
         &format!(".corepty-{}.part", uuid::Uuid::new_v4().simple()),
     ))?;
-    let written = async {
-        let mut source = tokio::fs::File::open(local).await?;
-        let mut writer = fs.open_write(&temporary, WriteMode::CreateNew).await?;
-        let mut buffer = vec![0; 256 * 1024];
-        loop {
-            let read = source.read(&mut buffer).await?;
-            if read == 0 {
-                break;
+    let staged = match fs.open_write(&temporary, WriteMode::CreateNew).await {
+        Ok(mut writer) => {
+            let written = async {
+                send_file(local, &mut writer).await?;
+                if let Some(mode) = original.mode {
+                    fs.set_mode(&temporary, mode).await?;
+                }
+                // Renaming a file someone else owns would make it ours.
+                let made = fs.stat(&temporary).await?;
+                Ok::<bool, io::Error>(
+                    (original.owner.is_none() || made.owner == original.owner)
+                        && (original.group.is_none() || made.group == original.group),
+                )
             }
-            writer.write_all(&buffer[..read]).await?;
+            .await;
+            match written {
+                Ok(true) => {
+                    if let Ok(modified) = std::fs::metadata(local).and_then(|m| m.modified()) {
+                        let _ = fs.set_times(&temporary, modified, None).await;
+                    }
+                    match fs.rename(&temporary, remote, true).await {
+                        Ok(()) => true,
+                        Err(e) => {
+                            let _ = fs.remove(&temporary, false).await;
+                            return Err(e);
+                        }
+                    }
+                }
+                Ok(false) => {
+                    let _ = fs.remove(&temporary, false).await;
+                    false
+                }
+                Err(e) => {
+                    let _ = fs.remove(&temporary, false).await;
+                    return Err(e);
+                }
+            }
         }
-        writer.shutdown().await?;
-        if let Ok(modified) = std::fs::metadata(local).and_then(|m| m.modified()) {
-            let _ = fs.set_times(&temporary, modified, None).await;
-        }
-        fs.rename(&temporary, remote, true).await
+        // No new files in that folder (`/etc` for a user who may write
+        // `/etc/hosts`): write the file in place.
+        Err(e) if e.kind() == io::ErrorKind::PermissionDenied => false,
+        Err(e) => return Err(e),
+    };
+    if !staged {
+        let mut writer = fs.open_write(remote, WriteMode::Truncate).await?;
+        send_file(local, &mut writer).await?;
     }
-    .await;
-    if let Err(e) = written {
-        let _ = fs.remove(&temporary, false).await;
-        return Err(e);
-    }
-    Ok(Stamp::of(&fs.stat(remote).await?))
+    Ok(fs.stat(remote).await.ok().map(|meta| Stamp::of(&meta)))
 }
 
 /// Split an editor command line (`code --wait`, `"C:\Program Files\x\x.exe" -n`)
@@ -423,27 +682,277 @@ fn editor_command(line: &str, file: &Path) -> Option<(String, Vec<String>)> {
     Some((program, parts.collect()))
 }
 
-/// Open `file` in `editor` (a command line), or with the default app.
-fn launch(editor: Option<&str>, file: &Path) -> io::Result<()> {
-    match editor.map(str::trim).filter(|line| !line.is_empty()) {
-        None => open::that_detached(file),
-        Some(line) => {
-            let (program, args) = editor_command(line, file)
-                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no editor given"))?;
-            std::process::Command::new(&program)
-                .args(args)
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn()
-                .map(drop)
-                .map_err(|e| io::Error::new(e.kind(), format!("couldn't start {program}: {e}")))
+/// A bare program name as Windows' shell finds it: every `PATH` folder, with
+/// each `PATHEXT` extension (`code` is `code.cmd`). Names with a folder or an
+/// extension are left alone.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn find_program(name: &str, path: &std::ffi::OsStr, extensions: &str) -> Option<PathBuf> {
+    let given = Path::new(name);
+    if given.components().count() != 1 || given.extension().is_some() {
+        return None;
+    }
+    for folder in std::env::split_paths(path) {
+        for extension in extensions.split(';').filter(|ext| !ext.is_empty()) {
+            let candidate = folder.join(format!("{name}{}", extension.to_ascii_lowercase()));
+            if candidate.is_file() {
+                return Some(candidate);
+            }
         }
+    }
+    None
+}
+
+/// Start `program` detached from us; on Unix a thread reaps it when it exits.
+fn spawn_editor(program: &str, args: &[String]) -> io::Result<()> {
+    #[cfg(windows)]
+    let program = std::env::var_os("PATH")
+        .and_then(|path| {
+            let extensions =
+                std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".into());
+            find_program(program, &path, &extensions)
+        })
+        .map(|found| found.to_string_lossy().into_owned())
+        .unwrap_or_else(|| program.to_string());
+    #[cfg(not(windows))]
+    let program = program.to_string();
+    let child = std::process::Command::new(&program)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| io::Error::new(e.kind(), format!("couldn't start {program}: {e}")))?;
+    #[cfg(unix)]
+    {
+        let mut child = child;
+        std::thread::spawn(move || child.wait());
+    }
+    #[cfg(not(unix))]
+    drop(child);
+    Ok(())
+}
+
+/// Open `file` for editing with no editor set: never the shell's "open"
+/// (that runs scripts and programs). Windows: the type's "edit" verb, else
+/// Notepad; macOS: the default text editor; elsewhere: the default app.
+fn edit_with_default(file: &Path) -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows::{
+            core::PCWSTR,
+            Win32::{
+                System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED},
+                UI::{Shell::ShellExecuteW, WindowsAndMessaging::SW_SHOWNORMAL},
+            },
+        };
+        let wide: Vec<u16> = file.as_os_str().encode_wide().chain(Some(0)).collect();
+        let verb: Vec<u16> = "edit".encode_utf16().chain(Some(0)).collect();
+        // ShellExecute can hand off to shell extensions: COM first.
+        unsafe {
+            let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        }
+        // Above 32 means it started.
+        let started = unsafe {
+            ShellExecuteW(
+                None,
+                PCWSTR(verb.as_ptr()),
+                PCWSTR(wide.as_ptr()),
+                PCWSTR::null(),
+                PCWSTR::null(),
+                SW_SHOWNORMAL,
+            )
+        };
+        if started.0 as isize > 32 {
+            return Ok(());
+        }
+        spawn_editor("notepad.exe", &[file.to_string_lossy().into_owned()])
+    }
+    #[cfg(target_os = "macos")]
+    {
+        spawn_editor(
+            "open",
+            &["-t".to_string(), file.to_string_lossy().into_owned()],
+        )
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        open::that_detached(file)
     }
 }
 
-fn copies_root() -> PathBuf {
-    std::env::temp_dir().join("CorePTY").join("open")
+/// Open `file`: with the default app, or (`editing`) in `editor`, a command
+/// line, or the default editor when that's blank.
+fn launch(editing: bool, editor: Option<&str>, file: &Path) -> io::Result<()> {
+    match editor.map(str::trim).filter(|line| !line.is_empty()) {
+        Some(line) if editing => {
+            let (program, args) = editor_command(line, file)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no editor given"))?;
+            spawn_editor(&program, &args)
+        }
+        _ if editing => edit_with_default(file),
+        _ => open::that_detached(file),
+    }
+}
+
+/// Types that run code when opened (programs, scripts, shortcuts, installers):
+/// opening a downloaded one runs it on this computer.
+const RUNNABLE: &[&str] = &[
+    // Windows
+    "exe",
+    "com",
+    "scr",
+    "pif",
+    "cpl",
+    "msi",
+    "msp",
+    "mst",
+    "msc",
+    "bat",
+    "cmd",
+    "ps1",
+    "psm1",
+    "psd1",
+    "vbs",
+    "vbe",
+    "js",
+    "jse",
+    "wsf",
+    "wsh",
+    "ws",
+    "hta",
+    "lnk",
+    "url",
+    "scf",
+    "inf",
+    "reg",
+    "chm",
+    "application",
+    "appref-ms",
+    "gadget",
+    "jar",
+    "appx",
+    "msix",
+    "appinstaller",
+    "library-ms",
+    "settingcontent-ms",
+    "diagcab",
+    "xll",
+    "iqy",
+    "slk",
+    // macOS and Linux
+    "app",
+    "command",
+    "tool",
+    "pkg",
+    "mpkg",
+    "workflow",
+    "scpt",
+    "terminal",
+    "desktop",
+    "sh",
+    "bash",
+    "zsh",
+    "csh",
+    "ksh",
+    "fish",
+    "run",
+    "bin",
+    "appimage",
+    "deb",
+    "rpm",
+    // Interpreters a desktop may be set to run
+    "py",
+    "pyw",
+    "pyz",
+    "pl",
+    "rb",
+    "php",
+    "lua",
+    "tcl",
+];
+
+/// Unicode controls that can make a name read differently: `invoice` + U+202E +
+/// `fdp.exe` shows as `invoiceexe.pdf`.
+fn has_bidi_controls(name: &str) -> bool {
+    name.chars().any(|c| {
+        matches!(c, '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
+    })
+}
+
+/// Whether opening a file of this name may run something on this computer
+/// (its type runs code here, or its name hides what it is).
+pub fn runs_code(name: &str) -> bool {
+    if has_bidi_controls(name) {
+        return true;
+    }
+    let extension = name
+        .trim_end_matches(['.', ' '])
+        .rsplit_once('.')
+        .map(|(_, extension)| extension.to_ascii_lowercase());
+    let Some(extension) = extension else {
+        return false;
+    };
+    if RUNNABLE.contains(&extension.as_str()) {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        // Whatever else Windows itself treats as dangerous to open.
+        use windows::{core::PCWSTR, Win32::UI::Shell::AssocIsDangerous};
+        let wide: Vec<u16> = format!(".{extension}")
+            .encode_utf16()
+            .chain(Some(0))
+            .collect();
+        if unsafe { AssocIsDangerous(PCWSTR(wide.as_ptr())) }.as_bool() {
+            return true;
+        }
+    }
+    false
+}
+
+/// Tag a downloaded copy as coming from elsewhere (Windows' Mark of the Web),
+/// so SmartScreen and Office's Protected View apply to it as to any download.
+fn mark_as_downloaded(local: &Path) {
+    #[cfg(windows)]
+    {
+        let mut stream = local.as_os_str().to_os_string();
+        stream.push(":Zone.Identifier");
+        let _ = std::fs::write(PathBuf::from(stream), "[ZoneTransfer]\r\nZoneId=3\r\n");
+    }
+    #[cfg(not(windows))]
+    let _ = local;
+}
+
+/// A folder only this user can enter.
+fn private_dir(dir: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new().mode(0o700).create(dir)
+    }
+    #[cfg(not(unix))]
+    std::fs::create_dir_all(dir)
+}
+
+/// Where copies go. Windows and macOS temp folders are per user already; on
+/// Linux `/tmp` is shared, so each run makes a fresh folder only this user can
+/// enter (one someone else made first can't be used to swap a copy).
+fn copies_root() -> io::Result<PathBuf> {
+    static ROOT: OnceLock<PathBuf> = OnceLock::new();
+    if let Some(root) = ROOT.get() {
+        return Ok(root.clone());
+    }
+    #[cfg(unix)]
+    let root = {
+        let root = std::env::temp_dir().join(format!("corepty-{}", uuid::Uuid::new_v4().simple()));
+        private_dir(&root)?;
+        root.join("open")
+    };
+    #[cfg(not(unix))]
+    let root = std::env::temp_dir().join("CorePTY").join("open");
+    std::fs::create_dir_all(&root)?;
+    Ok(ROOT.get_or_init(|| root).clone())
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -454,12 +963,19 @@ pub struct CopyView {
     pub path: String,
 }
 
-async fn open_local(editor: Option<String>, local: PathBuf) -> Result<(), String> {
+async fn open_local(editing: bool, editor: Option<String>, local: PathBuf) -> Result<(), String> {
     let shown = local.clone();
-    tokio::task::spawn_blocking(move || launch(editor.as_deref(), &local))
+    tokio::task::spawn_blocking(move || launch(editing, editor.as_deref(), &local))
         .await
         .map_err(|e| e.to_string())?
         .map_err(|e| format!("could not open {}: {e}", shown.to_string_lossy()))
+}
+
+/// Whether opening a file of this name may run code here: the file manager
+/// asks first.
+#[tauri::command]
+pub fn fs_runs_code(name: String) -> bool {
+    runs_code(&name)
 }
 
 /// Download a copy of a remote file and open it with the default app.
@@ -471,11 +987,15 @@ pub async fn fs_open_copy(
     location: Location,
 ) -> Result<CopyView, String> {
     let fs = registry.get(&location.fs)?;
+    let root = copies_root().map_err(|e| format!("could not make a folder for the copy: {e}"))?;
     let (id, local, _) = copies
-        .download(fs.as_ref(), &location.path, &copies_root())
+        .download(fs.as_ref(), &location.path, &root)
         .await
         .map_err(|e| format!("could not download {}: {e}", location.path.display()))?;
-    open_local(None, local.clone()).await?;
+    if let Err(e) = open_local(false, None, local.clone()).await {
+        copies.close(std::slice::from_ref(&id)).await;
+        return Err(e);
+    }
     Ok(CopyView {
         id,
         path: local.to_string_lossy().into_owned(),
@@ -483,21 +1003,24 @@ pub async fn fs_open_copy(
 }
 
 /// Edit a remote file (F4): download it, open it in `editor` (blank: the
-/// default app), and upload every save (`fs://edit` events report it).
+/// default editor), and upload every save (`fs://edit` events report it).
 #[tauri::command]
 pub async fn fs_edit(
     registry: State<'_, FsRegistry>,
+    sessions: State<'_, SftpSessions>,
     copies: State<'_, OpenedCopies>,
     location: Location,
     editor: Option<String>,
 ) -> Result<CopyView, String> {
     let fs = registry.get(&location.fs)?;
+    let root = copies_root().map_err(|e| format!("could not make a folder for the copy: {e}"))?;
+    let keep_open = sessions.use_of(&registry, &location.fs);
     let (id, local) = copies
-        .edit(fs, &location.path, &copies_root())
+        .edit(fs, &location.path, &root, keep_open)
         .await
         .map_err(|e| format!("could not download {}: {e}", location.path.display()))?;
-    if let Err(e) = open_local(editor, local.clone()).await {
-        copies.close(std::slice::from_ref(&id));
+    if let Err(e) = open_local(true, editor, local.clone()).await {
+        copies.close(std::slice::from_ref(&id)).await;
         return Err(e);
     }
     Ok(CopyView {
@@ -511,9 +1034,20 @@ pub fn fs_edit_resolve(copies: State<'_, OpenedCopies>, id: String, overwrite: b
     copies.resolve(&id, overwrite);
 }
 
+/// Close a tab's copies; returns those kept because the server doesn't have
+/// all of them (the user is told where they are).
 #[tauri::command]
-pub fn fs_close_copies(copies: State<'_, OpenedCopies>, ids: Vec<String>) {
-    copies.close(&ids);
+pub async fn fs_close_copies(
+    copies: State<'_, OpenedCopies>,
+    ids: Vec<String>,
+) -> Result<Vec<KeptCopy>, String> {
+    Ok(copies.close(&ids).await)
+}
+
+/// Edited files whose latest changes aren't on the server yet (asked on exit).
+#[tauri::command]
+pub fn fs_edits_pending(copies: State<'_, OpenedCopies>) -> Vec<String> {
+    copies.unsynced()
 }
 
 /// Route `fs://edit` events to the window.
@@ -555,8 +1089,28 @@ mod tests {
             .await
             .unwrap();
         assert_ne!(local.parent(), other.parent());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(local.parent().unwrap())
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(
+                mode & 0o777,
+                0o700,
+                "only this user can enter a copy's folder"
+            );
+        }
+        #[cfg(windows)]
+        {
+            let mut stream = local.as_os_str().to_os_string();
+            stream.push(":Zone.Identifier");
+            let mark = std::fs::read_to_string(PathBuf::from(stream)).unwrap();
+            assert!(mark.contains("ZoneId=3"), "{mark}");
+        }
 
-        copies.close(&[id, second]);
+        assert!(copies.close(&[id, second]).await.is_empty());
         assert!(!local.exists() && !other.exists());
         assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
     }
@@ -612,45 +1166,61 @@ mod tests {
                     EditEvent::Uploaded { .. } => "uploaded",
                     EditEvent::Conflict { .. } => "conflict",
                     EditEvent::Failed { .. } => "failed",
+                    EditEvent::Stopped { .. } => "stopped",
                 })
                 .collect()
         }
 
+        fn count(&self, kind: &str) -> usize {
+            self.kinds().iter().filter(|seen| **seen == kind).count()
+        }
+
         async fn until(&self, kind: &str, count: usize) -> bool {
-            for _ in 0..200 {
-                if self.kinds().iter().filter(|seen| **seen == kind).count() >= count {
+            for _ in 0..250 {
+                if self.count(kind) >= count {
                     return true;
                 }
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
             false
         }
+
+        async fn edit(&self, path: &str) -> (String, PathBuf) {
+            self.copies
+                .edit(
+                    self.remote.clone(),
+                    &MemFs::path(path),
+                    self.root.path(),
+                    None,
+                )
+                .await
+                .unwrap()
+        }
     }
 
     /// Save the copy as an editor would: new contents, a later time.
     fn save(local: &Path, contents: &[u8], seconds_later: u64) {
+        save_at(
+            local,
+            contents,
+            SystemTime::now() + Duration::from_secs(seconds_later),
+        );
+    }
+
+    fn save_at(local: &Path, contents: &[u8], when: SystemTime) {
         std::fs::write(local, contents).unwrap();
-        let later = SystemTime::now() + Duration::from_secs(seconds_later);
         std::fs::File::options()
             .write(true)
             .open(local)
             .unwrap()
-            .set_modified(later)
+            .set_modified(when)
             .unwrap();
     }
 
     #[tokio::test]
     async fn each_save_is_uploaded_over_the_servers_file() {
         let e = editing();
-        let (id, local) = e
-            .copies
-            .edit(
-                e.remote.clone(),
-                &MemFs::path("/srv/app.conf"),
-                e.root.path(),
-            )
-            .await
-            .unwrap();
+        let (id, local) = e.edit("/srv/app.conf").await;
         save(&local, b"port=8080\n", 5);
         assert!(e.until("uploaded", 1).await, "{:?}", e.kinds());
         assert_eq!(e.remote.read("/srv/app.conf").unwrap(), b"port=8080\n");
@@ -663,23 +1233,49 @@ mod tests {
         );
         // No temporary upload files are left on the server.
         assert!(!e.remote.paths().iter().any(|path| path.contains("corepty")));
-        e.copies.close(&[id]);
-        tokio::time::sleep(POLL * 4).await;
+        assert!(e.copies.close(&[id]).await.is_empty());
         assert!(!local.exists());
+    }
+
+    #[tokio::test]
+    async fn two_saves_in_one_second_with_the_same_size_are_both_uploaded() {
+        let e = editing();
+        let (id, local) = e.edit("/srv/app.conf").await;
+        let second = UNIX_EPOCH
+            + Duration::from_secs(
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs()
+                    + 30,
+            );
+        save_at(&local, b"port=81\n", second + Duration::from_millis(100));
+        assert!(e.until("uploaded", 1).await, "{:?}", e.kinds());
+        save_at(&local, b"port=82\n", second + Duration::from_millis(600));
+        assert!(e.until("uploaded", 2).await, "{:?}", e.kinds());
+        assert_eq!(e.remote.read("/srv/app.conf").unwrap(), b"port=82\n");
+        e.copies.close(&[id]).await;
+    }
+
+    #[tokio::test]
+    async fn uploads_keep_the_files_permissions() {
+        let e = editing();
+        e.remote
+            .set_mode(&MemFs::path("/srv/app.conf"), 0o600)
+            .await
+            .unwrap();
+        let (id, local) = e.edit("/srv/app.conf").await;
+        save(&local, b"secret=2\n", 5);
+        assert!(e.until("uploaded", 1).await, "{:?}", e.kinds());
+        let meta = e.remote.stat(&MemFs::path("/srv/app.conf")).await.unwrap();
+        assert_eq!(meta.mode, Some(0o600), "a private file stays private");
+        e.copies.close(&[id]).await;
     }
 
     #[tokio::test]
     async fn a_file_changed_on_the_server_asks_before_it_is_overwritten() {
         let e = editing();
-        let (id, local) = e
-            .copies
-            .edit(
-                e.remote.clone(),
-                &MemFs::path("/srv/app.conf"),
-                e.root.path(),
-            )
-            .await
-            .unwrap();
+        let (id, local) = e.edit("/srv/app.conf").await;
         // Someone else changes it on the server.
         e.remote.add_file("/srv/app.conf", b"port=81 # theirs\n");
         save(&local, b"port=8080 # mine\n", 5);
@@ -688,57 +1284,160 @@ mod tests {
             e.remote.read("/srv/app.conf").unwrap(),
             b"port=81 # theirs\n"
         );
-        // Keep theirs: nothing is uploaded.
-        e.copies.resolve(&id, false);
-        tokio::time::sleep(POLL * 4).await;
-        assert_eq!(
-            e.remote.read("/srv/app.conf").unwrap(),
-            b"port=81 # theirs\n"
-        );
-        // The next save no longer clashes with theirs (it was seen): it goes up.
-        save(&local, b"port=8080 # mine, again\n", 10);
+        // Upload mine.
+        e.copies.resolve(&id, true);
         assert!(e.until("uploaded", 1).await, "{:?}", e.kinds());
         assert_eq!(
             e.remote.read("/srv/app.conf").unwrap(),
-            b"port=8080 # mine, again\n"
+            b"port=8080 # mine\n"
         );
+        e.copies.close(&[id]).await;
+    }
 
-        // Another outside change, this time overwritten.
-        e.remote.add_file("/srv/app.conf", b"theirs again\n");
-        save(&local, b"mine wins\n", 15);
-        assert!(e.until("conflict", 2).await, "{:?}", e.kinds());
-        e.copies.resolve(&id, true);
-        assert!(e.until("uploaded", 2).await, "{:?}", e.kinds());
-        assert_eq!(e.remote.read("/srv/app.conf").unwrap(), b"mine wins\n");
-        e.copies.close(&[id]);
+    #[tokio::test]
+    async fn keeping_the_servers_version_stops_uploads_and_keeps_the_copy() {
+        let e = editing();
+        let (id, local) = e.edit("/srv/app.conf").await;
+        e.remote.add_file("/srv/app.conf", b"theirs\n");
+        save(&local, b"mine\n", 5);
+        assert!(e.until("conflict", 1).await, "{:?}", e.kinds());
+        e.copies.resolve(&id, false);
+        assert!(e.until("stopped", 1).await, "{:?}", e.kinds());
+        // A later save (an autosave, say) must not overwrite theirs either.
+        save(&local, b"mine, saved again\n", 10);
+        tokio::time::sleep(POLL * 5).await;
+        assert_eq!(e.remote.read("/srv/app.conf").unwrap(), b"theirs\n");
+        assert_eq!(e.count("uploaded"), 0);
+        // Closing keeps the copy: the user's edits exist nowhere else.
+        let kept = e.copies.close(&[id]).await;
+        assert_eq!(kept.len(), 1, "{kept:?}");
+        assert_eq!(std::fs::read(&local).unwrap(), b"mine, saved again\n");
+    }
+
+    #[tokio::test]
+    async fn closing_while_asked_about_a_conflict_keeps_the_copy() {
+        let e = editing();
+        let (id, local) = e.edit("/srv/app.conf").await;
+        e.remote.add_file("/srv/app.conf", b"theirs\n");
+        save(&local, b"mine\n", 5);
+        assert!(e.until("conflict", 1).await, "{:?}", e.kinds());
+        let kept = e.copies.close(&[id]).await;
+        assert_eq!(kept.len(), 1, "{kept:?}");
+        assert_eq!(std::fs::read(&local).unwrap(), b"mine\n");
+        assert_eq!(e.remote.read("/srv/app.conf").unwrap(), b"theirs\n");
+    }
+
+    #[tokio::test]
+    async fn a_file_that_became_a_folder_on_the_server_is_never_replaced() {
+        let e = editing();
+        let (id, local) = e.edit("/srv/app.conf").await;
+        e.remote
+            .remove(&MemFs::path("/srv/app.conf"), false)
+            .await
+            .unwrap();
+        e.remote.add_dir("/srv/app.conf");
+        e.remote.add_file("/srv/app.conf/index.html", b"<html>");
+        save(&local, b"mine\n", 5);
+        assert!(e.until("stopped", 1).await, "{:?}", e.kinds());
+        assert_eq!(
+            e.remote.read("/srv/app.conf/index.html").unwrap(),
+            b"<html>"
+        );
+        assert_eq!(e.copies.close(&[id]).await.len(), 1);
     }
 
     #[tokio::test]
     async fn closing_uploads_a_last_save_then_deletes_the_copy() {
         let e = editing();
-        let (id, local) = e
-            .copies
-            .edit(
-                e.remote.clone(),
-                &MemFs::path("/srv/app.conf"),
-                e.root.path(),
-            )
-            .await
-            .unwrap();
+        let (id, local) = e.edit("/srv/app.conf").await;
         save(&local, b"saved just before closing\n", 5);
-        e.copies.close(&[id]);
-        assert!(e.until("uploaded", 1).await, "{:?}", e.kinds());
+        let kept = e.copies.close(&[id]).await;
+        assert!(kept.is_empty(), "{kept:?}");
         assert_eq!(
             e.remote.read("/srv/app.conf").unwrap(),
             b"saved just before closing\n"
         );
-        for _ in 0..50 {
-            if !local.exists() {
+        assert!(!local.exists());
+    }
+
+    /// A real sftp-server behind a reconnectable mount, as the app has it.
+    async fn mounted(
+        dir: &Path,
+    ) -> Option<(Arc<crate::vfs::mount::SftpMount>, tokio::process::Child)> {
+        let (sftp, server) = crate::sftp::testing::local_sftp(dir).await?;
+        Some((crate::vfs::mount::SftpMount::new(sftp), server))
+    }
+
+    async fn site(mount: &Arc<crate::vfs::mount::SftpMount>) -> VPath {
+        mount
+            .home()
+            .await
+            .unwrap()
+            .join(&VName::Posix(b"site.conf".to_vec()))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_save_that_could_not_be_uploaded_goes_up_after_a_reconnect() {
+        let server_dir = tempfile::tempdir().unwrap();
+        std::fs::write(server_dir.path().join("site.conf"), b"listen 80;\n").unwrap();
+        let Some((mount, mut server)) = mounted(server_dir.path()).await else {
+            return;
+        };
+        let remote = site(&mount).await;
+        let e = editing();
+        let (id, local) = e
+            .copies
+            .edit(mount.clone(), &remote, e.root.path(), None)
+            .await
+            .unwrap();
+        // The connection drops; the user saves anyway.
+        server.kill().await.unwrap();
+        for _ in 0..100 {
+            if !mount.is_connected() {
                 break;
             }
-            tokio::time::sleep(POLL).await;
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        assert!(!local.exists());
+        save(&local, b"listen 8080;\n", 5);
+        assert!(e.until("failed", 1).await, "{:?}", e.kinds());
+        // Retried quietly while down: one message, not one per try.
+        tokio::time::sleep(RETRY * 3).await;
+        assert_eq!(e.count("failed"), 1, "{:?}", e.kinds());
+        // Back: the save goes up without the user saving again.
+        let (second, _server) = crate::sftp::testing::local_sftp(server_dir.path())
+            .await
+            .unwrap();
+        mount.replace(second);
+        assert!(e.until("uploaded", 1).await, "{:?}", e.kinds());
+        assert_eq!(
+            std::fs::read(server_dir.path().join("site.conf")).unwrap(),
+            b"listen 8080;\n"
+        );
+        assert!(e.copies.close(&[id]).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn closing_keeps_a_copy_whose_save_is_not_on_the_server() {
+        let server_dir = tempfile::tempdir().unwrap();
+        std::fs::write(server_dir.path().join("site.conf"), b"listen 80;\n").unwrap();
+        let Some((mount, mut server)) = mounted(server_dir.path()).await else {
+            return;
+        };
+        let remote = site(&mount).await;
+        let e = editing();
+        let (id, local) = e
+            .copies
+            .edit(mount.clone(), &remote, e.root.path(), None)
+            .await
+            .unwrap();
+        server.kill().await.unwrap();
+        save(&local, b"listen 8080;\n", 5);
+        assert!(e.until("failed", 1).await, "{:?}", e.kinds());
+        let kept = e.copies.close(&[id]).await;
+        assert_eq!(kept.len(), 1, "{kept:?}");
+        assert_eq!(kept[0].path, local.to_string_lossy());
+        assert_eq!(std::fs::read(&local).unwrap(), b"listen 8080;\n");
     }
 
     #[tokio::test]
@@ -754,7 +1453,7 @@ mod tests {
         let e = editing();
         let (id, local) = e
             .copies
-            .edit(Arc::new(sftp), &remote, e.root.path())
+            .edit(Arc::new(sftp), &remote, e.root.path(), None)
             .await
             .unwrap();
         assert_eq!(std::fs::read(&local).unwrap(), b"listen 80;\n");
@@ -766,7 +1465,88 @@ mod tests {
         );
         let leftovers = std::fs::read_dir(server_dir.path()).unwrap().count();
         assert_eq!(leftovers, 1, "only the file itself");
-        e.copies.close(&[id]);
+        e.copies.close(&[id]).await;
+    }
+
+    /// Saves through a link go to the file it points at; the link stays.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn editing_through_a_link_updates_the_linked_file() {
+        let server_dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(server_dir.path().join("available")).unwrap();
+        std::fs::write(server_dir.path().join("available/site"), b"listen 80;\n").unwrap();
+        std::os::unix::fs::symlink("available/site", server_dir.path().join("enabled")).unwrap();
+        let Some((sftp, _server)) = crate::sftp::testing::local_sftp(server_dir.path()).await
+        else {
+            return;
+        };
+        let home = sftp.home().await.unwrap();
+        let link = home.join(&VName::Posix(b"enabled".to_vec())).unwrap();
+        let e = editing();
+        let (id, local) = e
+            .copies
+            .edit(Arc::new(sftp), &link, e.root.path(), None)
+            .await
+            .unwrap();
+        save(&local, b"listen 8080;\n", 5);
+        assert!(e.until("uploaded", 1).await, "{:?}", e.kinds());
+        assert!(std::fs::symlink_metadata(server_dir.path().join("enabled"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(
+            std::fs::read(server_dir.path().join("available/site")).unwrap(),
+            b"listen 8080;\n"
+        );
+        e.copies.close(&[id]).await;
+    }
+
+    #[test]
+    fn files_that_run_code_are_recognized() {
+        for name in [
+            "deploy.bat",
+            "SETUP.EXE",
+            "run.cmd",
+            "x.ps1",
+            "a.vbs",
+            "app.hta",
+            "link.lnk",
+            "install.sh",
+            "tool.py",
+            "start.desktop",
+            "x.jar",
+            "notes.txt.exe",
+            "trailing.exe.",
+        ] {
+            assert!(runs_code(name), "{name}");
+        }
+        // A name that reads as a PDF but ends in .exe.
+        assert!(runs_code("invoice\u{202E}fdp.exe"));
+        assert!(runs_code("report\u{202E}.txt"));
+        for name in [
+            "notes.txt",
+            "photo.jpg",
+            "config.yml",
+            "Makefile",
+            "archive.tar.gz",
+        ] {
+            assert!(!runs_code(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn bare_program_names_are_found_with_windows_extensions() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("code.cmd"), b"@echo off").unwrap();
+        let path = std::env::join_paths([dir.path()]).unwrap();
+        assert_eq!(
+            find_program("code", &path, ".COM;.EXE;.BAT;.CMD"),
+            Some(dir.path().join("code.cmd"))
+        );
+        assert_eq!(find_program("missing", &path, ".EXE;.CMD"), None);
+        // With a folder or an extension, the name is used as given.
+        assert_eq!(find_program("code.cmd", &path, ".CMD"), None);
+        assert_eq!(find_program("bin/code", &path, ".CMD"), None);
     }
 
     #[test]

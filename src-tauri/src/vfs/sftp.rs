@@ -1062,9 +1062,14 @@ mod tests {
                 & 0o777
         };
         let before = mode("outside.txt");
-        crate::vfs::commands::chmod(&sftp, &at(&sftp, "site"), 0o640, true)
-            .await
-            .unwrap();
+        crate::vfs::commands::chmod(
+            &sftp,
+            &at(&sftp, "site"),
+            crate::vfs::commands::ModeChange::to(0o640),
+            true,
+        )
+        .await
+        .unwrap();
         assert_eq!(mode("site/css/app.css"), 0o640);
         assert_eq!(mode("site/css"), 0o750);
         assert_eq!(mode("site"), 0o750);
@@ -1389,7 +1394,13 @@ mod tests {
         };
         // Write-only, so no listing the folders afterwards: each is changed
         // after its contents.
-        let changed = crate::vfs::commands::chmod(&sftp, &at(&sftp, "locked"), 0o200, true).await;
+        let changed = crate::vfs::commands::chmod(
+            &sftp,
+            &at(&sftp, "locked"),
+            crate::vfs::commands::ModeChange::to(0o200),
+            true,
+        )
+        .await;
         #[cfg(unix)]
         for folder in ["locked", "locked/inner"] {
             use std::os::unix::fs::PermissionsExt;

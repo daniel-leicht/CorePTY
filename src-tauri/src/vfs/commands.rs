@@ -175,34 +175,87 @@ pub async fn fs_delete(
     Ok(())
 }
 
-/// Set POSIX permissions (the Properties dialog). Returns how many entries
+/// Set POSIX permissions (the Properties dialog): the bits in `set` on, those
+/// in `clear` off, the rest as each entry has them. Returns how many entries
 /// changed.
 #[tauri::command]
 pub async fn fs_chmod(
     registry: State<'_, FsRegistry>,
     location: Location,
-    mode: u32,
+    set: u32,
+    clear: u32,
     recursive: bool,
 ) -> Result<u64, String> {
     let fs = provider(&registry, &location.fs)?;
-    chmod(fs.as_ref(), &location.path, mode & 0o7777, recursive)
-        .await
-        .map_err(|e| failed("change the permissions of", &location.path, e))
+    chmod(
+        fs.as_ref(),
+        &location.path,
+        ModeChange { set, clear },
+        recursive,
+    )
+    .await
+    .map_err(|e| failed("change the permissions of", &location.path, e))
 }
 
-/// Apply `mode` to `path`; with `recursive`, to everything inside it too.
+/// Permission bits to turn on (`set`) and off (`clear`); the others stay as
+/// they are, so one change can apply to entries with different modes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModeChange {
+    pub set: u32,
+    pub clear: u32,
+}
+
+impl ModeChange {
+    /// Exactly `mode`, whatever was there.
+    #[cfg(test)]
+    pub fn to(mode: u32) -> Self {
+        Self {
+            set: mode & 0o7777,
+            clear: !mode & 0o7777,
+        }
+    }
+
+    /// The new mode for an entry that has `old`. `None` when the mode isn't
+    /// known and the change doesn't decide every bit.
+    fn apply(&self, old: Option<u32>) -> Option<u32> {
+        let decides_all = (self.set | self.clear) & 0o7777 == 0o7777;
+        let base = match old {
+            Some(mode) => mode & 0o7777,
+            None if decides_all => 0,
+            None => return None,
+        };
+        Some(((base & !self.clear) | self.set) & 0o7777)
+    }
+}
+
+/// Apply `change` to `path`; with `recursive`, to everything inside it too.
 /// Recursively, folders also get `x` wherever `r` is set (so they stay
 /// openable), each after its contents (a mode that locks its owner out
 /// would otherwise stop the walk), and links inside are left alone rather
 /// than followed out of the tree. An item that can't be changed doesn't stop
 /// the rest; the error then says how many failed.
-pub async fn chmod(fs: &dyn Vfs, path: &VPath, mode: u32, recursive: bool) -> io::Result<u64> {
-    let top = fs.lstat(path).await?;
+pub async fn chmod(
+    fs: &dyn Vfs,
+    path: &VPath,
+    change: ModeChange,
+    recursive: bool,
+) -> io::Result<u64> {
+    let mut top = fs.lstat(path).await?;
+    if top.kind == EntryKind::Symlink {
+        // A link given directly: its target's mode is what changes.
+        top = fs.stat(path).await?;
+    }
+    let unknown = || {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "its permissions aren't known, so only a complete mode can be set",
+        )
+    };
     if !(recursive && top.is_real_directory()) {
+        let mode = change.apply(top.mode).ok_or_else(unknown)?;
         fs.set_mode(path, mode).await?;
         return Ok(1);
     }
-    let folder_mode = mode | ((mode & 0o444) >> 2);
     // (path, metadata, depth, its contents are done)
     let mut pending = vec![(path.clone(), top, 0_usize, false)];
     let mut changed = 0;
@@ -234,10 +287,14 @@ pub async fn chmod(fs: &dyn Vfs, path: &VPath, mode: u32, recursive: bool) -> io
             }
             continue;
         }
-        match fs
-            .set_mode(&path, if folder { folder_mode } else { mode })
-            .await
-        {
+        let Some(mut mode) = change.apply(meta.mode) else {
+            fail(path, unknown());
+            continue;
+        };
+        if folder {
+            mode |= (mode & 0o444) >> 2;
+        }
+        match fs.set_mode(&path, mode).await {
             Ok(()) => changed += 1,
             Err(error) => fail(path, error),
         }
@@ -393,7 +450,7 @@ mod tests {
         fs.add_file("/site/css/app.css", b"*{}");
         // Just the folder.
         assert_eq!(
-            chmod(&fs, &MemFs::path("/site"), 0o750, false)
+            chmod(&fs, &MemFs::path("/site"), ModeChange::to(0o750), false)
                 .await
                 .unwrap(),
             1
@@ -406,7 +463,7 @@ mod tests {
             Some(0o644)
         );
         // Everything in it: files get the mode as given.
-        let changed = chmod(&fs, &MemFs::path("/site"), 0o640, true)
+        let changed = chmod(&fs, &MemFs::path("/site"), ModeChange::to(0o640), true)
             .await
             .unwrap();
         assert_eq!(changed, 4);
@@ -417,5 +474,49 @@ mod tests {
                 "{file}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_change_keeps_each_entrys_other_bits() {
+        let fs = MemFs::new();
+        fs.add_dir("/site");
+        fs.add_file("/site/deploy.sh", b"#!/bin/sh");
+        fs.add_file("/site/notes.txt", b"x");
+        let set = |path: &str, mode: u32| {
+            let fs = &fs;
+            let path = MemFs::path(path);
+            async move { fs.set_mode(&path, mode).await.unwrap() }
+        };
+        set("/site", 0o755).await;
+        set("/site/deploy.sh", 0o750).await;
+        set("/site/notes.txt", 0o600).await;
+        // Group write, nothing else: each keeps the rest of its own mode.
+        // (MemFs keeps modes on files only.)
+        let group_write = ModeChange {
+            set: 0o020,
+            clear: 0,
+        };
+        chmod(&fs, &MemFs::path("/site"), group_write, true)
+            .await
+            .unwrap();
+        let mode = |path: &str| {
+            let fs = &fs;
+            let path = MemFs::path(path);
+            async move { fs.stat(&path).await.unwrap().mode }
+        };
+        assert_eq!(mode("/site/deploy.sh").await, Some(0o770));
+        assert_eq!(mode("/site/notes.txt").await, Some(0o620));
+        let no_group_write = ModeChange {
+            set: 0,
+            clear: 0o020,
+        };
+        chmod(&fs, &MemFs::path("/site"), no_group_write, true)
+            .await
+            .unwrap();
+        assert_eq!(mode("/site/deploy.sh").await, Some(0o750));
+        assert_eq!(mode("/site/notes.txt").await, Some(0o600));
+        // A partial change can't apply to a mode that isn't known.
+        assert_eq!(group_write.apply(None), None);
+        assert_eq!(ModeChange::to(0o640).apply(None), Some(0o640));
     }
 }

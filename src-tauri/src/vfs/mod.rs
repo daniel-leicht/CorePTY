@@ -334,15 +334,16 @@ pub fn unsupported(what: &str) -> io::Error {
 }
 
 /// The filesystems the file manager can reach, by id. `local` is always there;
-/// remote ones come and go with their connections.
+/// remote ones come and go with their connections. Clones share one registry.
+#[derive(Clone)]
 pub struct FsRegistry {
-    filesystems: RwLock<HashMap<FsId, Arc<dyn Vfs>>>,
+    filesystems: Arc<RwLock<HashMap<FsId, Arc<dyn Vfs>>>>,
 }
 
 impl Default for FsRegistry {
     fn default() -> Self {
         let registry = Self {
-            filesystems: RwLock::new(HashMap::new()),
+            filesystems: Arc::default(),
         };
         registry.register(FsId::local(), Arc::new(local::LocalFs));
         registry

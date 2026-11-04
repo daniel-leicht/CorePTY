@@ -290,9 +290,14 @@ async fn real_chmod_rename_and_recursive_delete() {
 
     remote.fs.set_mode(&file, 0o444).await.unwrap();
     assert!(remote.fs.stat(&file).await.unwrap().readonly);
-    let changed = crate::vfs::commands::chmod(remote.fs.as_ref(), &file, 0o750, false)
-        .await
-        .unwrap();
+    let changed = crate::vfs::commands::chmod(
+        remote.fs.as_ref(),
+        &file,
+        crate::vfs::commands::ModeChange::to(0o750),
+        false,
+    )
+    .await
+    .unwrap();
     assert_eq!(changed, 1);
     let mode = remote.fs.stat(&file).await.unwrap().mode.unwrap();
     assert_ne!(mode & 0o200, 0, "writable again: {mode:o}");

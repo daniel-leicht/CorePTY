@@ -21,19 +21,100 @@ struct Opened {
     /// The SSH connection the current session runs on.
     connection_id: String,
     label: String,
-    /// Panels using it; it's closed when the last one lets go.
+    /// Where it was first opened (host, port, user): a reconnect must go
+    /// back there.
+    server: Server,
+    /// Panels, transfer jobs and edited files using it; it's closed when the
+    /// last one lets go.
     users: usize,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Server {
+    host: String,
+    port: u16,
+    username: String,
+}
+
+impl Server {
+    fn of(lease: &ConnectionLease) -> Self {
+        Self {
+            host: lease.host.to_ascii_lowercase(),
+            port: lease.port,
+            username: lease.username.clone(),
+        }
+    }
+}
+
+type OpenMap = Arc<Mutex<HashMap<FsId, Opened>>>;
 
 /// Tauri-managed state: the open SFTP filesystems.
 #[derive(Default)]
 pub struct SftpSessions {
-    open: Mutex<HashMap<FsId, Opened>>,
+    open: OpenMap,
+}
+
+fn lock(open: &OpenMap) -> MutexGuard<'_, HashMap<FsId, Opened>> {
+    open.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// One user fewer of `fs`; the last one closes it (and the SSH connection,
+/// unless a terminal tab still uses it).
+fn release(open: &OpenMap, registry: &FsRegistry, fs: &FsId) {
+    let mut open = lock(open);
+    let Some(opened) = open.get_mut(fs) else {
+        return;
+    };
+    opened.users = opened.users.saturating_sub(1);
+    if opened.users == 0 {
+        open.remove(fs);
+        registry.unregister(fs);
+    }
 }
 
 impl SftpSessions {
     fn open(&self) -> MutexGuard<'_, HashMap<FsId, Opened>> {
-        self.open.lock().unwrap_or_else(|e| e.into_inner())
+        lock(&self.open)
+    }
+
+    /// One more user of `fs`, if it's open.
+    pub fn retain(&self, fs: &FsId) -> bool {
+        match self.open().get_mut(fs) {
+            Some(opened) => {
+                opened.users += 1;
+                true
+            }
+            None => false,
+        }
+    }
+
+    pub fn release(&self, registry: &FsRegistry, fs: &FsId) {
+        release(&self.open, registry, fs);
+    }
+
+    /// Keep `fs` open while the returned guard lives (`None` for one that
+    /// isn't an open SFTP filesystem: local, say).
+    pub fn use_of(&self, registry: &FsRegistry, fs: &FsId) -> Option<SessionUse> {
+        self.retain(fs).then(|| SessionUse {
+            open: self.open.clone(),
+            registry: registry.clone(),
+            fs: fs.clone(),
+        })
+    }
+}
+
+/// Keeps an SFTP filesystem open, and so reconnectable, while it lives: held
+/// by a transfer job or an edited file, which may outlast every panel
+/// showing the server.
+pub struct SessionUse {
+    open: OpenMap,
+    registry: FsRegistry,
+    fs: FsId,
+}
+
+impl Drop for SessionUse {
+    fn drop(&mut self) {
+        release(&self.open, &self.registry, &self.fs);
     }
 }
 
@@ -206,6 +287,7 @@ pub async fn sftp_connect(
     let (lease, notice) = lease_for(&connections, &options).await?;
     let connection_id = lease.id.clone();
     let label = lease.label();
+    let server = Server::of(&lease);
     let fs = SftpFs::over_connection(lease).await?;
     let id = FsId(format!("sftp:{connection_id}"));
 
@@ -234,6 +316,7 @@ pub async fn sftp_connect(
                         mount: mount.clone(),
                         connection_id: connection_id.clone(),
                         label: label.clone(),
+                        server,
                         users: 1,
                     },
                 );
@@ -286,6 +369,19 @@ pub async fn sftp_reconnect(
     let (lease, notice) = lease_for(&connections, &options).await?;
     let connection_id = lease.id.clone();
     let label = lease.label();
+    // The same server and account: paused jobs and edited files carry on
+    // under this id, and must not land somewhere else.
+    let first = sessions
+        .open()
+        .get(&fs)
+        .map(|opened| (opened.server.clone(), opened.label.clone()));
+    if let Some((server, first_label)) = first {
+        if server != Server::of(&lease) {
+            return Err(format!(
+                "that login is for {label}, not {first_label}; open it on its own instead"
+            ));
+        }
+    }
     mount.replace(SftpFs::over_connection(lease).await?);
     if let Some(opened) = sessions.open().get_mut(&fs) {
         opened.connection_id = connection_id.clone();
@@ -300,15 +396,15 @@ pub async fn sftp_reconnect(
 /// SSH connection, unless a terminal tab still uses it).
 #[tauri::command]
 pub fn sftp_close(registry: State<'_, FsRegistry>, sessions: State<'_, SftpSessions>, fs: FsId) {
-    let mut open = sessions.open();
-    let Some(opened) = open.get_mut(&fs) else {
-        return;
-    };
-    opened.users = opened.users.saturating_sub(1);
-    if opened.users == 0 {
-        open.remove(&fs);
-        registry.unregister(&fs);
-    }
+    sessions.release(&registry, &fs);
+}
+
+/// One more panel on an open filesystem (connected or not): a panel going
+/// back to a server another panel or a job keeps open. False when it's not
+/// open any more. Release it with `sftp_close`.
+#[tauri::command]
+pub fn sftp_retain(sessions: State<'_, SftpSessions>, fs: FsId) -> bool {
+    sessions.retain(&fs)
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -337,4 +433,47 @@ pub fn sftp_sessions(sessions: State<'_, SftpSessions>) -> Vec<SftpSessionView> 
         .collect();
     views.sort_by(|a, b| a.label.cmp(&b.label));
     views
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_job_keeps_a_server_open_after_its_last_panel_lets_go() {
+        let dir = tempfile::tempdir().unwrap();
+        let Some((sftp, _server)) = crate::sftp::testing::local_sftp(dir.path()).await else {
+            return;
+        };
+        let fs = FsId("sftp:conn".to_string());
+        let registry = FsRegistry::default();
+        let sessions = SftpSessions::default();
+        let mount = SftpMount::new(sftp);
+        registry.register(fs.clone(), mount.clone());
+        sessions.open().insert(
+            fs.clone(),
+            Opened {
+                mount,
+                connection_id: "conn".to_string(),
+                label: "me@host".to_string(),
+                server: Server {
+                    host: "host".to_string(),
+                    port: 22,
+                    username: "me".to_string(),
+                },
+                users: 1, // the panel that opened it
+            },
+        );
+        let job = sessions.use_of(&registry, &fs).expect("open");
+        // The panel closes; the job still has the server (and can reconnect it).
+        sessions.release(&registry, &fs);
+        assert!(registry.get(&fs).is_ok());
+        assert!(sessions.retain(&fs), "a panel can come back to it");
+        sessions.release(&registry, &fs);
+        // The job ends: now it closes.
+        drop(job);
+        assert!(registry.get(&fs).is_err());
+        assert!(!sessions.retain(&fs));
+        assert!(sessions.use_of(&registry, &FsId::local()).is_none());
+    }
 }
