@@ -21,10 +21,12 @@ const scene = params.get("scene") ?? "terminal";
 const sessionIds: string[] = [];
 // `?big=N` adds C:\big with N files; `?step=ms` paces simulated transfers;
 // `?partial=1` presents clashes as partial copies (the Resume dialog).
+// The SFTP scene holds its upload part-way, for a still frame.
 const showcaseFs = new ShowcaseFs({
   bigFolder: Number(params.get("big")) || 0,
   stepMs: Number(params.get("step")) || undefined,
   partialConflicts: params.get("partial") === "1",
+  holdAt: scene === "sftp" ? 0.5 : undefined,
 });
 
 const folders = [
@@ -150,7 +152,79 @@ await app.mount();
 markCaptureStage("app-mounted");
 
 if (scene === "files") await renderFileManagerShowcase();
+else if (scene === "sftp") await renderSftpShowcase();
 else await renderTerminalShowcase();
+
+/** Local downloads on the left, the server's releases on the right, an upload running. */
+async function renderSftpShowcase(): Promise<void> {
+  // "Open SFTP" comes from an SSH tab: the panel shares its connection.
+  await app.newSsh({
+    name: "edge-01",
+    kind: "ssh",
+    host: "edge-01.example.net",
+    port: 22,
+    username: "deploy",
+    authType: "key",
+    password: "",
+    keyPath: "C:\Users\dev\.ssh\id_ed25519",
+    passphrase: "",
+    saveSecret: false,
+    folderId: "production",
+  });
+  for (const session of (app as unknown as { tabs: Array<{ setStatus?: (status: "connected") => void }> }).tabs) {
+    session.setStatus?.("connected");
+  }
+  const local = { fs: "local", path: "m:C:\\Users\\dev\\Downloads", display: "C:\\Users\\dev\\Downloads" };
+  app.newFileManager([local, undefined], { side: 1, target: { kind: "live", connectionId: REMOTE_CONNECTION } });
+  markCaptureStage("sftp-opened");
+  const panel = (side: number) =>
+    document.querySelector<HTMLElement>(`.file-manager.is-active .fm-panel[data-panel="${side}"]`);
+  const rows = (side: number) => [...(panel(side)?.querySelectorAll<HTMLElement>(".fm-row") ?? [])];
+  const named = (side: number, name: string) =>
+    rows(side).find((row) => row.querySelector(".fm-row__name")?.textContent === name);
+  const waitUntil = async (test: () => boolean) => {
+    for (let attempt = 0; attempt < 120 && !test(); attempt += 1) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 25));
+    }
+  };
+  const need = <T>(value: T | null | undefined, what: string): T => {
+    if (value === null || value === undefined) {
+      const panels = [...document.querySelectorAll<HTMLElement>(".fm-panel")].map(
+        (each) => `${each.dataset.panel}:${each.querySelector<HTMLInputElement>(".fm-path")?.value}:${each.querySelectorAll(".fm-row").length}`
+      );
+      throw new Error(`SFTP scene: no ${what} (panels ${panels.join(", ")}; focus ${document.activeElement?.className})`);
+    }
+    return value;
+  };
+  await waitUntil(() => rows(0).length >= 5 && rows(1).length >= 3);
+  // The right panel goes to the releases folder.
+  const path = need(panel(1)?.querySelector<HTMLInputElement>(".fm-path"), "right path field");
+  path.value = "/home/deploy/app/releases";
+  path.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+  await waitUntil(() => !!named(1, "checksums.txt"));
+  // Mark the two packages and send them up (F5, then Enter in the prompt).
+  for (const name of ["corepty-0.4.0-x64-setup.exe", "corepty-portable.zip"]) {
+    named(0, name)?.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, button: 0, ctrlKey: true }));
+  }
+  const grid = need(panel(0)?.querySelector<HTMLElement>(".fm-grid"), "left grid");
+  grid.focus();
+  const press = (target: Element, key: string) =>
+    target.dispatchEvent(new KeyboardEvent("keydown", { key, code: key, bubbles: true, cancelable: true }));
+  press(grid, "F5");
+  await waitUntil(() => !!document.querySelector(".fm-prompt input"));
+  const prompt = need(document.querySelector<HTMLInputElement>(".fm-prompt input"), "copy prompt");
+  prompt.focus();
+  press(prompt, "Enter");
+  await waitUntil(() => /50%|of/.test(document.querySelector(".fm-job .fm-job__detail")?.textContent ?? ""));
+  await waitUntil(() => !!document.querySelector(".fm-job.is-running"));
+  // The cursor rests on a release folder, the left panel active.
+  named(1, "0.3.8")?.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, button: 0 }));
+  need(panel(0)?.querySelector<HTMLElement>(".fm-grid"), "left grid").focus();
+  await new Promise<void>((resolve) => setTimeout(resolve, 150));
+  await new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
+  markCaptureStage("sftp-ready");
+  document.documentElement.dataset.showcaseReady = "true";
+}
 
 async function renderFileManagerShowcase(): Promise<void> {
   const at = (display: string) => ({ fs: "local", path: `m:${display}`, display });

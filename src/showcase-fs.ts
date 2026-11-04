@@ -36,10 +36,15 @@ export class ShowcaseFs {
   private readonly stepMs: number;
   /** Present every clash as a partial copy (the Resume dialog). */
   private readonly partialConflicts: boolean;
+  /** Stop transfers for good once this share of their bytes is done (a still frame). */
+  private readonly holdAt: number | null;
 
-  constructor(options: { bigFolder?: number; stepMs?: number; partialConflicts?: boolean } = {}) {
+  constructor(
+    options: { bigFolder?: number; stepMs?: number; partialConflicts?: boolean; holdAt?: number } = {}
+  ) {
     this.stepMs = options.stepMs ?? 40;
     this.partialConflicts = options.partialConflicts ?? false;
+    this.holdAt = options.holdAt ?? null;
     this.dir("C:\\");
     this.dir("C:\\Users");
     this.dir(HOME);
@@ -49,7 +54,7 @@ export class ShowcaseFs {
     for (const [name, at] of [[".github", 1260], ["docs", 840], ["src", 1320], ["src-tauri", 1140]] as const) {
       this.dir(`${project}\\${name}`, at);
     }
-    this.file(`${project}\\package.json`, 1426, 1200, '{\n  "name": "corepty",\n  "version": "0.3.8"\n}\n');
+    this.file(`${project}\\package.json`, 1426, 1200, '{\n  "name": "corepty",\n  "version": "0.4.0"\n}\n');
     this.file(`${project}\\README.md`, 12184, 1100, "# CorePTY\n\nA modern terminal workspace with SSH, Telnet, and dual-pane file management.\n");
     this.file(`${project}\\LICENSE`, 35150, -1425600, "GNU GENERAL PUBLIC LICENSE\nVersion 3, 29 June 2007\n");
     this.file(`${project}\\vite.config.ts`, 1173, 1020, 'import { defineConfig } from "vite";\n');
@@ -59,10 +64,10 @@ export class ShowcaseFs {
     this.dir(downloads, 600);
     this.dir(`${downloads}\\Screenshots`, 500);
     this.dir(`${downloads}\\Releases`, 200);
-    this.file(`${downloads}\\corepty-0.3.8-x64-setup.exe`, 8734912, 1300);
+    this.file(`${downloads}\\corepty-0.4.0-x64-setup.exe`, 8734912, 1300);
     this.file(`${downloads}\\corepty-portable.zip`, 7218432, 1240);
     this.file(`${downloads}\\terminal-themes.png`, 1842205, 800);
-    this.file(`${downloads}\\release-notes.txt`, 4821, 600, "CorePTY 0.3.8\n\n- Stabilized terminal UI\n- Installer upgrades\n");
+    this.file(`${downloads}\\release-notes.txt`, 4821, 600, "CorePTY 0.4.0\n\n- Dual-pane file manager, local and SFTP\n- Tab strip fixes\n");
     // The remote host: POSIX paths.
     for (const dir of ["/", "/home", REMOTE_HOME, `${REMOTE_HOME}/app`, `${REMOTE_HOME}/app/releases`, "/var", "/var/www", "/var/log"]) {
       this.dir(dir, 900);
@@ -72,6 +77,15 @@ export class ShowcaseFs {
     this.file(`${REMOTE_HOME}/app/server.log`, 2_480_220, 1310, "started\n");
     this.file(`${REMOTE_HOME}/deploy.sh`, 940, 1100, "#!/bin/sh\nset -e\n");
     this.file("/var/www/index.html", 5120, 900, "<!doctype html>\n");
+    // Releases on the server, for the SFTP scene.
+    const releases = `${REMOTE_HOME}/app/releases`;
+    for (const [name, at] of [["0.3.6", -10080], ["0.3.7", -4320], ["0.3.8", 600], ["current", 600]] as const) {
+      this.dir(`${releases}/${name}`, at);
+    }
+    this.file(`${releases}/checksums.txt`, 512, 610, "sha256  corepty-0.3.8-x64-setup.exe\n");
+    this.file(`${releases}/deploy.sh`, 1284, 1100, "#!/bin/sh\nset -e\n");
+    this.file(`${releases}/release-notes.md`, 6210, 620, "# CorePTY 0.3.8\n");
+    this.file(`${releases}/.env`, 210, -2000, "PORT=8080\n");
     if (options.bigFolder) {
       const big = "C:\\big";
       this.dir(big);
@@ -104,7 +118,7 @@ export class ShowcaseFs {
         return null;
       case "fs_edit":
       case "fs_open_copy":
-        return { id: "copy-1", path: `C:\Users\dev\AppData\Local\Temp\CorePTY\open\copy-1\${nameOf(untoken(a.location.path))}` };
+        return { id: "copy-1", path: `C:\\Users\\dev\\AppData\\Local\\Temp\\CorePTY\\open\\copy-1\\${nameOf(untoken(a.location.path))}` };
       case "sftp_sessions":
         return [{ fs: REMOTE_FS, connectionId: REMOTE_CONNECTION, label: REMOTE_LABEL, users: 1, connected: true }];
       case "ssh_connections":
@@ -367,6 +381,10 @@ export class ShowcaseFs {
           }
           if (action === "rename") target = answer.name ? join(folder, answer.name) : this.unique(folder, nameOf(source));
           else this.removeTree(target);
+        }
+        if (!node.dir && this.holdAt !== null && totals.bytes && done.bytes / totals.bytes >= this.holdAt) {
+          progress(nameOf(source));
+          await new Promise(() => {});
         }
         await pause();
         if (node.dir) {

@@ -74,6 +74,8 @@ under safe spellings when downloaded.
 
 <div align="center">
   <img src="docs/file-manager.png" alt="CorePTY dual-pane file manager" width="840" />
+  <br /><br />
+  <img src="docs/file-manager-sftp.png" alt="CorePTY file manager with a local panel, an SFTP panel, and an upload in the transfer queue" width="840" />
 </div>
 
 ## Downloads
@@ -274,7 +276,8 @@ Git for Windows ships one, and Linux and macOS have OpenSSH (set
 marked `#[ignore]`; `scripts/sftp-real-tests.sh` starts a throwaway one on
 127.0.0.1 and runs them (`--bench` adds a throughput benchmark).
 
-Regenerate the README's deterministic theme gallery on Windows with
+Regenerate the README's deterministic screenshots (the theme gallery and the
+file manager, local and with SFTP) on Windows with
 `npm run screenshots`.
 
 ### Release build
