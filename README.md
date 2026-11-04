@@ -3,7 +3,7 @@
 
   <h1>CorePTY</h1>
 
-  <p><strong>A cross-platform terminal workspace with local shells, SSH, Telnet, and dual-pane file management.</strong></p>
+  <p><strong>A cross-platform terminal workspace with local shells, SSH, Telnet, and a dual-pane local and SFTP file manager.</strong></p>
 
   <p>
     <a href="https://github.com/daniel-leicht/CorePTY/actions/workflows/ci.yml"><img src="https://github.com/daniel-leicht/CorePTY/actions/workflows/ci.yml/badge.svg" alt="Continuous integration status" /></a>
@@ -20,8 +20,9 @@
 
 CorePTY is a tabbed desktop terminal workspace built with [Tauri 2](https://tauri.app/),
 [xterm.js](https://xtermjs.org/), and Rust. It provides local pseudo-terminal
-sessions, SSH connections, Telnet connections, and local file management in one
-interface without bundling a Chromium runtime.
+sessions, SSH connections, Telnet connections, and a Commander-style file manager
+for this machine and SFTP servers in one interface, without bundling a Chromium
+runtime.
 
 Connection profiles can be organized into nested folders. Saved passwords and
 private-key passphrases are stored in the operating system keychain rather than
@@ -41,14 +42,21 @@ in the profile file.
   connection colors.
 - Dynamic terminal titles, tab duplication, reconnect support, search, and
   configurable right-click behavior.
-- A modern Commander-style file-manager tab with two independently navigable
-  panels, sortable columns, history, path entry, filtering, and hidden-file
-  controls.
-- Mouse and keyboard file workflows: multi-selection, contextual menus,
-  cross-panel drag and drop, clipboard operations, text/image preview, and
-  cancellable copy or move progress.
-- Cross-platform file operations including rename, folder creation, conflict
-  policies, operating-system Trash/Recycle Bin, and explicit permanent delete.
+- A Commander-style file manager (in the spirit of Norton Commander and
+  WinSCP): two panels, each showing this machine or an SFTP server, so files
+  move local to remote, remote to local, or between two servers.
+- SFTP on the SSH connection a terminal tab already has (no second login), or
+  on a saved connection; remote panels can follow the terminal's working folder.
+- A background transfer queue with progress, speed, and time left; clashes ask
+  once per item (overwrite, skip, keep both, newer only, or apply to all), big
+  files resume from a `.filepart` after an interruption, and jobs pause while a
+  connection is down and carry on after Reconnect.
+- Remote files: view in place, open a downloaded copy, or edit one in your
+  editor with every save uploaded back (after checking the server's file didn't
+  change meanwhile); a Properties dialog with a permissions (chmod) editor.
+- Keyboard-first marking (Insert, Space, Shift+movement, numpad masks), quick
+  search by typing, filters, history, sortable columns, drag and drop, and a
+  clipboard; Trash/Recycle Bin for local files and explicit permanent delete.
 - Eight built-in application and terminal themes.
 - Configurable fonts, cursor styles, scrollback, bell behavior, minimum
   contrast, and copy-on-select.
@@ -56,9 +64,13 @@ in the profile file.
 ### File manager
 
 The file manager keeps the speed and two-panel structure of classic Commander
-tools while using CorePTY's current theme and modern desktop conventions. It is
-local-only today; each panel already uses an independent provider/location model
-so a later SFTP provider can support local-to-remote and remote-to-remote tabs.
+tools while using CorePTY's current theme and modern desktop conventions. Each
+panel shows a location on a filesystem: this machine, or an SFTP server opened
+from the location menu (`Alt+F1` / `Alt+F2`), from an SSH tab's context menu
+("Open SFTP"), or from a saved connection. Panels on one server share a single
+SFTP session, so a move between them is a rename on the server. Remote names
+are kept byte for byte; names Windows can't store (`a:b`, `CON`) are saved
+under safe spellings when downloaded.
 
 <div align="center">
   <img src="docs/file-manager.png" alt="CorePTY dual-pane file manager" width="840" />
@@ -98,6 +110,13 @@ a security prompt on first launch.
   Native paths remain in the Rust backend as opaque tokens instead of being
   assembled in the webview, and file-manager tabs do not inherit terminal
   elevation.
+- SFTP uses the same SSH host-key checks as terminal tabs. Opening SFTP on an
+  SSH tab reuses that tab's authenticated connection; a saved connection logs in
+  with its keychain secret or asks for the password.
+- Remote files that are opened or edited are downloaded into a per-file folder
+  under the system temp directory and deleted when their tab closes. Opening one
+  hands it to the application your system associates with its type, as opening
+  it locally would.
 - Telnet provides no transport encryption or server authentication. Use it only
   with systems and networks where cleartext access is acceptable.
 
@@ -126,23 +145,34 @@ Within a file-manager panel:
 | Shortcut | Action |
 |---|---|
 | `Tab` | Switch active panel |
-| Arrow keys, `Page Up` / `Page Down`, `Home` / `End` | Move through files |
-| `Enter` / double-click | Open a folder or file |
+| `Ctrl+U` | Swap the two panels |
+| Arrow keys, `Page Up` / `Page Down`, `Home` / `End` | Move the cursor (marks stay as they are) |
+| `Shift` + those keys | Mark a range |
+| `Insert` / `Space` | Mark or unmark (`Insert` also moves down) |
+| `Ctrl+A` | Mark everything |
+| Numpad `+` / `-` / `*` | Mark or unmark files by a mask, invert the marks |
+| Typing a name | Jump to it (quick search) |
+| `Esc` | End a quick search, close the filter, or clear the marks |
+| `Enter` / double-click | Open a folder, or open a file (a remote one as a downloaded copy) |
 | `Backspace` / `Alt+Up` | Open the parent folder |
+| `Ctrl+\` | Go to the root folder |
 | `Alt+Left` / `Alt+Right` | Navigate folder history |
-| `Insert` / `Space` | Toggle selection (`Insert` advances to the next item) |
-| `Ctrl+A` | Select all visible items |
+| `Alt+F1` / `Alt+F2` | Choose a location for the left / right panel: this machine, the panel's server, SSH tabs, saved connections |
+| `Alt+Enter` | Properties (size, dates, owner, permissions) |
 | `Ctrl+F` | Filter the current folder |
-| `Ctrl+C` / `Ctrl+X` / `Ctrl+V` | Copy, cut, or paste selected files |
-| `F2` | Rename one selected item |
-| `F3` | Preview a text file or image |
-| `F5` / `F6` | Copy or move to the opposite panel |
+| `Ctrl+R` | Refresh |
+| `Ctrl+C` / `Ctrl+X` / `Ctrl+V` | Copy, cut, or paste files |
+| `F2` / `Shift+F6` | Rename |
+| `F3` | View a text file or image |
+| `F4` | Edit: open with the default app; a remote file uploads on every save |
+| `F5` / `F6` | Copy or move to the other panel |
 | `F7` | Create a folder |
-| `F8` / `Delete` | Move selected items to Trash or Recycle Bin |
-| `Shift+F8` / `Shift+Delete` | Permanently delete selected items after confirmation |
+| `F8` / `Delete` | Move to Trash or Recycle Bin (delete, after confirmation, on servers) |
+| `Shift+F8` / `Shift+Delete` | Delete permanently after confirmation |
 
-Dragging between panels copies by default; hold `Shift` while dropping to move.
-Ctrl/Command-click and Shift-click provide conventional mouse multi-selection.
+Operations act on the marked items, or on the one under the cursor when nothing
+is marked. Dragging between panels copies by default; hold `Shift` while
+dropping to move. Ctrl/Command-click and Shift-click mark with the mouse.
 
 ## Themes
 
@@ -179,7 +209,8 @@ the terminal palette.
 | SSH | `russh` with the `ring` cryptography backend |
 | Telnet | CorePTY's bounded IAC parser over Tokio TCP |
 | Credentials | `keyring` with native platform backends |
-| File manager | Provider-neutral Rust filesystem API with opaque native paths, streamed operation progress, and OS Trash/Recycle Bin integration |
+| File manager | A provider-neutral filesystem layer (this machine and SFTP) with byte-exact paths, a background transfer queue (staged writes, resumable `.filepart` copies, pause on connection loss), and OS Trash/Recycle Bin integration |
+| SFTP | CorePTY's SFTP v3 client on `russh` channels: requests pipelined for throughput, connections shared with terminal tabs, file data on its own channel |
 | Profiles and settings | Atomically replaced TOML and JSON files in the application config directory |
 
 The frontend and native session drivers communicate through Tauri commands and
@@ -236,6 +267,12 @@ cargo test --all-targets
 
 `npm run check` performs TypeScript type checking, runs the Vitest suite, and
 produces a release-mode frontend bundle.
+
+The SFTP tests talk to a real OpenSSH `sftp-server` over its standard streams:
+Git for Windows ships one, and Linux and macOS have OpenSSH (set
+`COREPTY_SFTP_SERVER` to use another binary). Tests against a full sshd are
+marked `#[ignore]`; `scripts/sftp-real-tests.sh` starts a throwaway one on
+127.0.0.1 and runs them (`--bench` adds a throughput benchmark).
 
 Regenerate the README's deterministic theme gallery on Windows with
 `npm run screenshots`.
