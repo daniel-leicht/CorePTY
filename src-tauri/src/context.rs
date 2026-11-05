@@ -212,10 +212,11 @@ fn claude_args(argv: &[String]) -> &[String] {
     let Some(program) = argv.first() else {
         return argv;
     };
-    let stem = Path::new(program)
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("")
+    // The program's name, whichever separator its path uses.
+    let name = program.rsplit(['/', '\\']).next().unwrap_or(program);
+    let stem = name
+        .split_once('.')
+        .map_or(name, |(stem, _)| stem)
         .to_ascii_lowercase();
     if matches!(stem.as_str(), "node" | "bun" | "deno") {
         // Runtime options come first, then the script.
