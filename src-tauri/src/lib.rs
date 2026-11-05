@@ -60,7 +60,6 @@ pub fn run() {
         .manage(TransferManager::default())
         .manage(sftp::commands::SftpSessions::default())
         .manage(edit::OpenedCopies::default())
-        .manage(context::Processes::default())
         .invoke_handler(tauri::generate_handler![
             ping,
             commands::session_create_local,
