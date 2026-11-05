@@ -22,6 +22,7 @@ import type { AppTab, TabStatus, TabStatusInfo } from "../tab";
 import { uuid } from "../util";
 import {
   confirmAction,
+  confirmChoice,
   copyMoveDialog,
   isBrowserAccelerator,
   maskDialog,
@@ -129,6 +130,9 @@ export class FileManagerTab implements AppTab, PanelHost {
   /** Edit conflicts waiting until this tab is in front to be asked. */
   private readonly editQuestions: Array<Extract<EditEvent, { event: "conflict" }>> = [];
   private askingEdit = false;
+  /** A question was put off (dismissed): asked again when the tab is focused. */
+  private editQuestionsDeferred = false;
+  private editQuestionTimer: number | null = null;
   /** Source folder of each queued transfer, refreshed when it ends. */
   private readonly transferSources = new WeakMap<TransferRequest, FsLocationView | null>();
   /** Aborted on dispose: dismisses this tab's dialogs. */
@@ -229,6 +233,7 @@ export class FileManagerTab implements AppTab, PanelHost {
     if (this.disposed) return;
     this.active.focus();
     this.queue.resume(); // a question that came in while another tab was in front
+    this.editQuestionsDeferred = false;
     this.askEditQuestion();
   }
 
@@ -636,12 +641,20 @@ export class FileManagerTab implements AppTab, PanelHost {
   }
 
   private askEditQuestion(): void {
-    if (this.askingEdit || this.disposed || !this.element.classList.contains("is-active")) return;
-    const event = this.editQuestions.shift();
-    if (!event) return;
+    if (this.askingEdit || this.disposed || this.editQuestionsDeferred) return;
+    if (!this.element.classList.contains("is-active") || !this.editQuestions.length) return;
+    if (modalOpen()) {
+      // Never on top of another question (Enter there must not answer this).
+      this.editQuestionTimer ??= window.setTimeout(() => {
+        this.editQuestionTimer = null;
+        this.askEditQuestion();
+      }, 400);
+      return;
+    }
+    const event = this.editQuestions.shift()!;
     this.askingEdit = true;
     void (async () => {
-      const overwrite = await confirmAction(
+      const overwrite = await confirmChoice(
         {
           title: "Changed on the server",
           message: `“${event.name}” changed on the server since you opened it. Upload your copy over it?`,
@@ -654,8 +667,15 @@ export class FileManagerTab implements AppTab, PanelHost {
         },
         this.dialogs
       );
-      if (!this.disposed) void fsApi.editResolve(event.id, overwrite).catch(() => undefined);
       this.askingEdit = false;
+      if (this.disposed) return;
+      if (overwrite === null) {
+        // Put off (Esc): asked again later, not taken as an answer.
+        this.editQuestions.unshift(event);
+        this.editQuestionsDeferred = true;
+        return;
+      }
+      void fsApi.editResolve(event.id, overwrite).catch(() => undefined);
       this.askEditQuestion();
     })();
   }
@@ -975,10 +995,10 @@ export class FileManagerTab implements AppTab, PanelHost {
     if (!editing && (await fsApi.runsCode(entry.name).catch(() => true))) {
       const run = await confirmAction(
         {
-          title: "Run a file from the server?",
-          message: `Opening “${visibleName(entry.name)}” runs it on this computer, with your rights. Only do this if you trust where it came from.`,
-          detail: "F4 opens it in an editor instead.",
-          action: "Open and run",
+          title: "Open a file from the server?",
+          message: `Opening “${visibleName(entry.name)}” may run it on this computer, with your rights: its type isn't one CorePTY knows is safe to open. Only do this if you trust where it came from.`,
+          detail: "F3 shows it, F4 opens it in an editor; neither runs it.",
+          action: "Open it",
           danger: true,
           safeDefault: true,
         },

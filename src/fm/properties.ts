@@ -30,7 +30,7 @@ export function octal(mode: number): string {
   return mode & 0o7000 ? text.padStart(4, "0") : text.padStart(3, "0");
 }
 
-/** An octal field's value, or null when it isn't one (`75`, `0755`, `rwx`). */
+/** An octal field's value (`755`, `0755`, `4755`), or null when it isn't one (`75`, `rwx`). */
 export function parseOctal(text: string): number | null {
   const trimmed = text.trim();
   if (!/^[0-7]{3,4}$/.test(trimmed)) return null;
@@ -66,6 +66,11 @@ export async function propertiesDialog(
   const { entries, posix } = options;
   const one = entries.length === 1 ? entries[0] : null;
   const folders = entries.filter((entry) => entry.isDirectory);
+  // Links are left alone: changing one changes what it points at.
+  const targets = entries.filter((entry) => entry.kind !== "symlink");
+  const targetFolders = targets.filter((entry) => entry.isDirectory);
+  /** A mode not known takes only a complete one (every bit decided). */
+  const unknownMode = targets.some((entry) => entry.mode === null);
   const body = document.createElement("div");
   body.className = "fm-props";
   const rows: Array<[string, string]> = [
@@ -111,8 +116,6 @@ export async function propertiesDialog(
     })();
   }
 
-  // Links are left alone: changing one changes what it points at.
-  const targets = entries.filter((entry) => entry.kind !== "symlink");
   const common = commonBits(targets.map((entry) => entry.mode));
   /** Bits the user turned on and off. */
   let set = 0;
@@ -138,7 +141,7 @@ export async function propertiesDialog(
         (special) => `<label class="check"><input type="checkbox" data-bit="${special.bit}" /> ${special.label}</label>`
       ).join("")}</div>
       <label class="field fm-perms__octal"><span class="field__label">Octal</span><input inputmode="numeric" spellcheck="false" maxlength="4" /><span class="fm-perms__text"></span></label>
-      ${folders.length ? `<label class="check fm-perms__recursive"><input type="checkbox" /> Also everything inside ${folders.length === 1 ? "the folder" : "the folders"} (folders keep x where r is set)</label>` : ""}
+      ${targetFolders.length ? `<label class="check fm-perms__recursive"><input type="checkbox" /> Also everything inside ${targetFolders.length === 1 ? "the folder" : "the folders"} (folders keep x where r is set)</label>` : ""}
       ${targets.length < entries.length ? `<p class="fm-confirm__note">Links are left as they are.</p>` : ""}`;
     body.appendChild(perms);
     const boxes = Array.from(perms.querySelectorAll<HTMLInputElement>("input[data-bit]"));
@@ -168,8 +171,8 @@ export async function propertiesDialog(
       text.textContent =
         mode !== null
           ? formatMode(mode, type)
-          : targets.some((entry) => entry.mode === null)
-            ? "(not known: only what you change is set)"
+          : unknownMode
+            ? "(not known: type a whole mode in the octal field)"
             : "(different on each: only what you change is set)";
       apply();
     };
@@ -218,12 +221,16 @@ export async function propertiesDialog(
   });
   // Apply only once something changed (and the octal field holds a mode).
   const applyButton = document.querySelector<HTMLButtonElement>('.fm-props-dialog [data-value="apply"]');
+  // Something changed, the octal field holds a mode, and where a mode isn't
+  // known, every bit is decided.
+  const ready = () =>
+    valid && (set !== 0 || clear !== 0) && (!unknownMode || ((set | clear) & 0o7777) === 0o7777);
   apply = () => {
-    if (applyButton) applyButton.disabled = !valid || (set === 0 && clear === 0);
+    if (applyButton) applyButton.disabled = !ready();
   };
   apply();
   const choice = await pending;
-  if (choice !== "apply" || !posix || !valid || (set === 0 && clear === 0)) return false;
+  if (choice !== "apply" || !posix || !ready()) return false;
   const deep = recursive?.checked ?? false;
   for (const entry of targets) {
     await fsApi.chmod({ fs: options.fs, path: entry.path }, set, clear, deep && entry.isDirectory);

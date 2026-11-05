@@ -1,6 +1,6 @@
 [package]
 name = "corepty"
-version = "0.4.0"
+version = "0.5.0"
 description = "CorePTY — a modern terminal workspace with SSH, Telnet, and dual-pane file management"
 authors = ["Daniel Leicht"]
 license = "GPL-3.0-or-later"
@@ -36,6 +36,7 @@ dirs = "6"
 dunce = "1"
 open = "5"
 trash = "5.2.6"
+sysinfo = { version = "0.36", default-features = false, features = ["system"] }
 
 [dev-dependencies]
 tempfile = "3"

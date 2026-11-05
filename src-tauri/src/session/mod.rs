@@ -53,6 +53,8 @@ pub struct SessionInfo {
 struct SessionHandle {
     input_tx: UnboundedSender<SessionInput>,
     info: SessionInfo,
+    /// Local shells: the shell's process, to see what runs in it.
+    pid: Option<u32>,
 }
 
 /// Registry of live sessions, stored in Tauri's managed state.
@@ -76,8 +78,32 @@ impl SessionManager {
     }
 
     pub fn register(&self, info: SessionInfo, input_tx: UnboundedSender<SessionInput>) {
-        self.guard()
-            .insert(info.id.clone(), SessionHandle { input_tx, info });
+        self.register_process(info, input_tx, None);
+    }
+
+    /// Register a session whose shell is a process of ours (a local tab).
+    pub fn register_process(
+        &self,
+        info: SessionInfo,
+        input_tx: UnboundedSender<SessionInput>,
+        pid: Option<u32>,
+    ) {
+        self.guard().insert(
+            info.id.clone(),
+            SessionHandle {
+                input_tx,
+                info,
+                pid,
+            },
+        );
+    }
+
+    /// The shell processes of these sessions (those that have one).
+    pub fn pids(&self, ids: &[String]) -> Vec<(String, u32)> {
+        let map = self.guard();
+        ids.iter()
+            .filter_map(|id| Some((id.clone(), map.get(id)?.pid?)))
+            .collect()
     }
 
     pub fn send(&self, id: &str, input: SessionInput) -> Result<(), String> {

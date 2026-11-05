@@ -44,6 +44,14 @@ impl Server {
             username: lease.username.clone(),
         }
     }
+
+    fn of_target(target: &SshTarget) -> Self {
+        Self {
+            host: target.host.to_ascii_lowercase(),
+            port: target.port,
+            username: target.username.clone(),
+        }
+    }
 }
 
 type OpenMap = Arc<Mutex<HashMap<FsId, Opened>>>;
@@ -366,20 +374,28 @@ pub async fn sftp_reconnect(
             return Ok(view(&fs, &mount, &connection_id, &label).await);
         }
     }
-    let (lease, notice) = lease_for(&connections, &options).await?;
-    let connection_id = lease.id.clone();
-    let label = lease.label();
     // The same server and account: paused jobs and edited files carry on
-    // under this id, and must not land somewhere else.
+    // under this id, and must not land somewhere else. Checked before
+    // logging in where the login says where it goes.
     let first = sessions
         .open()
         .get(&fs)
         .map(|opened| (opened.server.clone(), opened.label.clone()));
-    if let Some((server, first_label)) = first {
-        if server != Server::of(&lease) {
-            return Err(format!(
-                "that login is for {label}, not {first_label}; open it on its own instead"
-            ));
+    let elsewhere = |label: &str, first_label: &str| {
+        format!("that login is for {label}, not {first_label}; open it on its own instead")
+    };
+    if let (Some((server, first_label)), Some(target)) = (&first, options.target()) {
+        if *server != Server::of_target(&target) {
+            let label = format!("{}@{}", target.username, target.host);
+            return Err(elsewhere(&label, first_label));
+        }
+    }
+    let (lease, notice) = lease_for(&connections, &options).await?;
+    let connection_id = lease.id.clone();
+    let label = lease.label();
+    if let Some((server, first_label)) = &first {
+        if *server != Server::of(&lease) {
+            return Err(elsewhere(&label, first_label));
         }
     }
     mount.replace(SftpFs::over_connection(lease).await?);

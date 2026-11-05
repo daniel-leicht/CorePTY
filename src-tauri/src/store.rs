@@ -17,6 +17,7 @@ const KEYRING_SERVICE: &str = "CorePTY";
 const LEGACY_IDENTIFIER: &str = "com.corepty.app";
 static STORE_LOCK: Mutex<()> = Mutex::new(());
 static SETTINGS_LOCK: Mutex<()> = Mutex::new(());
+static SNAPSHOT_LOCK: Mutex<()> = Mutex::new(());
 
 fn lock(mutex: &'static Mutex<()>) -> MutexGuard<'static, ()> {
     mutex.lock().unwrap_or_else(|e| e.into_inner())
@@ -99,6 +100,11 @@ struct Store {
 }
 
 fn config_dir(app: &AppHandle) -> Result<PathBuf, String> {
+    // A development build can keep its own, away from the installed app's.
+    #[cfg(debug_assertions)]
+    if let Some(dir) = std::env::var_os("COREPTY_CONFIG_DIR").filter(|d| !d.is_empty()) {
+        return Ok(PathBuf::from(dir));
+    }
     app.path().app_config_dir().map_err(|e| e.to_string())
 }
 
@@ -267,6 +273,62 @@ pub fn settings_save(app: AppHandle, settings: Value) -> Result<(), String> {
     let _guard = lock(&SETTINGS_LOCK);
     let path = settings_path(&app)?;
     let body = serde_json::to_string_pretty(&settings).map_err(|e| e.to_string())?;
+    atomic_write(&path, body.as_bytes())
+}
+
+// ---------------------------------------------------------------------------
+// Open tabs — JSON (schema owned by the frontend), for "restore my tabs"
+// ---------------------------------------------------------------------------
+
+fn snapshot_path(app: &AppHandle) -> Result<PathBuf, String> {
+    config_file(app, "tabs.json")
+}
+
+/// The last snapshot of the open tabs.
+#[derive(Serialize)]
+pub struct LoadedSnapshot {
+    snapshot: Value,
+    /// Written by another CorePTY that's still running: another window's
+    /// tabs, not ones to offer at startup.
+    live: bool,
+}
+
+#[tauri::command]
+pub fn tabs_snapshot_load(app: AppHandle) -> Result<Option<LoadedSnapshot>, String> {
+    let _guard = lock(&SNAPSHOT_LOCK);
+    let path = snapshot_path(&app)?;
+    let snapshot: Value = match fs::read_to_string(&path) {
+        // A damaged file is as good as none: there's nothing to restore.
+        Ok(s) => match serde_json::from_str(&s) {
+            Ok(value) => value,
+            Err(_) => return Ok(None),
+        },
+        Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.to_string()),
+    };
+    let writer = &snapshot["writer"];
+    let live = match (writer["pid"].as_u64(), writer["started"].as_u64()) {
+        (Some(pid), Some(started)) => u32::try_from(pid).is_ok_and(|pid| {
+            pid != std::process::id() && crate::context::started_at(pid) == Some(started)
+        }),
+        _ => false,
+    };
+    Ok(Some(LoadedSnapshot { snapshot, live }))
+}
+
+#[tauri::command]
+pub fn tabs_snapshot_save(app: AppHandle, mut snapshot: Value) -> Result<(), String> {
+    let _guard = lock(&SNAPSHOT_LOCK);
+    let path = snapshot_path(&app)?;
+    if let Value::Object(fields) = &mut snapshot {
+        let pid = std::process::id();
+        let started = crate::context::started_at(pid).unwrap_or(0);
+        fields.insert(
+            "writer".to_string(),
+            serde_json::json!({ "pid": pid, "started": started }),
+        );
+    }
+    let body = serde_json::to_string_pretty(&snapshot).map_err(|e| e.to_string())?;
     atomic_write(&path, body.as_bytes())
 }
 

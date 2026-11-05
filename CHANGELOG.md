@@ -1,5 +1,56 @@
 # Changelog
 
+## 0.5.0 (2026-11-05)
+
+### New: restore your tabs
+
+- CorePTY keeps a snapshot of its open tabs (every 30 seconds, shortly after a
+  change, and as the window closes) and offers to reopen them at startup, from
+  the `+` menu, or from the empty window. Local shells reopen in their
+  folders; tabs that ran Claude Code resume the same session with the same
+  options (`claude --resume <id> --dangerously-skip-permissions …`), unless
+  it's open elsewhere. Saved SSH and Telnet connections reconnect, file
+  managers reopen their local folders, and pinned tab names come back. The
+  dialog lists what each tab will run, and any of them can be left out.
+- PowerShell reports its folder at each prompt (OSC 7) while the feature is on.
+- Settings › Restore tabs turns it off.
+- A connection saved from the connection dialog is linked to its tab (Open
+  SFTP finds the tab's connection, and the tab can be restored).
+
+### Fixes
+
+- Copy-on-select no longer copies an old selection again when you click back
+  into the terminal (on its margin or scrollbar, after switching tabs or
+  windows), overwriting what you had copied elsewhere since; only a selection
+  just made is copied.
+
+Fixes from a review of 0.4.0's remote editing and opening:
+
+- Opening a remote file with `Enter` asks first unless its type is one known
+  to be safe to open; 0.4.0 asked only for a list of program and script types,
+  which missed some an interpreter or client runs (`.pyc`, `.rdp`,
+  `.diagcab`, …).
+- On Linux, `F4` with no editor set opens the desktop's text editor, not the
+  file type's app (which could run a `.jar` or `.desktop` file); on Windows,
+  only known-safe types use their own editor, others open in Notepad.
+- An upload cut off while writing the server's file in place is redone
+  without asking, instead of being taken for someone else's change.
+- A failed upload is retried every 15 seconds (and when the connection comes
+  back), not re-sent on every check; a server that won't set permissions gets
+  the file written in place instead of no upload at all.
+- An edited file's permissions are set before its contents go up, so a
+  private file is never readable on the way.
+- Closing the app counts a save made just before, and lets a running upload
+  finish; its question says where the copies are. A copy opened with `Enter`
+  and changed is kept when its tab closes.
+- A folder that appears where an edited file was is never replaced; a
+  temporary file a dropped upload leaves on the server is removed later.
+- Edit conflicts wait while another question is open, and putting one off
+  (Esc) no longer counts as keeping the server's version; the Properties
+  dialog no longer offers changes it can't make to files of unknown mode.
+- Reconnecting with a login for another server is refused before it logs in;
+  editors started through a `.cmd` file get no console window.
+
 ## 0.4.0 (2026-11-04)
 
 ### New: a dual-pane file manager, local and SFTP

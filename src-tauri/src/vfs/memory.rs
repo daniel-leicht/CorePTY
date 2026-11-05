@@ -41,6 +41,12 @@ pub struct MemFs {
     first_read_hook: Mutex<Option<Hook>>,
     /// The next reader fails after its first chunk (a dropped connection).
     fail_after_first_chunk: std::sync::atomic::AtomicBool,
+    /// `set_mode` fails (a server that refuses SETSTAT).
+    refuse_set_mode: std::sync::atomic::AtomicBool,
+    /// Every `open_write` fails (a full disk, say).
+    refuse_writes: std::sync::atomic::AtomicBool,
+    /// The next write keeps half of what it's given, then fails (a drop mid-upload).
+    fail_next_write: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl MemFs {
@@ -128,6 +134,19 @@ impl MemFs {
     /// Make the next reader fail after handing out its first chunk.
     pub fn fail_next_read_midway(&self) {
         self.fail_after_first_chunk.store(true, Ordering::SeqCst);
+    }
+
+    pub fn refuse_set_mode(&self, refuse: bool) {
+        self.refuse_set_mode.store(refuse, Ordering::SeqCst);
+    }
+
+    pub fn refuse_writes(&self, refuse: bool) {
+        self.refuse_writes.store(refuse, Ordering::SeqCst);
+    }
+
+    /// Make the next write keep half of what it's given, then fail.
+    pub fn fail_next_write_midway(&self) {
+        self.fail_next_write.store(true, Ordering::SeqCst);
     }
 }
 
@@ -383,9 +402,17 @@ impl Vfs for MemFs {
     }
 
     async fn open_write(&self, path: &VPath, mode: WriteMode) -> io::Result<VWrite> {
+        if self.refuse_writes.load(Ordering::SeqCst) {
+            return Err(io::Error::other("no space left on the device"));
+        }
         let key = key(path)?;
         let mut nodes = self.nodes.lock().unwrap();
         self.parent_must_be_dir(&nodes, &key)?;
+        // Rewriting a file keeps its mode, as on a real filesystem.
+        let kept_mode = match nodes.get(&key) {
+            Some(Node::File { mode, .. }) => *mode,
+            _ => 0o644,
+        };
         let existing = match nodes.get(&key) {
             Some(Node::File { data, .. }) => Some(data.clone()),
             Some(Node::Dir { .. }) => {
@@ -410,13 +437,15 @@ impl Vfs for MemFs {
             Node::File {
                 data: buffer.clone(),
                 modified: SystemTime::now(),
-                mode: 0o644,
+                mode: kept_mode,
             },
         );
         Ok(Box::pin(MemWriter {
             nodes: self.nodes.clone(),
             key,
             buffer,
+            fail_next: self.fail_next_write.clone(),
+            failing: false,
         }))
     }
 
@@ -440,6 +469,12 @@ impl Vfs for MemFs {
     }
 
     async fn set_mode(&self, path: &VPath, new_mode: u32) -> io::Result<()> {
+        if self.refuse_set_mode.load(Ordering::SeqCst) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "setting permissions isn't allowed here",
+            ));
+        }
         let key = key(path)?;
         if let Some(Node::File { mode, .. }) = self.nodes.lock().unwrap().get_mut(&key) {
             *mode = new_mode;
@@ -461,6 +496,8 @@ struct MemWriter {
     nodes: Arc<Mutex<BTreeMap<Vec<u8>, Node>>>,
     key: Vec<u8>,
     buffer: Vec<u8>,
+    fail_next: Arc<std::sync::atomic::AtomicBool>,
+    failing: bool,
 }
 
 impl MemWriter {
@@ -477,6 +514,20 @@ impl AsyncWrite for MemWriter {
         _cx: &mut Context<'_>,
         bytes: &[u8],
     ) -> Poll<io::Result<usize>> {
+        if self.failing || self.fail_next.swap(false, Ordering::SeqCst) {
+            self.failing = true;
+            let half = if self.buffer.is_empty() {
+                bytes.len() / 2
+            } else {
+                0
+            };
+            self.buffer.extend_from_slice(&bytes[..half]);
+            self.store();
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "the connection was lost",
+            )));
+        }
         self.buffer.extend_from_slice(bytes);
         self.store();
         Poll::Ready(Ok(bytes.len()))

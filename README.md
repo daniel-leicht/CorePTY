@@ -57,6 +57,10 @@ in the profile file.
 - Keyboard-first marking (Insert, Space, Shift+movement, numpad masks), quick
   search by typing, filters, history, sortable columns, drag and drop, and a
   clipboard; Trash/Recycle Bin for local files and explicit permanent delete.
+- Restore your tabs: CorePTY keeps a snapshot of the open tabs and offers to
+  reopen them at startup (or from the `+` menu), each local shell in its
+  folder, and a tab that was running Claude Code resumes the same session with
+  the same options (`--dangerously-skip-permissions`, `--model`, …).
 - Eight built-in application and terminal themes.
 - Configurable fonts, cursor styles, scrollback, bell behavior, minimum
   contrast, and copy-on-select.
@@ -77,6 +81,29 @@ under safe spellings when downloaded.
   <br /><br />
   <img src="docs/file-manager-sftp.png" alt="CorePTY file manager with a local panel, an SFTP panel, and an upload in the transfer queue" width="840" />
 </div>
+
+### Restoring tabs
+
+With **Restore tabs** on (Settings, on by default), CorePTY looks at its tabs
+every 30 seconds, shortly after a change (a tab opened, closed, moved or
+renamed, a folder changed), and as the window closes, and keeps what it sees in
+`tabs.json` in its configuration folder. At the next start it lists those tabs,
+with what each will run, and reopens the ones you keep ticked, in their order:
+
+- Local shells reopen in their folder: Command Prompt's and bash's folder is
+  read from the shell process; PowerShell is set to report its folder at each
+  prompt (OSC 7), since its process doesn't follow `cd`.
+- A tab running Claude Code (found through the session file Claude keeps for
+  each running session) reopens in Claude's folder and types
+  `claude --resume <session> <options>` once the shell is ready. Options that
+  say how Claude runs are kept; ones that pick a session or make it a one-shot
+  run (`--continue`, `--print`, an opening prompt, …) are left out, as are
+  values that can't be typed safely in that shell; the dialog shows both. A
+  session already open elsewhere isn't resumed a second time, and one that
+  never had a message starts afresh with the same options.
+- SSH and Telnet tabs of saved connections reconnect (asking for a password
+  only if the keychain has none); file manager tabs reopen their local folders.
+  Administrator tabs and unsaved SSH logins aren't reopened.
 
 ## Downloads
 
@@ -118,13 +145,28 @@ a security prompt on first launch.
 - Remote files that are opened or edited are downloaded into a per-file folder
   under the system temp directory (on Linux, one only you can enter), marked as
   downloaded on Windows (so SmartScreen and Office's Protected View apply), and
-  deleted when their tab closes, unless the server is missing changes you made:
-  then the copy is kept and you are told where. Opening a remote program or
-  script (or a name with text-reversing characters) asks first, since it would
-  run on this computer; `F4` opens files in an editor and never runs them.
+  deleted when their tab closes, unless they hold changes the server doesn't
+  have (a save that couldn't be uploaded, or edits to a copy opened with
+  `Enter`, which is never uploaded): then the copy is kept and you are told
+  where. Opening a remote file asks first unless its type is one known to be
+  safe to open (text, data, documents without macros, pictures, sound, video,
+  archives), and always when its name holds text-reversing characters: anything
+  else (a program, a script, a shortcut, a type an interpreter handles) could
+  run on this computer. `F4` opens files in an editor and never runs them.
 - Saving an edited file uploads it only after checking that the server's copy
-  didn't change meanwhile, keeps its permissions and owner, writes through links
-  to the file they point at, and never replaces a folder.
+  didn't change meanwhile (an upload of yours that was cut off isn't taken for
+  someone else's change). It keeps the file's permissions (set before any of
+  its contents are written) and owner, writes through links to the file they
+  point at, and doesn't replace a folder. Hard links and extended attributes
+  are kept only when the file is written in place (when its owner would change,
+  its folder takes no new files, or the server won't set permissions).
+- The tabs snapshot (`tabs.json`) holds tab names, folders, saved-connection
+  ids, and the id, folder and options of the Claude Code sessions in them; never
+  a password or passphrase. To see what runs in a tab, CorePTY reads the
+  processes under its own shells and Claude Code's session files (not its key
+  files). A restore types only what its dialog showed, and only after you
+  choose Restore; a session running with `--dangerously-skip-permissions`
+  resumes with it.
 - Telnet provides no transport encryption or server authentication. Use it only
   with systems and networks where cleartext access is acceptable.
 
@@ -172,7 +214,7 @@ Within a file-manager panel:
 | `Ctrl+C` / `Ctrl+X` / `Ctrl+V` | Copy, cut, or paste files |
 | `F2` / `Shift+F6` | Rename |
 | `F3` | View a text file or image |
-| `F4` | Edit: a local file opens with its app; a remote one in your editor (Settings › File manager; blank: Notepad on Windows, the default text editor elsewhere), uploaded on every save |
+| `F4` | Edit: a local file opens with its app; a remote one in your editor (Settings › File manager; blank: on Windows the type's editor for documents and pictures, else Notepad; elsewhere the desktop's text editor), uploaded on every save |
 | `F5` / `F6` | Copy or move to the other panel |
 | `F7` | Create a folder |
 | `F8` / `Delete` | Move to Trash or Recycle Bin (delete, after confirmation, on servers) |
@@ -220,6 +262,7 @@ the terminal palette.
 | File manager | A provider-neutral filesystem layer (this machine and SFTP) with byte-exact paths, a background transfer queue (staged writes, resumable `.filepart` copies, pause on connection loss), and OS Trash/Recycle Bin integration |
 | SFTP | CorePTY's SFTP v3 client on `russh` channels: requests pipelined for throughput, connections shared with terminal tabs, file data on its own channel |
 | Profiles and settings | Atomically replaced TOML and JSON files in the application config directory |
+| Tab context | `sysinfo` for the processes under each local shell (folder, command line) and Claude Code session files, for restoring tabs |
 
 The frontend and native session drivers communicate through Tauri commands and
 binary-safe events. Terminal sessions and file managers implement a shared tab

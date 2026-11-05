@@ -116,11 +116,26 @@ pub struct KeptCopy {
     pub reason: String,
 }
 
+/// An edited copy's state, shared with the exit prompt (read at the moment
+/// it asks, not as of the last poll).
+#[derive(Debug, Default)]
+struct Shared {
+    /// The copy as last uploaded (or downloaded).
+    synced: Option<LocalStamp>,
+    /// An upload is running.
+    syncing: bool,
+    /// A save failed to upload, or a conflict went unanswered.
+    behind: bool,
+}
+
 /// A downloaded copy of a remote file.
 struct Copy {
     dir: PathBuf,
     local: PathBuf,
     name: String,
+    /// The copy as downloaded: one opened with Enter and then changed is kept
+    /// on close (its changes go nowhere else).
+    downloaded: Option<LocalStamp>,
     /// Set while it's being edited.
     watcher: Option<Watcher>,
 }
@@ -130,8 +145,15 @@ struct Watcher {
     answers: mpsc::UnboundedSender<bool>,
     /// What became of the copy once the watcher stopped.
     done: oneshot::Receiver<Option<KeptCopy>>,
-    /// Whether the copy has changes the server doesn't (for the exit prompt).
-    unsynced: watch::Receiver<bool>,
+    state: Arc<Mutex<Shared>>,
+}
+
+/// An edited copy with changes the server doesn't have yet.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingEdit {
+    pub name: String,
+    pub path: String,
 }
 
 /// Tauri-managed state: the copies opened this session, by id.
@@ -141,9 +163,13 @@ pub struct OpenedCopies {
     events: RwLock<Option<EditSink>>,
 }
 
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 impl OpenedCopies {
     fn copies(&self) -> MutexGuard<'_, HashMap<String, Copy>> {
-        self.copies.lock().unwrap_or_else(|e| e.into_inner())
+        lock(&self.copies)
     }
 
     pub fn set_events(&self, sink: EditSink) {
@@ -182,6 +208,7 @@ impl OpenedCopies {
                         dir,
                         local: local.clone(),
                         name: shown,
+                        downloaded: local_stamp(&local),
                         watcher: None,
                     },
                 );
@@ -210,7 +237,11 @@ impl OpenedCopies {
         let (stop, stopped) = watch::channel(false);
         let (answers, answered) = mpsc::unbounded_channel();
         let (done_tx, done) = oneshot::channel();
-        let (unsynced_tx, unsynced) = watch::channel(false);
+        let synced = local_stamp(&local);
+        let state = Arc::new(Mutex::new(Shared {
+            synced,
+            ..Shared::default()
+        }));
         let session = Session {
             id: id.clone(),
             name: path
@@ -222,12 +253,14 @@ impl OpenedCopies {
             local: local.clone(),
             original: Original::of(&meta),
             remote_stamp: Some(Stamp::of(&meta)),
-            synced: local_stamp(&local),
+            synced,
+            attempted: None,
             pending: None,
             conflicted: false,
             stopped: None,
+            leftover: None,
             sink: self.sink(),
-            unsynced: unsynced_tx,
+            state: state.clone(),
             _keep_open: keep_open,
         };
         let dir = match self.copies().get_mut(&id) {
@@ -236,7 +269,7 @@ impl OpenedCopies {
                     stop,
                     answers,
                     done,
-                    unsynced,
+                    state,
                 });
                 copy.dir.clone()
             }
@@ -257,18 +290,28 @@ impl OpenedCopies {
         }
     }
 
-    /// Edited copies with changes the server doesn't have yet (by name).
-    fn unsynced(&self) -> Vec<String> {
+    /// Edited copies with changes the server doesn't have yet, as of now: a
+    /// save the watcher hasn't seen, an upload running, or one that failed.
+    fn unsynced(&self) -> Vec<PendingEdit> {
         self.copies()
             .values()
-            .filter(|copy| copy.watcher.as_ref().is_some_and(|w| *w.unsynced.borrow()))
-            .map(|copy| copy.name.clone())
+            .filter(|copy| {
+                copy.watcher.as_ref().is_some_and(|watcher| {
+                    let state = lock(&watcher.state);
+                    state.syncing || state.behind || local_stamp(&copy.local) != state.synced
+                })
+            })
+            .map(|copy| PendingEdit {
+                name: copy.name.clone(),
+                path: copy.local.to_string_lossy().into_owned(),
+            })
             .collect()
     }
 
     /// Delete copies (their apps may still have them open: best effort). An
     /// edited one uploads a last change first; one the server doesn't have
-    /// all of is kept instead, and returned.
+    /// all of is kept instead, and returned. So is one opened with Enter and
+    /// changed since (nothing uploads those).
     async fn close(&self, ids: &[String]) -> Vec<KeptCopy> {
         let removed: Vec<Copy> = {
             let mut copies = self.copies();
@@ -285,9 +328,22 @@ impl OpenedCopies {
                         Err(_) => kept.push(KeptCopy {
                             name: copy.name,
                             path: copy.local.to_string_lossy().into_owned(),
-                            reason: "its last upload hasn't finished".to_string(),
+                            reason: "its upload was still running; the copy goes once it's \
+                                     done, and stays if it fails"
+                                .to_string(),
                         }),
                     }
+                }
+                None if local_stamp(&copy.local).is_some()
+                    && local_stamp(&copy.local) != copy.downloaded =>
+                {
+                    kept.push(KeptCopy {
+                        name: copy.name,
+                        path: copy.local.to_string_lossy().into_owned(),
+                        reason: "it was changed, and copies opened with Enter aren't \
+                                 uploaded (F4 edits a remote file)"
+                            .to_string(),
+                    });
                 }
                 None => {
                     let _ = tokio::fs::remove_dir_all(&copy.dir).await;
@@ -325,19 +381,25 @@ struct Session {
     remote: VPath,
     local: PathBuf,
     original: Original,
-    /// The server's file as last downloaded or uploaded (`None`: not known,
-    /// an upload landed but couldn't be checked).
+    /// The server's file as last downloaded or uploaded (`None`: not known —
+    /// an upload landed but couldn't be checked, or was cut off half-way:
+    /// what's there is ours, so the next upload doesn't ask).
     remote_stamp: Option<Stamp>,
     /// The copy as last uploaded (or downloaded).
     synced: Option<LocalStamp>,
+    /// The copy as last tried: a failed upload isn't retried on every poll,
+    /// only on the retry timer, a reconnect, or a new save.
+    attempted: Option<LocalStamp>,
     /// A save that couldn't be uploaded, and why.
     pending: Option<String>,
     /// The tab closed while the user was asked about a conflict.
     conflicted: bool,
     /// No more uploads, and why.
     stopped: Option<String>,
+    /// A temporary file a failed upload couldn't remove from the server.
+    leftover: Option<VPath>,
     sink: EditSink,
-    unsynced: watch::Sender<bool>,
+    state: Arc<Mutex<Shared>>,
     _keep_open: Option<SessionUse>,
 }
 
@@ -379,18 +441,18 @@ impl Session {
             if self.stopped.is_none() {
                 let mut due =
                     self.pending.is_some() && retry_at.is_some_and(|at| Instant::now() >= at);
-                if let Some(now) = self.saved() {
+                if let Some(now) = self.new_save() {
                     // Wait for the editor to finish writing before uploading.
                     tokio::time::sleep(POLL / 2).await;
                     due |= local_stamp(&self.local) == Some(now);
                 }
                 if due || (stopping && self.has_changes()) {
+                    self.publish(true);
                     self.sync(&mut answers, &mut stop).await;
                     retry_at = self.pending.as_ref().map(|_| Instant::now() + RETRY);
                 }
             }
-            self.unsynced
-                .send_replace(self.has_changes() || self.conflicted);
+            self.publish(false);
             if stopping || *stop.borrow() {
                 let kept = self.kept();
                 if kept.is_none() {
@@ -402,10 +464,22 @@ impl Session {
         }
     }
 
+    fn publish(&self, syncing: bool) {
+        let mut state = lock(&self.state);
+        state.synced = self.synced;
+        state.syncing = syncing;
+        state.behind = self.pending.is_some() || self.conflicted;
+    }
+
     /// The copy's stamp, if it changed since the last upload.
     fn saved(&self) -> Option<LocalStamp> {
         let now = local_stamp(&self.local)?;
         (Some(now) != self.synced).then_some(now)
+    }
+
+    /// The copy's stamp, if it was saved since the last upload or attempt.
+    fn new_save(&self) -> Option<LocalStamp> {
+        self.saved().filter(|now| Some(*now) != self.attempted)
     }
 
     /// Changes the server doesn't have.
@@ -472,11 +546,9 @@ impl Session {
             Err(e) if e.kind() == io::ErrorKind::NotFound => None,
             Err(e) => return self.failed(format!("couldn't check the file on the server: {e}")),
         };
-        if let Some(meta) = &on_server {
-            if meta.kind != EntryKind::File {
-                // A folder (say) by that name now: never put a file over it.
-                return self.stop_syncing("on the server it isn't a file any more");
-            }
+        if on_server.as_ref().is_some_and(|meta| meta.is_directory) {
+            // A folder by that name now: never put a file over it.
+            return self.stop_syncing("on the server it's a folder now");
         }
         let changed = match (&on_server, self.remote_stamp) {
             (None, _) => true, // deleted on the server
@@ -512,15 +584,37 @@ impl Session {
             id: id.clone(),
             name: name.clone(),
         });
+        self.attempted = Some(now);
         match upload(self.fs.as_ref(), &self.local, &self.remote, &self.original).await {
             Ok(stamp) => {
                 self.remote_stamp = stamp;
                 self.synced = Some(now);
                 self.pending = None;
                 self.conflicted = false;
+                if let Some(leftover) = self.leftover.take() {
+                    let _ = self.fs.remove(&leftover, false).await;
+                }
                 (self.sink)(EditEvent::Uploaded { id, name });
             }
-            Err(e) => self.failed(e.to_string()),
+            Err(e) => {
+                if let Some(leftover) = e.leftover {
+                    self.leftover = Some(leftover);
+                }
+                if e.error.kind() == io::ErrorKind::IsADirectory {
+                    return self.stop_syncing("on the server it's a folder now");
+                }
+                if e.touched {
+                    // What's on the server now is this upload, cut off: the
+                    // retry goes over it without asking.
+                    self.remote_stamp = None;
+                    self.failed(format!(
+                        "{}; the file on the server may be incomplete until it goes up",
+                        e.error
+                    ));
+                } else {
+                    self.failed(e.error.to_string());
+                }
+            }
         }
     }
 }
@@ -567,70 +661,124 @@ async fn send_file(local: &Path, writer: &mut crate::vfs::VWrite) -> io::Result<
     writer.shutdown().await
 }
 
+/// Why an upload failed, and what it left behind.
+struct UploadError {
+    error: io::Error,
+    /// The server's file may have changed (written in place part-way, or a
+    /// rename whose answer was lost).
+    touched: bool,
+    /// A temporary file that couldn't be removed.
+    leftover: Option<VPath>,
+}
+
+impl From<io::Error> for UploadError {
+    fn from(error: io::Error) -> Self {
+        Self {
+            error,
+            touched: false,
+            leftover: None,
+        }
+    }
+}
+
+/// Remove a temporary file; `Some` (it) when that failed and it's left behind.
+async fn left_behind(fs: &dyn Vfs, temporary: &VPath) -> Option<VPath> {
+    fs.remove(temporary, false)
+        .await
+        .err()
+        .map(|_| temporary.clone())
+}
+
 /// Upload the copy over the server's file. Usually in one step, as editors
-/// save: written beside it under a temporary name with the file's mode, then
-/// renamed over it (a failure leaves the old one). In place instead when that
-/// would change the file's owner, or the folder takes no new files: the
-/// file itself is kept (owner, links to it, attributes), at the cost of a
-/// half-written file if the connection drops mid-way.
-/// Returns the new stamp, `None` if the file couldn't be checked afterwards.
+/// save: written beside it under a temporary name that gets the file's mode
+/// before any of its contents (so a private file is never readable on the
+/// way), then renamed over it (a failure leaves the old one). In place
+/// instead when that would change the file's mode or owner (a server that
+/// refuses setting it, a file someone else owns), the folder takes no new
+/// files, or the file is reached through a link: the file itself is kept
+/// (owner, links to it, attributes), at the cost of a half-written file if
+/// the connection drops mid-way. Returns the new stamp, `None` if the file
+/// couldn't be checked afterwards.
 async fn upload(
     fs: &dyn Vfs,
     local: &Path,
     remote: &VPath,
     original: &Original,
-) -> io::Result<Option<Stamp>> {
+) -> Result<Option<Stamp>, UploadError> {
+    // A link the server didn't resolve: writing through it reaches the file.
+    let through_link =
+        matches!(fs.lstat(remote).await, Ok(meta) if meta.kind == EntryKind::Symlink);
     let folder = remote.parent().unwrap_or_else(|| remote.clone());
     let temporary = folder.join(&VName::for_path(
         &folder,
         &format!(".corepty-{}.part", uuid::Uuid::new_v4().simple()),
     ))?;
-    let staged = match fs.open_write(&temporary, WriteMode::CreateNew).await {
-        Ok(mut writer) => {
-            let written = async {
-                send_file(local, &mut writer).await?;
-                if let Some(mode) = original.mode {
-                    fs.set_mode(&temporary, mode).await?;
+    let mut staged = false;
+    if !through_link {
+        match fs.open_write(&temporary, WriteMode::CreateNew).await {
+            Ok(mut writer) => {
+                let fits = async {
+                    if let Some(mode) = original.mode {
+                        fs.set_mode(&temporary, mode).await?;
+                    }
+                    // Renaming a file someone else owns would make it ours.
+                    let made = fs.stat(&temporary).await?;
+                    Ok::<bool, io::Error>(
+                        (original.owner.is_none() || made.owner == original.owner)
+                            && (original.group.is_none() || made.group == original.group),
+                    )
                 }
-                // Renaming a file someone else owns would make it ours.
-                let made = fs.stat(&temporary).await?;
-                Ok::<bool, io::Error>(
-                    (original.owner.is_none() || made.owner == original.owner)
-                        && (original.group.is_none() || made.group == original.group),
-                )
-            }
-            .await;
-            match written {
-                Ok(true) => {
+                .await
+                .unwrap_or(false);
+                if fits {
+                    if let Err(error) = send_file(local, &mut writer).await {
+                        drop(writer);
+                        return Err(UploadError {
+                            error,
+                            touched: false,
+                            leftover: left_behind(fs, &temporary).await,
+                        });
+                    }
                     if let Ok(modified) = std::fs::metadata(local).and_then(|m| m.modified()) {
                         let _ = fs.set_times(&temporary, modified, None).await;
                     }
-                    match fs.rename(&temporary, remote, true).await {
-                        Ok(()) => true,
-                        Err(e) => {
-                            let _ = fs.remove(&temporary, false).await;
-                            return Err(e);
-                        }
+                    // A folder that appeared meanwhile is never replaced.
+                    if matches!(fs.lstat(remote).await, Ok(meta) if meta.is_real_directory()) {
+                        return Err(UploadError {
+                            error: io::Error::new(io::ErrorKind::IsADirectory, "it's a folder now"),
+                            touched: false,
+                            leftover: left_behind(fs, &temporary).await,
+                        });
                     }
-                }
-                Ok(false) => {
+                    if let Err(error) = fs.rename(&temporary, remote, true).await {
+                        return Err(UploadError {
+                            error,
+                            touched: true, // it may have landed before the answer was lost
+                            leftover: left_behind(fs, &temporary).await,
+                        });
+                    }
+                    staged = true;
+                } else {
+                    drop(writer);
                     let _ = fs.remove(&temporary, false).await;
-                    false
-                }
-                Err(e) => {
-                    let _ = fs.remove(&temporary, false).await;
-                    return Err(e);
                 }
             }
+            // No new files in that folder (`/etc` for a user who may write
+            // `/etc/hosts`): write the file in place.
+            Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {}
+            Err(e) => return Err(e.into()),
         }
-        // No new files in that folder (`/etc` for a user who may write
-        // `/etc/hosts`): write the file in place.
-        Err(e) if e.kind() == io::ErrorKind::PermissionDenied => false,
-        Err(e) => return Err(e),
-    };
+    }
     if !staged {
         let mut writer = fs.open_write(remote, WriteMode::Truncate).await?;
-        send_file(local, &mut writer).await?;
+        // From here the server's file is this upload, half-written if it fails.
+        if let Err(error) = send_file(local, &mut writer).await {
+            return Err(UploadError {
+                error,
+                touched: true,
+                leftover: None,
+            });
+        }
     }
     Ok(fs.stat(remote).await.ok().map(|meta| Stamp::of(&meta)))
 }
@@ -715,11 +863,23 @@ fn spawn_editor(program: &str, args: &[String]) -> io::Result<()> {
         .unwrap_or_else(|| program.to_string());
     #[cfg(not(windows))]
     let program = program.to_string();
-    let child = std::process::Command::new(&program)
+    let mut command = std::process::Command::new(&program);
+    command
         .args(args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    #[cfg(windows)]
+    {
+        // A batch-file launcher (`code.cmd`) would keep a console window open.
+        use std::os::windows::process::CommandExt;
+        let lower = program.to_ascii_lowercase();
+        if lower.ends_with(".cmd") || lower.ends_with(".bat") {
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            command.creation_flags(CREATE_NO_WINDOW);
+        }
+    }
+    let child = command
         .spawn()
         .map_err(|e| io::Error::new(e.kind(), format!("couldn't start {program}: {e}")))?;
     #[cfg(unix)]
@@ -732,38 +892,17 @@ fn spawn_editor(program: &str, args: &[String]) -> io::Result<()> {
     Ok(())
 }
 
-/// Open `file` for editing with no editor set: never the shell's "open"
-/// (that runs scripts and programs). Windows: the type's "edit" verb, else
-/// Notepad; macOS: the default text editor; elsewhere: the default app.
+/// Open `file` for editing with no editor set: never the type's "open" (that
+/// runs scripts and programs). Windows: for a type known to be safe, its
+/// "edit" verb (Paint for an image, Word for a document), otherwise Notepad;
+/// macOS: the default text editor; elsewhere: the desktop's text editor.
 fn edit_with_default(file: &Path) -> io::Result<()> {
     #[cfg(windows)]
     {
-        use std::os::windows::ffi::OsStrExt;
-        use windows::{
-            core::PCWSTR,
-            Win32::{
-                System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED},
-                UI::{Shell::ShellExecuteW, WindowsAndMessaging::SW_SHOWNORMAL},
-            },
-        };
-        let wide: Vec<u16> = file.as_os_str().encode_wide().chain(Some(0)).collect();
-        let verb: Vec<u16> = "edit".encode_utf16().chain(Some(0)).collect();
-        // ShellExecute can hand off to shell extensions: COM first.
-        unsafe {
-            let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
-        }
-        // Above 32 means it started.
-        let started = unsafe {
-            ShellExecuteW(
-                None,
-                PCWSTR(verb.as_ptr()),
-                PCWSTR(wide.as_ptr()),
-                PCWSTR::null(),
-                PCWSTR::null(),
-                SW_SHOWNORMAL,
-            )
-        };
-        if started.0 as isize > 32 {
+        let name = file
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned());
+        if name.as_deref().is_some_and(|name| !runs_code(name)) && shell_edit(file) {
             return Ok(());
         }
         spawn_editor("notepad.exe", &[file.to_string_lossy().into_owned()])
@@ -777,8 +916,56 @@ fn edit_with_default(file: &Path) -> io::Result<()> {
     }
     #[cfg(not(any(windows, target_os = "macos")))]
     {
-        open::that_detached(file)
+        // The app set for plain text, never the file type's own (a `.jar` or
+        // `.desktop` one would run it).
+        let editor = std::process::Command::new("xdg-mime")
+            .args(["query", "default", "text/plain"])
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+            .filter(|id| !id.is_empty());
+        let no_editor = || {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "no text editor is set up for this desktop: choose one in Settings › File manager",
+            )
+        };
+        let editor = editor.ok_or_else(no_editor)?;
+        spawn_editor("gtk-launch", &[editor, file.to_string_lossy().into_owned()])
+            .map_err(|_| no_editor())
     }
+}
+
+/// The shell's "edit" verb for `file`; false when its type has none.
+#[cfg(windows)]
+fn shell_edit(file: &Path) -> bool {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::{
+        core::PCWSTR,
+        Win32::{
+            System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED},
+            UI::{Shell::ShellExecuteW, WindowsAndMessaging::SW_SHOWNORMAL},
+        },
+    };
+    let wide: Vec<u16> = file.as_os_str().encode_wide().chain(Some(0)).collect();
+    let verb: Vec<u16> = "edit".encode_utf16().chain(Some(0)).collect();
+    // ShellExecute can hand off to shell extensions: COM first.
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+    }
+    let started = unsafe {
+        ShellExecuteW(
+            None,
+            PCWSTR(verb.as_ptr()),
+            PCWSTR(wide.as_ptr()),
+            PCWSTR::null(),
+            PCWSTR::null(),
+            SW_SHOWNORMAL,
+        )
+    };
+    // Above 32 means it started.
+    started.0 as isize > 32
 }
 
 /// Open `file`: with the default app, or (`editing`) in `editor`, a command
@@ -795,93 +982,39 @@ fn launch(editing: bool, editor: Option<&str>, file: &Path) -> io::Result<()> {
     }
 }
 
-/// Types that run code when opened (programs, scripts, shortcuts, installers):
-/// opening a downloaded one runs it on this computer.
-const RUNNABLE: &[&str] = &[
-    // Windows
-    "exe",
-    "com",
-    "scr",
-    "pif",
-    "cpl",
-    "msi",
-    "msp",
-    "mst",
-    "msc",
-    "bat",
-    "cmd",
-    "ps1",
-    "psm1",
-    "psd1",
-    "vbs",
-    "vbe",
-    "js",
-    "jse",
-    "wsf",
-    "wsh",
-    "ws",
-    "hta",
-    "lnk",
-    "url",
-    "scf",
-    "inf",
-    "reg",
-    "chm",
-    "application",
-    "appref-ms",
-    "gadget",
-    "jar",
-    "appx",
-    "msix",
-    "appinstaller",
-    "library-ms",
-    "settingcontent-ms",
-    "diagcab",
-    "xll",
-    "iqy",
-    "slk",
-    // macOS and Linux
-    "app",
-    "command",
-    "tool",
-    "pkg",
-    "mpkg",
-    "workflow",
-    "scpt",
-    "terminal",
-    "desktop",
-    "sh",
-    "bash",
-    "zsh",
-    "csh",
-    "ksh",
-    "fish",
-    "run",
-    "bin",
-    "appimage",
-    "deb",
-    "rpm",
-    // Interpreters a desktop may be set to run
-    "py",
-    "pyw",
-    "pyz",
-    "pl",
-    "rb",
-    "php",
-    "lua",
-    "tcl",
+/// Types that are only ever shown, played or edited when opened: text, data,
+/// documents without macros, pictures, sound, video, archives. Any other type
+/// may run code (programs, scripts, shortcuts, installers, and types handled
+/// by an interpreter or a remote-desktop client), so opening it asks first.
+const SAFE_TO_OPEN: &[&str] = &[
+    // text and data
+    "txt", "text", "log", "md", "markdown", "rst", "adoc", "json", "jsonl", "yaml", "yml", "toml",
+    "ini", "cfg", "conf", "csv", "tsv", "xml", "diff", "patch", "srt", "vtt",
+    // documents (none that hold macros: doc, docm, xls, xlsm, ppt, pptm ask)
+    "pdf", "rtf", "docx", "xlsx", "pptx", "odt", "ods", "odp", "odg", "epub", "html", "htm",
+    // pictures
+    "png", "jpg", "jpeg", "gif", "bmp", "webp", "ico", "tif", "tiff", "heic", "heif", "avif", "svg",
+    "psd", // sound and video
+    "mp3", "wav", "flac", "ogg", "oga", "opus", "m4a", "aac", "wma", "mp4", "m4v", "mkv", "avi",
+    "mov", "webm", "wmv", "mpg", "mpeg", "ogv",
+    // archives (they open in an archive tool, which shows them)
+    "zip", "tar", "gz", "tgz", "bz2", "xz", "zst", "7z", "rar",
 ];
 
 /// Unicode controls that can make a name read differently: `invoice` + U+202E +
 /// `fdp.exe` shows as `invoiceexe.pdf`.
 fn has_bidi_controls(name: &str) -> bool {
     name.chars().any(|c| {
-        matches!(c, '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
+        matches!(
+            c,
+            '\u{061C}' | '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'
+        )
     })
 }
 
-/// Whether opening a file of this name may run something on this computer
-/// (its type runs code here, or its name hides what it is).
+/// Whether opening a file of this name may run something on this computer:
+/// its type isn't one known to be safe to open (no extension included), or
+/// its name hides what it is.
 pub fn runs_code(name: &str) -> bool {
     if has_bidi_controls(name) {
         return true;
@@ -890,25 +1023,7 @@ pub fn runs_code(name: &str) -> bool {
         .trim_end_matches(['.', ' '])
         .rsplit_once('.')
         .map(|(_, extension)| extension.to_ascii_lowercase());
-    let Some(extension) = extension else {
-        return false;
-    };
-    if RUNNABLE.contains(&extension.as_str()) {
-        return true;
-    }
-    #[cfg(windows)]
-    {
-        // Whatever else Windows itself treats as dangerous to open.
-        use windows::{core::PCWSTR, Win32::UI::Shell::AssocIsDangerous};
-        let wide: Vec<u16> = format!(".{extension}")
-            .encode_utf16()
-            .chain(Some(0))
-            .collect();
-        if unsafe { AssocIsDangerous(PCWSTR(wide.as_ptr())) }.as_bool() {
-            return true;
-        }
-    }
-    false
+    !extension.is_some_and(|extension| SAFE_TO_OPEN.contains(&extension.as_str()))
 }
 
 /// Tag a downloaded copy as coming from elsewhere (Windows' Mark of the Web),
@@ -1046,7 +1161,7 @@ pub async fn fs_close_copies(
 
 /// Edited files whose latest changes aren't on the server yet (asked on exit).
 #[tauri::command]
-pub fn fs_edits_pending(copies: State<'_, OpenedCopies>) -> Vec<String> {
+pub fn fs_edits_pending(copies: State<'_, OpenedCopies>) -> Vec<PendingEdit> {
     copies.unsynced()
 }
 
@@ -1502,36 +1617,122 @@ mod tests {
     }
 
     #[test]
-    fn files_that_run_code_are_recognized() {
+    fn only_types_known_to_be_safe_open_without_asking() {
         for name in [
             "deploy.bat",
             "SETUP.EXE",
-            "run.cmd",
             "x.ps1",
-            "a.vbs",
             "app.hta",
             "link.lnk",
             "install.sh",
-            "tool.py",
             "start.desktop",
             "x.jar",
             "notes.txt.exe",
             "trailing.exe.",
+            // Types an interpreter or a client runs, found missing from a deny list.
+            "module.pyc",
+            "fix.diagcab",
+            "office.rdp",
+            "macros.docm",
+            "old.doc",
+            // No extension: whatever the system makes of it.
+            "Makefile",
+            // Names that read as something else.
+            "invoice\u{202E}fdp.exe",
+            "report\u{202E}.txt",
+            "arabic\u{061C}mark.txt",
         ] {
             assert!(runs_code(name), "{name}");
         }
-        // A name that reads as a PDF but ends in .exe.
-        assert!(runs_code("invoice\u{202E}fdp.exe"));
-        assert!(runs_code("report\u{202E}.txt"));
         for name in [
             "notes.txt",
-            "photo.jpg",
+            "photo.JPG",
             "config.yml",
-            "Makefile",
             "archive.tar.gz",
+            "report.pdf",
+            "sheet.xlsx",
+            "trailing.txt. ",
         ] {
             assert!(!runs_code(name), "{name}");
         }
+    }
+
+    #[tokio::test]
+    async fn an_upload_cut_off_in_place_is_redone_without_asking() {
+        let e = editing();
+        // The server refuses setting modes: uploads write the file in place
+        // (which keeps its mode).
+        e.remote.refuse_set_mode(true);
+        let (id, local) = e.edit("/srv/app.conf").await;
+        // The connection drops half-way through writing the server's file.
+        e.remote.fail_next_write_midway();
+        save(&local, b"port=8080 # all of it\n", 5);
+        assert!(e.until("failed", 1).await, "{:?}", e.kinds());
+        // The retry puts the whole file there; the half-written one isn't
+        // taken for someone else's change.
+        assert!(e.until("uploaded", 1).await, "{:?}", e.kinds());
+        assert_eq!(e.count("conflict"), 0, "{:?}", e.kinds());
+        assert_eq!(
+            e.remote.read("/srv/app.conf").unwrap(),
+            b"port=8080 # all of it\n"
+        );
+        assert!(e.copies.close(&[id]).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_failing_upload_is_retried_on_the_timer_not_on_every_check() {
+        let e = editing();
+        let (id, local) = e.edit("/srv/app.conf").await;
+        e.remote.refuse_writes(true);
+        save(&local, b"port=8080\n", 5);
+        assert!(e.until("failed", 1).await, "{:?}", e.kinds());
+        let window = RETRY * 4;
+        tokio::time::sleep(window).await;
+        // The first try and about one per RETRY; checks come every POLL.
+        let tries = e.count("uploading");
+        assert!(tries <= 6, "{tries} uploads in {window:?}: {:?}", e.kinds());
+        assert_eq!(e.count("failed"), 1);
+        e.remote.refuse_writes(false);
+        assert!(e.until("uploaded", 1).await, "{:?}", e.kinds());
+        e.copies.close(&[id]).await;
+    }
+
+    #[tokio::test]
+    async fn a_save_counts_as_pending_the_moment_it_lands() {
+        let e = editing();
+        let (id, local) = e.edit("/srv/app.conf").await;
+        assert!(e.copies.unsynced().is_empty());
+        save(&local, b"port=8080\n", 5);
+        // Asked right away (quitting, say), before the watcher's next check.
+        let pending = e.copies.unsynced();
+        assert_eq!(pending.len(), 1, "{pending:?}");
+        assert_eq!(pending[0].name, "app.conf");
+        assert!(e.until("uploaded", 1).await, "{:?}", e.kinds());
+        for _ in 0..50 {
+            if e.copies.unsynced().is_empty() {
+                break;
+            }
+            tokio::time::sleep(POLL).await;
+        }
+        assert!(e.copies.unsynced().is_empty());
+        e.copies.close(&[id]).await;
+    }
+
+    #[tokio::test]
+    async fn a_copy_opened_with_enter_and_changed_is_kept() {
+        let remote = MemFs::new();
+        remote.add_dir("/srv");
+        remote.add_file("/srv/report.docx", b"original");
+        let root = tempfile::tempdir().unwrap();
+        let copies = OpenedCopies::default();
+        let (id, local, _) = copies
+            .download(&remote, &MemFs::path("/srv/report.docx"), root.path())
+            .await
+            .unwrap();
+        save(&local, b"edited in the app", 5);
+        let kept = copies.close(&[id]).await;
+        assert_eq!(kept.len(), 1, "{kept:?}");
+        assert_eq!(std::fs::read(&local).unwrap(), b"edited in the app");
     }
 
     #[test]

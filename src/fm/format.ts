@@ -89,7 +89,7 @@ export function maskToRegExp(mask: string): RegExp | null {
 /** A name with the Unicode controls that reorder text shown as codes
  * (`invoice[U+202E]fdp.exe`), so it can't pass for another name. */
 export function visibleName(name: string): string {
-  return name.replace(/[\u200e\u200f\u202a-\u202e\u2066-\u2069]/g, (c) =>
+  return name.replace(/[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/g, (c) =>
     `[U+${c.charCodeAt(0).toString(16).toUpperCase().padStart(4, "0")}]`
   );
 }

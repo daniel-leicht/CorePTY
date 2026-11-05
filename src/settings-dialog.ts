@@ -109,9 +109,13 @@ export class SettingsDialog {
             <input type="checkbox" data-role="copyOnSelect" ${s.copyOnSelect ? "checked" : ""} />
             <span>Copy on selection (PuTTY-style)</span>
           </label>
+          <label class="check">
+            <input type="checkbox" data-role="restoreTabs" ${s.restoreTabs ? "checked" : ""} />
+            <span>Restore tabs <span class="muted">· reopen the last tabs in their folders, resuming Claude Code sessions (at startup, or from the + menu)</span></span>
+          </label>
           <div class="settings-section">File manager</div>
           <label class="field">
-            <span class="field__label">Editor for remote files <span class="muted">(F4; blank = the default editor, Notepad on Windows; {file} marks the file)</span></span>
+            <span class="field__label">Editor for remote files <span class="muted">(F4; blank = Notepad or the type's editor on Windows, the default text editor elsewhere; {file} marks the file)</span></span>
             <input data-role="externalEditor" value="${escAttr(s.externalEditor)}" placeholder="e.g. code --wait" spellcheck="false" />
           </label>
         </div>

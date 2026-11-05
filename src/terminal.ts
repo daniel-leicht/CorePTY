@@ -33,6 +33,8 @@ export class TerminalSession implements AppTab {
   /** Re-fits when the element gains/changes size (e.g. becomes visible). */
   private sizeObserver: ResizeObserver | null = null;
   private fitRaf = 0;
+  /** When output last arrived (performance clock); 0 before any. */
+  private lastOutputAt = 0;
 
   kind: SessionKind;
   iconName: string;
@@ -191,6 +193,26 @@ export class TerminalSession implements AppTab {
     this.baseTitle = info.title || this.baseTitle;
   }
 
+  /**
+   * Resolves once the program has started writing and then paused for
+   * `quietMs` (a shell showing its prompt), or after `maxMs` anyway; false if
+   * the session ended first.
+   */
+  async whenQuiet(quietMs = 500, maxMs = 15000): Promise<boolean> {
+    const start = performance.now();
+    while (performance.now() - start < maxMs) {
+      if (!this.alive) return false;
+      if (this.lastOutputAt && performance.now() - this.lastOutputAt >= quietMs) return true;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    return this.alive;
+  }
+
+  /** Type into the session, as if from the keyboard. */
+  send(text: string): void {
+    if (this.info && this.alive) void api.write(this.info.id, text);
+  }
+
   setStatus(status: SessionStatus): void {
     this.status = status;
     this.onStatusChange?.();
@@ -229,6 +251,7 @@ export class TerminalSession implements AppTab {
   }
 
   writeBytes(bytes: Uint8Array): void {
+    this.lastOutputAt = performance.now();
     const buffer = this.term.buffer.active;
     const followFrom = buffer.viewportY === buffer.baseY ? buffer.viewportY : null;
     this.term.write(this.dimFilter.feed(bytes), () => {
@@ -276,6 +299,12 @@ export class TerminalSession implements AppTab {
 
   hasSelection(): boolean {
     return this.term.hasSelection();
+  }
+
+  /** Where the selection is (null: none), to tell one selection from another. */
+  selectionKey(): string | null {
+    const at = this.term.getSelectionPosition();
+    return at ? `${at.start.x},${at.start.y}-${at.end.x},${at.end.y}` : null;
   }
 
   getSelection(): string {

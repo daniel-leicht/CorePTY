@@ -22,6 +22,8 @@ export interface Settings {
   minContrast: "off" | "standard" | "high";
   /** Command that edits remote files (F4); blank = the default app. `{file}` marks the file. */
   externalEditor: string;
+  /** Keep a snapshot of the open tabs (folders, Claude Code sessions) and offer to reopen them. */
+  restoreTabs: boolean;
 }
 
 export const DEFAULTS: Settings = {
@@ -41,6 +43,7 @@ export const DEFAULTS: Settings = {
   // autosuggest / ghost text — until it's indistinguishable from normal output.
   minContrast: "off",
   externalEditor: "",
+  restoreTabs: true,
 };
 
 /** Live settings object. Mutated in place so importers see updates. */
@@ -144,6 +147,7 @@ function sanitize(raw: Record<string, unknown>): Partial<Settings> {
   if (bool(raw.cursorBlink) !== undefined) out.cursorBlink = raw.cursorBlink as boolean;
   if (num(raw.scrollback)) out.scrollback = clamp(raw.scrollback as number, 100, 200000);
   if (bool(raw.copyOnSelect) !== undefined) out.copyOnSelect = raw.copyOnSelect as boolean;
+  if (bool(raw.restoreTabs) !== undefined) out.restoreTabs = raw.restoreTabs as boolean;
   if (raw.rightClick === "paste" || raw.rightClick === "menu") out.rightClick = raw.rightClick;
   // The shell id is validated against the OS list at launch, so accept any string.
   if (typeof raw.defaultShell === "string" && raw.defaultShell)

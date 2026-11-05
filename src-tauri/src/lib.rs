@@ -8,6 +8,7 @@
 mod broker;
 mod commands;
 mod connections;
+mod context;
 mod edit;
 mod session;
 mod sftp;
@@ -59,6 +60,7 @@ pub fn run() {
         .manage(TransferManager::default())
         .manage(sftp::commands::SftpSessions::default())
         .manage(edit::OpenedCopies::default())
+        .manage(context::Processes::default())
         .invoke_handler(tauri::generate_handler![
             ping,
             commands::session_create_local,
@@ -72,6 +74,9 @@ pub fn run() {
             commands::session_list,
             commands::list_local_shells,
             commands::host_os,
+            context::tabs_context,
+            context::claude_running,
+            context::host_names,
             connections::ssh_connections,
             sftp::commands::sftp_connect,
             sftp::commands::sftp_close,
@@ -114,6 +119,8 @@ pub fn run() {
             store::folder_delete,
             store::settings_load,
             store::settings_save,
+            store::tabs_snapshot_load,
+            store::tabs_snapshot_save,
         ])
         .run(tauri::generate_context!())
         .expect("error while running CorePTY");
