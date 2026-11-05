@@ -2,6 +2,23 @@
 
 ## 0.4.1 (unreleased)
 
+### New: restore your tabs
+
+- CorePTY keeps a snapshot of its open tabs (every 30 seconds, shortly after a
+  change, and as the window closes) and offers to reopen them at startup, from
+  the `+` menu, or from the empty window. Local shells reopen in their
+  folders; tabs that ran Claude Code resume the same session with the same
+  options (`claude --resume <id> --dangerously-skip-permissions …`), unless
+  it's open elsewhere. Saved SSH and Telnet connections reconnect, file
+  managers reopen their local folders, and pinned tab names come back. The
+  dialog lists what each tab will run, and any of them can be left out.
+- PowerShell reports its folder at each prompt (OSC 7) while the feature is on.
+- Settings › Restore tabs turns it off.
+- A connection saved from the connection dialog is linked to its tab (Open
+  SFTP finds the tab's connection, and the tab can be restored).
+
+### Fixes
+
 - Copy-on-select no longer copies an old selection again when you click back
   into the terminal (on its margin or scrollbar, after switching tabs or
   windows), overwriting what you had copied elsewhere since; only a selection

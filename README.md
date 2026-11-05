@@ -57,6 +57,10 @@ in the profile file.
 - Keyboard-first marking (Insert, Space, Shift+movement, numpad masks), quick
   search by typing, filters, history, sortable columns, drag and drop, and a
   clipboard; Trash/Recycle Bin for local files and explicit permanent delete.
+- Restore your tabs: CorePTY keeps a snapshot of the open tabs and offers to
+  reopen them at startup (or from the `+` menu), each local shell in its
+  folder, and a tab that was running Claude Code resumes the same session with
+  the same options (`--dangerously-skip-permissions`, `--model`, …).
 - Eight built-in application and terminal themes.
 - Configurable fonts, cursor styles, scrollback, bell behavior, minimum
   contrast, and copy-on-select.
@@ -77,6 +81,29 @@ under safe spellings when downloaded.
   <br /><br />
   <img src="docs/file-manager-sftp.png" alt="CorePTY file manager with a local panel, an SFTP panel, and an upload in the transfer queue" width="840" />
 </div>
+
+### Restoring tabs
+
+With **Restore tabs** on (Settings, on by default), CorePTY looks at its tabs
+every 30 seconds, shortly after a change (a tab opened, closed, moved or
+renamed, a folder changed), and as the window closes, and keeps what it sees in
+`tabs.json` in its configuration folder. At the next start it lists those tabs,
+with what each will run, and reopens the ones you keep ticked, in their order:
+
+- Local shells reopen in their folder: Command Prompt's and bash's folder is
+  read from the shell process; PowerShell is set to report its folder at each
+  prompt (OSC 7), since its process doesn't follow `cd`.
+- A tab running Claude Code (found through the session file Claude keeps for
+  each running session) reopens in Claude's folder and types
+  `claude --resume <session> <options>` once the shell is ready. Options that
+  say how Claude runs are kept; ones that pick a session or make it a one-shot
+  run (`--continue`, `--print`, an opening prompt, …) are left out, as are
+  values that can't be typed safely in that shell; the dialog shows both. A
+  session already open elsewhere isn't resumed a second time, and one that
+  never had a message starts afresh with the same options.
+- SSH and Telnet tabs of saved connections reconnect (asking for a password
+  only if the keychain has none); file manager tabs reopen their local folders.
+  Administrator tabs and unsaved SSH logins aren't reopened.
 
 ## Downloads
 
@@ -133,6 +160,13 @@ a security prompt on first launch.
   point at, and doesn't replace a folder. Hard links and extended attributes
   are kept only when the file is written in place (when its owner would change,
   its folder takes no new files, or the server won't set permissions).
+- The tabs snapshot (`tabs.json`) holds tab names, folders, saved-connection
+  ids, and the id, folder and options of the Claude Code sessions in them; never
+  a password or passphrase. To see what runs in a tab, CorePTY reads the
+  processes under its own shells and Claude Code's session files (not its key
+  files). A restore types only what its dialog showed, and only after you
+  choose Restore; a session running with `--dangerously-skip-permissions`
+  resumes with it.
 - Telnet provides no transport encryption or server authentication. Use it only
   with systems and networks where cleartext access is acceptable.
 
@@ -228,6 +262,7 @@ the terminal palette.
 | File manager | A provider-neutral filesystem layer (this machine and SFTP) with byte-exact paths, a background transfer queue (staged writes, resumable `.filepart` copies, pause on connection loss), and OS Trash/Recycle Bin integration |
 | SFTP | CorePTY's SFTP v3 client on `russh` channels: requests pipelined for throughput, connections shared with terminal tabs, file data on its own channel |
 | Profiles and settings | Atomically replaced TOML and JSON files in the application config directory |
+| Tab context | `sysinfo` for the processes under each local shell (folder, command line) and Claude Code session files, for restoring tabs |
 
 The frontend and native session drivers communicate through Tauri commands and
 binary-safe events. Terminal sessions and file managers implement a shared tab
