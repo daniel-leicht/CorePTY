@@ -66,6 +66,8 @@ export type TabFacts =
       pinned: string | null;
       /** Its OSC 7 folder, if the shell reports one. */
       osc7: { path: string; host: string } | null;
+      /** A Claude session a restore is bringing back here, until it's seen running. */
+      pendingClaude?: SnapshotClaude | null;
     }
   | {
       kind: "files";
@@ -144,7 +146,7 @@ function snapshotTab(tab: TabFacts, contexts: Map<string, TabContext>, machine: 
     const context = tab.sessionId ? contexts.get(tab.sessionId) : undefined;
     const reported = tab.osc7 ? localOsc7Path(tab.osc7.path, tab.osc7.host, machine) : null;
     const cwd = localFolder(spec.shell, reported, context?.cwd);
-    const claude = context?.claude;
+    const claude = context?.claude ?? tab.pendingClaude ?? undefined;
     return {
       kind: "local",
       shell: spec.shell,

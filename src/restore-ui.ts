@@ -34,8 +34,6 @@ export class TabSnapshots {
   /** A window that never had a tab leaves the last snapshot alone: it may yet restore it. */
   private hadTabs = false;
   private taking: Promise<void> | null = null;
-  /** Restores under way (their Claude sessions aren't up yet). */
-  private paused = 0;
 
   constructor(
     private readonly facts: () => { tabs: TabFacts[]; active: number },
@@ -54,18 +52,6 @@ export class TabSnapshots {
     }
   }
 
-  /** Hold snapshots while tabs are restored; call the result to go on. */
-  pause(): () => void {
-    this.paused += 1;
-    let resumed = false;
-    return () => {
-      if (resumed) return;
-      resumed = true;
-      this.paused -= 1;
-      this.changed();
-    };
-  }
-
   /** Something changed: take a snapshot in a moment. */
   changed(): void {
     if (!settings.restoreTabs || this.settle) return;
@@ -78,7 +64,7 @@ export class TabSnapshots {
   /** Take one now (after the one being taken, if any). */
   async take(): Promise<void> {
     while (this.taking) await this.taking;
-    if (!settings.restoreTabs || this.paused) return;
+    if (!settings.restoreTabs) return;
     this.taking = this.takeOne().finally(() => (this.taking = null));
     return this.taking;
   }

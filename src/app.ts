@@ -54,10 +54,14 @@ import {
   startFolder,
   type HostFacts,
   type Snapshot,
+  type SnapshotClaude,
   type SnapshotTab,
   type TabFacts,
 } from "./restore";
 import { chooseTabs, TabSnapshots, unavailable, type RestoreFacts } from "./restore-ui";
+
+/** How long a restored tab's Claude session counts as starting. */
+const RESUMING_MS = 90_000;
 
 /** App version, injected at build time by Vite (see vite.config.ts). */
 declare const __APP_VERSION__: string;
@@ -81,6 +85,8 @@ export class App {
   );
   /** Whether there's a saved snapshot with tabs to offer (the empty state's button). */
   private restorable = false;
+  /** Claude sessions being resumed in restored tabs: kept in snapshots until seen running. */
+  private readonly resuming = new WeakMap<TerminalSession, { claude: SnapshotClaude; until: number }>();
   /** uid of the tab whose inline-rename input is currently open (if any). */
   private renamingUid: string | null = null;
   /** Last tab mousedown, for manual double-click (survives tab re-render). */
@@ -597,6 +603,7 @@ export class App {
           tab instanceof FileManagerTab ? tab.currentLocations() : ([undefined, undefined] as const);
         return { kind: "files", label: tab.title, pinned, locations: [locations[0], locations[1]] };
       }
+      const resuming = this.resuming.get(tab);
       return {
         kind: "terminal",
         spec: tab.spec,
@@ -604,6 +611,7 @@ export class App {
         label: tab.title,
         pinned,
         osc7: tab.cwd !== null ? { path: tab.cwd, host: tab.cwdHost ?? "" } : null,
+        pendingClaude: resuming && resuming.until > Date.now() ? resuming.claude : null,
       };
     });
     return { tabs, active: this.active ? this.tabs.indexOf(this.active) : -1 };
@@ -639,77 +647,71 @@ export class App {
 
   /** Reopen these tabs of a snapshot, in their order, after any that are open. */
   private async restoreTabs(snapshot: Snapshot, chosen: SnapshotTab[], facts: RestoreFacts): Promise<void> {
-    // Snapshots wait until the Claude sessions are back up.
-    const resume = this.snapshots.pause();
-    try {
-      // One started since the dialog opened isn't resumed a second time either.
-      const running = new Set(await api.claudeRunning().catch(() => [...facts.running]));
-      // Logins first (from the keychain), so the tabs open in their order.
-      const logins = new Map<SnapshotTab, ConnForm | null>();
-      for (const tab of chosen) {
-        if (tab.kind !== "ssh" && tab.kind !== "telnet") continue;
-        const saved = facts.saved.find((each) => each.id === tab.savedId);
-        if (saved) logins.set(tab, await this.savedForm(saved));
-      }
-      const wanted = snapshot.tabs[snapshot.active];
-      let focus: AppTab | null = null;
-      const askLogin: SavedSession[] = [];
-      const started: Promise<void>[] = [];
-      let elsewhere = 0;
-      for (const tab of chosen) {
-        let opened: AppTab | null = null;
-        if (tab.kind === "local") {
-          const { session, ready } = this.openLocal(tab.shell, { cwd: startFolder(tab) });
-          opened = session;
-          const claude = tab.claude;
-          if (claude && running.has(claude.sessionId)) elsewhere += 1;
-          if (claude && !running.has(claude.sessionId)) {
-            const { line } = claudeLine(claude, tab.shell, facts.machine.windows);
-            // Typed once the shell has shown its prompt.
-            started.push(
-              ready.then(async () => {
-                if (await session.whenQuiet(800)) session.send(`${line}\r`);
-              })
-            );
-          } else {
-            started.push(ready);
-          }
-        } else if (tab.kind === "ssh" || tab.kind === "telnet") {
-          const login = logins.get(tab);
-          if (login === null) {
-            // A password to type: asked for after the others are open.
-            const saved = facts.saved.find((each) => each.id === tab.savedId);
-            if (saved) askLogin.push(saved);
-            continue;
-          }
-          const form = login ?? (tab.kind === "telnet" ? telnetForm(tab) : undefined);
-          if (!form) continue;
-          const { session, ready } = this.openRemote(form);
-          opened = session;
-          started.push(ready);
-        } else if (tab.kind === "files") {
-          opened = this.newFileManager([tab.left, tab.right]);
-        }
-        if (!opened) continue;
-        if (tab.pinned) opened.setCustomTitle(tab.pinned);
-        if (tab === wanted) focus = opened;
-      }
-      if (focus) this.activate(focus);
-      if (elsewhere) {
-        this.toast(
-          elsewhere === 1
-            ? "One Claude Code session is open elsewhere, so it wasn't resumed"
-            : `${elsewhere} Claude Code sessions are open elsewhere, so they weren't resumed`,
-          "warn"
-        );
-      }
-      await Promise.all(started);
-      for (const saved of askLogin) await this.openDialog(saved);
-      // Claude takes a few seconds to start and say which session it runs.
-      await new Promise((resolve) => setTimeout(resolve, 8000));
-    } finally {
-      resume();
+    // One started since the dialog opened isn't resumed a second time either.
+    const running = new Set(await api.claudeRunning().catch(() => [...facts.running]));
+    // Logins first (from the keychain), so the tabs open in their order.
+    const logins = new Map<SnapshotTab, ConnForm | null>();
+    for (const tab of chosen) {
+      if (tab.kind !== "ssh" && tab.kind !== "telnet") continue;
+      const saved = facts.saved.find((each) => each.id === tab.savedId);
+      if (saved) logins.set(tab, await this.savedForm(saved));
     }
+    const wanted = snapshot.tabs[snapshot.active];
+    let focus: AppTab | null = null;
+    const askLogin: SavedSession[] = [];
+    const started: Promise<void>[] = [];
+    let elsewhere = 0;
+    for (const tab of chosen) {
+      let opened: AppTab | null = null;
+      if (tab.kind === "local") {
+        const { session, ready } = this.openLocal(tab.shell, { cwd: startFolder(tab) });
+        opened = session;
+        const claude = tab.claude;
+        if (claude && running.has(claude.sessionId)) elsewhere += 1;
+        if (claude && !running.has(claude.sessionId)) {
+          const { line } = claudeLine(claude, tab.shell, facts.machine.windows);
+          // Snapshots keep it while Claude starts (or until it plainly didn't).
+          this.resuming.set(session, { claude, until: Date.now() + RESUMING_MS });
+          // Typed once the shell has shown its prompt.
+          started.push(
+            ready.then(async () => {
+              if (await session.whenQuiet(800)) session.send(`${line}\r`);
+            })
+          );
+        } else {
+          started.push(ready);
+        }
+      } else if (tab.kind === "ssh" || tab.kind === "telnet") {
+        const login = logins.get(tab);
+        if (login === null) {
+          // A password to type: asked for after the others are open.
+          const saved = facts.saved.find((each) => each.id === tab.savedId);
+          if (saved) askLogin.push(saved);
+          continue;
+        }
+        const form = login ?? (tab.kind === "telnet" ? telnetForm(tab) : undefined);
+        if (!form) continue;
+        const { session, ready } = this.openRemote(form);
+        opened = session;
+        started.push(ready);
+      } else if (tab.kind === "files") {
+        opened = this.newFileManager([tab.left, tab.right]);
+      }
+      if (!opened) continue;
+      if (tab.pinned) opened.setCustomTitle(tab.pinned);
+      if (tab === wanted) focus = opened;
+    }
+    if (focus) this.activate(focus);
+    if (elsewhere) {
+      this.toast(
+        elsewhere === 1
+          ? "One Claude Code session is open elsewhere, so it wasn't resumed"
+          : `${elsewhere} Claude Code sessions are open elsewhere, so they weren't resumed`,
+        "warn"
+      );
+    }
+    await Promise.all(started);
+    for (const saved of askLogin) await this.openDialog(saved);
   }
 
   /** A file manager tab with this PC on the left and the server on the right. */

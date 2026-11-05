@@ -136,6 +136,24 @@ describe("snapshots", () => {
     ]);
   });
 
+  it("keep a session being resumed until it's seen running", () => {
+    const resuming = claude([["--verbose"]]);
+    const tab = (sessionId: string): TabFacts => ({
+      kind: "terminal",
+      spec: { kind: "local", shell: "cmd" },
+      sessionId,
+      label: "claude",
+      pinned: null,
+      osc7: null,
+      pendingClaude: resuming,
+    });
+    const starting = buildSnapshot([tab("s2")], 0, contexts, windows);
+    expect(starting.tabs[0]).toMatchObject({ cwd: "C:\\Windows", claude: resuming });
+    // Once Claude runs, what it says wins.
+    const running = buildSnapshot([tab("s1")], 0, contexts, windows);
+    expect(running.tabs[0]).toMatchObject({ claude: claude([["--dangerously-skip-permissions"]]) });
+  });
+
   it("never holds a password", () => {
     const secret = buildSnapshot(
       [{ kind: "terminal", spec: { kind: "ssh", form: form({ id: "x", password: "hunter2", passphrase: "p" }) }, sessionId: null, label: "x", pinned: null, osc7: null }],
