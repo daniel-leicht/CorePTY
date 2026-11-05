@@ -131,8 +131,16 @@ export function buildSnapshot(
   };
 }
 
+/**
+ * A tab title without the spinner a busy program animates at its start
+ * (Claude Code's stars, braille dots): it isn't a change worth saving.
+ */
+export function steadyLabel(title: string): string {
+  return title.replace(/^[\u2800-\u28ff\u2722-\u273d\u00b7*\s]+/u, "") || title;
+}
+
 function snapshotTab(tab: TabFacts, contexts: Map<string, TabContext>, machine: HostFacts): SnapshotTab {
-  const named = { label: tab.label, ...(tab.pinned !== null ? { pinned: tab.pinned } : {}) };
+  const named = { label: steadyLabel(tab.label), ...(tab.pinned !== null ? { pinned: tab.pinned } : {}) };
   if (tab.kind === "files") {
     const local = (location: FsLocationView | undefined) =>
       location?.fs === "local" ? { fs: location.fs, path: location.path, display: location.display } : undefined;
@@ -140,9 +148,9 @@ function snapshotTab(tab: TabFacts, contexts: Map<string, TabContext>, machine: 
     return { kind: "files", ...named, ...(left ? { left } : {}), ...(right ? { right } : {}) };
   }
   const spec = tab.spec;
-  if (!spec) return { kind: "skipped", label: tab.label, reason: "can't be reopened" };
+  if (!spec) return { kind: "skipped", label: named.label, reason: "can't be reopened" };
   if (spec.kind === "local") {
-    if (spec.elevated) return { kind: "skipped", label: tab.label, reason: "runs as Administrator" };
+    if (spec.elevated) return { kind: "skipped", label: named.label, reason: "runs as Administrator" };
     const context = tab.sessionId ? contexts.get(tab.sessionId) : undefined;
     const reported = tab.osc7 ? localOsc7Path(tab.osc7.path, tab.osc7.host, machine) : null;
     const cwd = localFolder(spec.shell, reported, context?.cwd);
@@ -168,7 +176,7 @@ function snapshotTab(tab: TabFacts, contexts: Map<string, TabContext>, machine: 
   const form = spec.form;
   if (spec.kind === "ssh") {
     // Its login is in the saved connection (and the keychain), never here.
-    if (!form.id) return { kind: "skipped", label: tab.label, reason: "not a saved connection" };
+    if (!form.id) return { kind: "skipped", label: named.label, reason: "not a saved connection" };
     return { kind: "ssh", savedId: form.id, ...named };
   }
   return {

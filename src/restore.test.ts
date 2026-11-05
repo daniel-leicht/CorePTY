@@ -10,6 +10,7 @@ import {
   quote,
   snapshotKey,
   startFolder,
+  steadyLabel,
   type SnapshotClaude,
   type TabFacts,
 } from "./restore";
@@ -121,7 +122,7 @@ describe("snapshots", () => {
       {
         kind: "local",
         shell: "cmd",
-        label: "✳ Claude Code",
+        label: "Claude Code",
         cwd: "C:\\Projects\\CorePty.Net",
         claude: claude([["--dangerously-skip-permissions"]]),
       },
@@ -152,6 +153,14 @@ describe("snapshots", () => {
     // Once Claude runs, what it says wins.
     const running = buildSnapshot([tab("s1")], 0, contexts, windows);
     expect(running.tabs[0]).toMatchObject({ claude: claude([["--dangerously-skip-permissions"]]) });
+  });
+
+  it("keep tab names without a busy program's spinner", () => {
+    expect(steadyLabel("✳ Refactor the queue")).toBe("Refactor the queue");
+    expect(steadyLabel("✶ Refactor the queue")).toBe("Refactor the queue");
+    expect(steadyLabel("⠋ Building")).toBe("Building");
+    expect(steadyLabel("C:\\WINDOWS\\system32\\cmd.exe")).toBe("C:\\WINDOWS\\system32\\cmd.exe");
+    expect(steadyLabel("✳")).toBe("✳");
   });
 
   it("never holds a password", () => {
