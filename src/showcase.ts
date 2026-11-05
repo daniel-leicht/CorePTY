@@ -89,12 +89,65 @@ const sessions = [
   },
 ] as const;
 
+/** The restore scene's last session: Claude tabs, a shell, an admin tab, SSH, files. */
+const RESUMED = "766ac475-7d95-4f55-96ac-e885e0a6a577";
+const OPEN_ELSEWHERE = "f83afb2c-17e2-4435-8a61-8fd18d89793a";
+const restoreSnapshot = {
+  version: 1,
+  savedAt: Date.now() - 7 * 60_000,
+  active: 0,
+  tabs: [
+    {
+      kind: "local",
+      shell: "cmd",
+      label: "✳ Refactor the transfer queue",
+      cwd: "C:\\Projects\\CorePTY",
+      claude: {
+        sessionId: RESUMED,
+        cwd: "C:\\Projects\\CorePTY",
+        args: [["--dangerously-skip-permissions"], ["--model", "opus"]],
+        dropped: ["--continue"],
+        resumable: true,
+      },
+    },
+    { kind: "local", shell: "powershell", label: "PowerShell", pinned: "builds", cwd: "C:\\Users\\dev\\Downloads" },
+    {
+      kind: "local",
+      shell: "cmd",
+      label: "✳ Claude Code",
+      cwd: "C:\\Projects\\site",
+      claude: { sessionId: OPEN_ELSEWHERE, cwd: "C:\\Projects\\site", args: [], dropped: [], resumable: true },
+    },
+    { kind: "skipped", label: "PowerShell (Admin)", reason: "runs as Administrator" },
+    { kind: "ssh", savedId: "edge-01", label: "edge-01" },
+    {
+      kind: "files",
+      label: "Files",
+      left: { fs: "local", path: "m:C:\\Projects\\CorePTY", display: "C:\\Projects\\CorePTY" },
+    },
+  ],
+};
+/** What the app sent: checked by scripted runs. */
+const ipcLog: { command: string; args: unknown }[] = [];
+(window as unknown as { __ipcLog?: unknown }).__ipcLog = ipcLog;
+
 mockWindows("main");
 mockIPC(
   (command, args) => {
     const filesystem = showcaseFs.handle(command, args as Record<string, unknown> | undefined);
     if (filesystem !== undefined) return filesystem;
+    if (/^(session_create|session_write|tabs_)/.test(command)) ipcLog.push({ command, args });
     switch (command) {
+      case "host_names":
+        return ["devbox", "localhost"];
+      case "claude_running":
+        return scene === "restore" ? [OPEN_ELSEWHERE] : [];
+      case "tabs_context":
+        return [];
+      case "tabs_snapshot_load":
+        return scene === "restore" ? { snapshot: restoreSnapshot, live: false } : null;
+      case "tabs_snapshot_save":
+        return null;
       case "settings_load":
         return { theme, fontSize: 14, lineHeight: 1.18, cursorBlink: false };
       case "settings_save":
@@ -153,7 +206,17 @@ markCaptureStage("app-mounted");
 
 if (scene === "files") await renderFileManagerShowcase();
 else if (scene === "sftp") await renderSftpShowcase();
+else if (scene === "restore") await renderRestoreShowcase();
 else await renderTerminalShowcase();
+
+/** The restore dialog CorePTY shows at startup, over the empty window. */
+async function renderRestoreShowcase(): Promise<void> {
+  for (let attempt = 0; attempt < 80 && !document.querySelector(".restore-dialog"); attempt += 1) {
+    await new Promise<void>((resolve) => setTimeout(resolve, 25));
+  }
+  markCaptureStage("restore-ready");
+  document.documentElement.dataset.showcaseReady = "true";
+}
 
 /** Local downloads on the left, the server's releases on the right, an upload running. */
 async function renderSftpShowcase(): Promise<void> {

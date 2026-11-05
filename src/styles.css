@@ -2204,6 +2204,89 @@ html.theme-starbase .tab-tip {
   height: 16px;
   accent-color: var(--accent);
 }
+.check .muted {
+  color: var(--text-3);
+}
+
+/* Restore tabs: the last session's tabs, each with what it reopens. */
+.modal.restore-dialog {
+  width: 620px;
+}
+.restore__when {
+  font-size: 12.5px;
+  color: var(--text-2);
+}
+.restore__list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-height: 52vh;
+  overflow-y: auto;
+  margin: 0 -8px;
+}
+.restore__tab {
+  display: grid;
+  grid-template-columns: auto auto minmax(0, 1fr);
+  align-items: start;
+  gap: 10px;
+  padding: 8px;
+  border-radius: 8px;
+  cursor: pointer;
+  transition: background 0.12s var(--ease);
+}
+.restore__tab:hover {
+  background: var(--bg-3);
+}
+.restore__tab.is-off {
+  cursor: default;
+  opacity: 0.55;
+}
+.restore__tab.is-off:hover {
+  background: none;
+}
+.restore__tab input {
+  width: 16px;
+  height: 16px;
+  margin: 2px 0 0;
+  accent-color: var(--accent);
+}
+.restore__icon {
+  display: grid;
+  place-items: center;
+  width: 20px;
+  height: 20px;
+  color: var(--accent-2);
+}
+.restore__icon svg {
+  width: 16px;
+  height: 16px;
+}
+.restore__text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.restore__label {
+  font-size: 13px;
+  color: var(--text-0);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.restore__detail {
+  font-size: 12px;
+  color: var(--text-3);
+  overflow-wrap: anywhere;
+}
+.restore__detail.is-claude {
+  color: var(--text-2);
+}
+.restore__detail.is-command {
+  color: var(--text-1);
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+}
 .hidden {
   display: none !important;
 }

@@ -76,6 +76,7 @@ pub fn run() {
             commands::host_os,
             context::tabs_context,
             context::claude_running,
+            context::host_names,
             connections::ssh_connections,
             sftp::commands::sftp_connect,
             sftp::commands::sftp_close,

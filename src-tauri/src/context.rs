@@ -59,8 +59,9 @@ pub struct ClaudeSession {
     pub session_id: String,
     /// The folder Claude runs in (its sessions are kept per folder).
     pub cwd: String,
-    /// The options to start it with again, after `--resume <id>`.
-    pub args: Vec<String>,
+    /// The options to start it with again, after `--resume <id>`: each one
+    /// with its values (`["--model", "opus"]`).
+    pub args: Vec<Vec<String>>,
     /// The options left out, as typed (for the restore dialog).
     pub dropped: Vec<String>,
     /// Whether the conversation has been saved (a new session isn't until
@@ -344,7 +345,7 @@ fn typeable(value: &str) -> bool {
 /// an option's value may be attached (`--model=opus`, `-nwork`) or follow it,
 /// and a list option takes arguments until the next option. Anything else (the
 /// opening prompt, unknown options) is left out.
-pub fn resume_args(args: &[String]) -> (Vec<String>, Vec<String>) {
+pub fn resume_args(args: &[String]) -> (Vec<Vec<String>>, Vec<String>) {
     let mut keep = Vec::new();
     let mut dropped = Vec::new();
     let mut i = 0;
@@ -410,8 +411,7 @@ pub fn resume_args(args: &[String]) -> (Vec<String>, Vec<String>) {
             }
         }
         if kept && values.iter().all(|v| typeable(v)) {
-            keep.push(name);
-            keep.extend(values);
+            keep.push(std::iter::once(name).chain(values).collect());
         } else {
             let mut typed = vec![arg.clone()];
             // The attached value is part of `arg` already.
@@ -605,6 +605,54 @@ pub async fn tabs_context(
         .map_err(|e| e.to_string())
 }
 
+/// When a running process started (seconds since 1970): with its id, it
+/// names the process (ids get reused). Ours is looked up once.
+pub fn started_at(pid: u32) -> Option<u64> {
+    static OURS: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    let look = || {
+        let mut sys = System::new();
+        let pid = Pid::from_u32(pid);
+        sys.refresh_processes_specifics(
+            ProcessesToUpdate::Some(&[pid]),
+            true,
+            ProcessRefreshKind::nothing(),
+        );
+        sys.process(pid).map(|p| p.start_time())
+    };
+    if pid == std::process::id() {
+        *OURS.get_or_init(look)
+    } else {
+        look()
+    }
+}
+
+/// This machine's names (lowercase), as its shells put them in OSC 7
+/// (`file://name/path`): a folder reported under another name is a remote
+/// shell's (an `ssh` in a local tab).
+#[tauri::command]
+pub fn host_names() -> Vec<String> {
+    let mut names: Vec<String> = [
+        System::host_name(),
+        std::env::var("COMPUTERNAME").ok(),
+        std::env::var("HOSTNAME").ok(),
+        Some("localhost".to_string()),
+    ]
+    .into_iter()
+    .flatten()
+    .map(|name| name.trim().to_lowercase())
+    .filter(|name| !name.is_empty())
+    .collect();
+    // `box.example.com` is `box` too.
+    let short: Vec<String> = names
+        .iter()
+        .filter_map(|name| name.split_once('.').map(|(first, _)| first.to_string()))
+        .collect();
+    names.extend(short);
+    names.sort();
+    names.dedup();
+    names
+}
+
 /// The ids of the Claude sessions running now, so a restore doesn't open one
 /// a second time.
 #[tauri::command]
@@ -625,7 +673,7 @@ mod tests {
 
     fn split(line: &str) -> (String, Vec<String>) {
         let (keep, dropped) = resume_args(&args(line));
-        (keep.join(" "), dropped)
+        (keep.concat().join(" "), dropped)
     }
 
     #[test]
@@ -745,7 +793,7 @@ mod tests {
             "opus".to_string(),
         ];
         let (keep, dropped) = resume_args(&argv);
-        assert_eq!(keep, vec!["--model", "opus"]);
+        assert_eq!(keep, vec![vec!["--model", "opus"]]);
         assert_eq!(
             dropped,
             vec![
@@ -756,7 +804,7 @@ mod tests {
         );
         // Spaces are fine: they're quoted when typed.
         let argv = vec!["--append-system-prompt".to_string(), "be brief".to_string()];
-        assert_eq!(resume_args(&argv).0, argv);
+        assert_eq!(resume_args(&argv).0, vec![argv]);
     }
 
     #[test]
@@ -863,6 +911,13 @@ mod tests {
         assert_eq!(tidy_folder(Path::new("/home/u/")).unwrap(), "/home/u");
         assert_eq!(tidy_folder(Path::new("/")).unwrap(), "/");
         assert!(tidy_folder(Path::new("")).is_none());
+    }
+
+    #[test]
+    fn our_start_is_known() {
+        let ours = started_at(std::process::id()).expect("running");
+        assert!(ours > 1_600_000_000);
+        assert_eq!(started_at(std::process::id()), Some(ours));
     }
 
     #[test]

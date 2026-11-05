@@ -48,6 +48,16 @@ import { FileManagerTab } from "./fm/file-manager-tab";
 import type { RemoteTarget } from "./fm/remote";
 import { appRemoteSource, type SshTab } from "./remote-source";
 import type { AppTab } from "./tab";
+import {
+  claudeLine,
+  parseSnapshot,
+  startFolder,
+  type HostFacts,
+  type Snapshot,
+  type SnapshotTab,
+  type TabFacts,
+} from "./restore";
+import { chooseTabs, TabSnapshots, unavailable, type RestoreFacts } from "./restore-ui";
 
 /** App version, injected at build time by Vite (see vite.config.ts). */
 declare const __APP_VERSION__: string;
@@ -62,6 +72,15 @@ export class App {
   private active: AppTab | null = null;
   /** Host OS ("windows" | "macos" | "linux" | …); gates OS-specific UI. */
   private hostOs = "";
+  /** This machine's names, to tell its shells' OSC 7 folders from remote ones. */
+  private hostNames: string[] = [];
+  /** Snapshots of the open tabs, for "restore my tabs". */
+  private readonly snapshots = new TabSnapshots(
+    () => this.tabFacts(),
+    () => this.machine()
+  );
+  /** Whether there's a saved snapshot with tabs to offer (the empty state's button). */
+  private restorable = false;
   /** uid of the tab whose inline-rename input is currently open (if any). */
   private renamingUid: string | null = null;
   /** Last tab mousedown, for manual double-click (survives tab re-render). */
@@ -108,6 +127,7 @@ export class App {
     // Fetch the OS-specific shell list + host OS before the UI renders.
     await loadShells();
     this.hostOs = await api.hostOs().catch(() => "");
+    this.hostNames = await api.hostNames().catch(() => []);
     this.render();
     this.syncWindowFrame();
     this.tree = new ConnectionsTree(this.connectionsEl, {
@@ -126,6 +146,8 @@ export class App {
     this.renderTabs();
     this.updateStatus();
     void this.tree.refresh();
+    this.snapshots.sync();
+    if (settings.restoreTabs) void this.offerRestore(false);
   }
 
   private defaultShell(): LocalShell {
@@ -213,6 +235,7 @@ export class App {
                 <div class="stage-empty__actions">
                   <button class="btn primary" id="stage-empty-new">${icon("terminal")} New terminal</button>
                   <button class="btn ghost" id="stage-empty-files">${icon("files")} File manager</button>
+                  <button class="btn ghost" id="stage-empty-restore" hidden>${icon("refresh")} Restore tabs</button>
                 </div>
               </div>
             </div>
@@ -314,6 +337,9 @@ export class App {
     this.root
       .querySelector("#stage-empty-files")!
       .addEventListener("click", () => this.newFileManager());
+    this.root
+      .querySelector("#stage-empty-restore")!
+      .addEventListener("click", () => void this.offerRestore(true));
 
     this.setupTabStrip();
     this.setupStageInteractions();
@@ -332,7 +358,8 @@ export class App {
       if (result.action === "save") {
         await this.saveProfile(form, false, existing);
       } else {
-        if (form.name || existing) await this.saveProfile(form, true, existing);
+        // The tab knows its saved connection (Open SFTP, restoring tabs).
+        if (form.name || existing) form.id = await this.saveProfile(form, true, existing);
         await this.hydrateStoredSecret(form, existing);
         this.connectForm(form);
       }
@@ -400,6 +427,13 @@ export class App {
   }
 
   private async connectSaved(s: SavedSession): Promise<void> {
+    const form = await this.savedForm(s);
+    if (form) this.connectForm(form);
+    else void this.openDialog(s);
+  }
+
+  /** The login of a saved connection, its secret from the keychain; null if a password must be typed. */
+  private async savedForm(s: SavedSession): Promise<ConnForm | null> {
     let secret = "";
     if (s.saveSecret) {
       try {
@@ -422,11 +456,7 @@ export class App {
       saveSecret: s.saveSecret,
       folderId: s.folderId ?? null,
     };
-    if (s.kind === "ssh" && form.authType === "password" && !form.password) {
-      void this.openDialog(s);
-      return;
-    }
-    this.connectForm(form);
+    return s.kind === "ssh" && form.authType === "password" && !form.password ? null : form;
   }
 
   private connectForm(form: ConnForm): void {
@@ -446,21 +476,41 @@ export class App {
     return { id, cols, rows };
   }
 
-  async newLocal(shell: LocalShell): Promise<void> {
+  async newLocal(shell: LocalShell): Promise<TerminalSession> {
+    const { session, ready } = this.openLocal(shell);
+    await ready;
+    return session;
+  }
+
+  /** Open a local shell tab now (in `cwd`); `ready` settles once it started or failed. */
+  private openLocal(
+    shell: LocalShell,
+    options: { cwd?: string } = {}
+  ): { session: TerminalSession; ready: Promise<void> } {
     const def = localShells.find((s) => s.id === shell);
     const session = new TerminalSession("local", def?.label ?? "Shell", def?.icon ?? "terminal");
     session.spec = { kind: "local", shell };
     const { id, cols, rows } = this.beginSession(session);
-    try {
-      const info = await api.createLocal({ id, shell, cols, rows });
-      session.attach(info);
-    } catch (err) {
-      this.byId.delete(id);
-      session.markError(String(err));
-      this.toast(`Couldn't start ${def?.label ?? shell}: ${err}`, "error");
-    }
-    this.renderTabs();
-    this.updateStatus();
+    const ready = (async () => {
+      try {
+        const info = await api.createLocal({
+          id,
+          shell,
+          cols,
+          rows,
+          cwd: options.cwd,
+          reportCwd: settings.restoreTabs,
+        });
+        session.attach(info);
+      } catch (err) {
+        this.byId.delete(id);
+        session.markError(String(err));
+        this.toast(`Couldn't start ${def?.label ?? shell}: ${err}`, "error");
+      }
+      this.renderTabs();
+      this.updateStatus();
+    })();
+    return { session, ready };
   }
 
   /** Open a local shell elevated (Administrator) — raises a UAC prompt. */
@@ -487,42 +537,45 @@ export class App {
   }
 
   /** `connectionId`: reuse that live connection (Duplicate) instead of logging in again. */
-  async newSsh(form: ConnForm, connectionId?: string): Promise<void> {
-    const title = form.name || `${form.username}@${form.host}`;
-    const session = new TerminalSession("ssh", title, "ssh");
-    session.spec = { kind: "ssh", form };
-    const { id, cols, rows } = this.beginSession(session);
-    try {
-      const info = await api.createSsh(this.sshOptions(form, id, cols, rows, connectionId));
-      session.attach(info);
-    } catch (err) {
-      this.byId.delete(id);
-      session.markError(String(err));
-    }
-    this.renderTabs();
-    this.updateStatus();
+  async newSsh(form: ConnForm, connectionId?: string): Promise<TerminalSession> {
+    const { session, ready } = this.openRemote(form, connectionId);
+    await ready;
+    return session;
   }
 
-  async newTelnet(form: ConnForm): Promise<void> {
-    const title = form.name || `telnet ${form.host}`;
-    const session = new TerminalSession("telnet", title, "telnet");
-    session.spec = { kind: "telnet", form };
+  async newTelnet(form: ConnForm): Promise<TerminalSession> {
+    const { session, ready } = this.openRemote(form);
+    await ready;
+    return session;
+  }
+
+  /** Open an SSH or Telnet tab now; `ready` settles once it connected or failed. */
+  private openRemote(form: ConnForm, connectionId?: string): { session: TerminalSession; ready: Promise<void> } {
+    const ssh = form.kind === "ssh";
+    const title = form.name || (ssh ? `${form.username}@${form.host}` : `telnet ${form.host}`);
+    const session = new TerminalSession(form.kind, title, form.kind);
+    session.spec = ssh ? { kind: "ssh", form } : { kind: "telnet", form };
     const { id, cols, rows } = this.beginSession(session);
-    try {
-      const info = await api.createTelnet(this.telnetOptions(form, id, cols, rows));
-      session.attach(info);
-    } catch (err) {
-      this.byId.delete(id);
-      session.markError(String(err));
-    }
-    this.renderTabs();
-    this.updateStatus();
+    const ready = (async () => {
+      try {
+        const info = ssh
+          ? await api.createSsh(this.sshOptions(form, id, cols, rows, connectionId))
+          : await api.createTelnet(this.telnetOptions(form, id, cols, rows));
+        session.attach(info);
+      } catch (err) {
+        this.byId.delete(id);
+        session.markError(String(err));
+      }
+      this.renderTabs();
+      this.updateStatus();
+    })();
+    return { session, ready };
   }
 
   newFileManager(
     initialLocations?: [FsLocationView | undefined, FsLocationView | undefined],
     openRemote?: { side: 0 | 1; target: RemoteTarget }
-  ): void {
+  ): FileManagerTab {
     const tab = new FileManagerTab({
       toast: (message, kind) => this.toast(message, kind),
       initialLocations,
@@ -530,6 +583,133 @@ export class App {
       openRemote,
     });
     this.addTab(tab);
+    return tab;
+  }
+
+  // ---- restoring tabs -----------------------------------------------------
+
+  /** The open tabs, as a snapshot sees them. */
+  private tabFacts(): { tabs: TabFacts[]; active: number } {
+    const tabs = this.tabs.map((tab): TabFacts => {
+      const pinned = tab.pinned ? tab.title : null;
+      if (!(tab instanceof TerminalSession)) {
+        const locations =
+          tab instanceof FileManagerTab ? tab.currentLocations() : ([undefined, undefined] as const);
+        return { kind: "files", label: tab.title, pinned, locations: [locations[0], locations[1]] };
+      }
+      return {
+        kind: "terminal",
+        spec: tab.spec,
+        sessionId: tab.alive ? tab.info?.id ?? null : null,
+        label: tab.title,
+        pinned,
+        osc7: tab.cwd !== null ? { path: tab.cwd, host: tab.cwdHost ?? "" } : null,
+      };
+    });
+    return { tabs, active: this.active ? this.tabs.indexOf(this.active) : -1 };
+  }
+
+  private machine(): HostFacts {
+    return { windows: this.hostOs === "windows", names: this.hostNames };
+  }
+
+  /**
+   * Offer to reopen the last snapshot's tabs: at startup (unless another
+   * CorePTY window that's still open took it), or from the + menu.
+   */
+  private async offerRestore(fromMenu: boolean): Promise<void> {
+    const loaded = await api.tabsSnapshotLoad().catch(() => null);
+    const snapshot = loaded ? parseSnapshot(loaded.snapshot) : null;
+    const [running, saved] = await Promise.all([
+      api.claudeRunning().catch((): string[] => []),
+      api.sessionsLoad().catch((): SavedSession[] => []),
+    ]);
+    const facts: RestoreFacts = { machine: this.machine(), running: new Set(running), saved };
+    const usable = snapshot ? snapshot.tabs.filter((tab) => !unavailable(tab, facts)).length : 0;
+    this.restorable = usable > 0;
+    this.syncEmptyState();
+    if (!snapshot || !usable) {
+      if (fromMenu) this.toast("There are no saved tabs to restore", "info");
+      return;
+    }
+    if (!fromMenu && loaded?.live) return;
+    const chosen = await chooseTabs(snapshot, facts);
+    if (chosen) await this.restoreTabs(snapshot, chosen, facts);
+  }
+
+  /** Reopen these tabs of a snapshot, in their order, after any that are open. */
+  private async restoreTabs(snapshot: Snapshot, chosen: SnapshotTab[], facts: RestoreFacts): Promise<void> {
+    // Snapshots wait until the Claude sessions are back up.
+    const resume = this.snapshots.pause();
+    try {
+      // One started since the dialog opened isn't resumed a second time either.
+      const running = new Set(await api.claudeRunning().catch(() => [...facts.running]));
+      // Logins first (from the keychain), so the tabs open in their order.
+      const logins = new Map<SnapshotTab, ConnForm | null>();
+      for (const tab of chosen) {
+        if (tab.kind !== "ssh" && tab.kind !== "telnet") continue;
+        const saved = facts.saved.find((each) => each.id === tab.savedId);
+        if (saved) logins.set(tab, await this.savedForm(saved));
+      }
+      const wanted = snapshot.tabs[snapshot.active];
+      let focus: AppTab | null = null;
+      const askLogin: SavedSession[] = [];
+      const started: Promise<void>[] = [];
+      let elsewhere = 0;
+      for (const tab of chosen) {
+        let opened: AppTab | null = null;
+        if (tab.kind === "local") {
+          const { session, ready } = this.openLocal(tab.shell, { cwd: startFolder(tab) });
+          opened = session;
+          const claude = tab.claude;
+          if (claude && running.has(claude.sessionId)) elsewhere += 1;
+          if (claude && !running.has(claude.sessionId)) {
+            const { line } = claudeLine(claude, tab.shell, facts.machine.windows);
+            // Typed once the shell has shown its prompt.
+            started.push(
+              ready.then(async () => {
+                if (await session.whenQuiet(800)) session.send(`${line}\r`);
+              })
+            );
+          } else {
+            started.push(ready);
+          }
+        } else if (tab.kind === "ssh" || tab.kind === "telnet") {
+          const login = logins.get(tab);
+          if (login === null) {
+            // A password to type: asked for after the others are open.
+            const saved = facts.saved.find((each) => each.id === tab.savedId);
+            if (saved) askLogin.push(saved);
+            continue;
+          }
+          const form = login ?? (tab.kind === "telnet" ? telnetForm(tab) : undefined);
+          if (!form) continue;
+          const { session, ready } = this.openRemote(form);
+          opened = session;
+          started.push(ready);
+        } else if (tab.kind === "files") {
+          opened = this.newFileManager([tab.left, tab.right]);
+        }
+        if (!opened) continue;
+        if (tab.pinned) opened.setCustomTitle(tab.pinned);
+        if (tab === wanted) focus = opened;
+      }
+      if (focus) this.activate(focus);
+      if (elsewhere) {
+        this.toast(
+          elsewhere === 1
+            ? "One Claude Code session is open elsewhere, so it wasn't resumed"
+            : `${elsewhere} Claude Code sessions are open elsewhere, so they weren't resumed`,
+          "warn"
+        );
+      }
+      await Promise.all(started);
+      for (const saved of askLogin) await this.openDialog(saved);
+      // Claude takes a few seconds to start and say which session it runs.
+      await new Promise((resolve) => setTimeout(resolve, 8000));
+    } finally {
+      resume();
+    }
   }
 
   /** A file manager tab with this PC on the left and the server on the right. */
@@ -615,7 +795,9 @@ export class App {
         if (spec.elevated) {
           session.attach(await api.createLocalElevated({ id, shell: spec.shell, cols, rows }));
         } else {
-          session.attach(await api.createLocal({ id, shell: spec.shell, cols, rows }));
+          session.attach(
+            await api.createLocal({ id, shell: spec.shell, cols, rows, reportCwd: settings.restoreTabs })
+          );
         }
       } else if (spec.kind === "ssh") {
         session.attach(
@@ -643,6 +825,7 @@ export class App {
     if (session instanceof TerminalSession) {
       session.onExit = updateTab;
       session.onReconnect = () => void this.relaunch(session);
+      session.watchCwd(() => this.snapshots.changed());
     }
     session.onClose = () => void this.closeTab(session);
     this.closeTabList(); // its snapshot of the tabs is now stale
@@ -653,6 +836,7 @@ export class App {
   }
 
   private activate(session: AppTab): void {
+    this.snapshots.changed();
     this.active = session;
     for (const t of this.tabs) t.element.classList.toggle("is-active", t === session);
     // Update the strip highlight in place rather than rebuilding it — keeps tab
@@ -714,6 +898,7 @@ export class App {
     }
     session.dispose();
     this.tabs.splice(idx, 1);
+    this.snapshots.changed();
     this.closeTabList(); // its snapshot of the tabs is now stale
 
     const wasActive = this.active === session;
@@ -1023,6 +1208,7 @@ export class App {
       return;
     }
     this.tabs.splice(after ? ti + 1 : ti, 0, dragged);
+    this.snapshots.changed();
     this.renderTabs();
   }
 
@@ -1049,7 +1235,10 @@ export class App {
       items.push({
         label: "Reset name",
         icon: "refresh",
-        action: () => session.setCustomTitle(null),
+        action: () => {
+          session.setCustomTitle(null);
+          this.snapshots.changed();
+        },
       });
     }
     items.push("sep", {
@@ -1141,6 +1330,7 @@ export class App {
       done = true;
       this.renamingUid = null;
       if (save) session.setCustomTitle(input.value);
+      this.snapshots.changed();
       this.renderTabs();
       if (session === this.active) this.updateStatus();
     };
@@ -1183,6 +1373,9 @@ export class App {
   /** Show the empty-state placeholder only when there are no open tabs. */
   private syncEmptyState(): void {
     this.stageEmptyEl?.toggleAttribute("hidden", this.tabs.length > 0);
+    this.stageEmptyEl
+      ?.querySelector("#stage-empty-restore")
+      ?.toggleAttribute("hidden", !(settings.restoreTabs && this.restorable));
   }
 
   // ---- launcher popover ---------------------------------------------------
@@ -1209,6 +1402,11 @@ export class App {
       <div class="pop__sep"></div>
       <div class="pop__label">Tools</div>
       <button class="pop__item" data-tool="files"><span class="pop__icon">${icon("files")}</span><span class="pop__name">File Manager</span><span class="pop__hint">Ctrl+Shift+E</span></button>
+      ${
+        settings.restoreTabs
+          ? `<button class="pop__item" data-tool="restore"><span class="pop__icon">${icon("refresh")}</span><span class="pop__name">Restore tabs…</span><span class="pop__hint">From the last session</span></button>`
+          : ""
+      }
     `;
     document.body.appendChild(menu);
     const r = anchor.getBoundingClientRect();
@@ -1222,6 +1420,7 @@ export class App {
         else if (item.dataset.conn)
           void this.openDialog(undefined, { presetKind: item.dataset.conn as "ssh" | "telnet" });
         else if (item.dataset.tool === "files") this.newFileManager();
+        else if (item.dataset.tool === "restore") void this.offerRestore(true);
       });
     });
 
@@ -1335,6 +1534,8 @@ export class App {
   // ---- settings -----------------------------------------------------------
 
   private applySettingsToAll(): void {
+    this.snapshots.sync();
+    this.syncEmptyState();
     this.syncWindowFrame();
     for (const t of this.tabs) t.applySettings();
     requestAnimationFrame(() => this.active?.fit());
@@ -1355,6 +1556,8 @@ export class App {
   private wireWindowChrome(): void {
     // Edited remote files whose last saves aren't on the server yet: ask first.
     onCloseRequested(async () => {
+      // The tabs as they are now, to restore next time.
+      await this.snapshots.take();
       const pending = () => fsApi.editsPending().catch(() => []);
       let edits = await pending();
       // An upload that's just running gets a moment to finish.
@@ -1632,4 +1835,20 @@ export class App {
       setTimeout(() => el.remove(), 250);
     }, 4000);
   }
+}
+
+/** A Telnet tab that wasn't a saved connection (Telnet has no login to keep). */
+function telnetForm(tab: Extract<SnapshotTab, { kind: "telnet" }>): ConnForm {
+  return {
+    name: tab.name,
+    kind: "telnet",
+    host: tab.host,
+    port: tab.port,
+    username: "",
+    authType: "password",
+    password: "",
+    keyPath: "",
+    passphrase: "",
+    saveSecret: false,
+  };
 }

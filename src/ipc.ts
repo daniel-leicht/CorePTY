@@ -33,6 +33,30 @@ export interface LocalOptions {
   cols: number;
   rows: number;
   title?: string;
+  /** PowerShell: report the folder at each prompt (OSC 7), for restoring tabs. */
+  reportCwd?: boolean;
+}
+
+/** A Claude Code session running in a local tab. */
+export interface ClaudeContext {
+  sessionId: string;
+  /** The folder it runs in. */
+  cwd: string;
+  /** Its options, each with its values, to start it with again. */
+  args: string[][];
+  /** Options that can't be used again (session-picking, one-shot, multi-line), as typed. */
+  dropped: string[];
+  /** Whether the conversation has been saved (and can be resumed). */
+  resumable: boolean;
+}
+
+/** What a local tab is doing (see src-tauri/src/context.rs). */
+export interface TabContext {
+  /** The backend session id. */
+  id: string;
+  /** The shell process's working folder (PowerShell's stays where it started). */
+  cwd?: string;
+  claude?: ClaudeContext;
 }
 
 export type SshAuth =
@@ -405,6 +429,16 @@ export const api = {
   sshConnections: () => invoke<SshConnectionView[]>("ssh_connections"),
   /** Host OS: "windows" | "macos" | "linux" | … */
   hostOs: () => invoke<string>("host_os"),
+  /** This machine's names (lowercase), to tell its OSC 7 folders from a remote shell's. */
+  hostNames: () => invoke<string[]>("host_names"),
+
+  /** What these local tabs are doing (by backend session id). */
+  tabsContext: (ids: string[]) => invoke<TabContext[]>("tabs_context", { ids }),
+  /** The Claude Code sessions running on this machine now. */
+  claudeRunning: () => invoke<string[]>("claude_running"),
+  /** The last snapshot; `live` if another CorePTY that's still running wrote it. */
+  tabsSnapshotLoad: () => invoke<{ snapshot: unknown; live: boolean } | null>("tabs_snapshot_load"),
+  tabsSnapshotSave: (snapshot: unknown) => invoke<void>("tabs_snapshot_save", { snapshot }),
 
   secretSet: (id: string, secret: string) => invoke<void>("secret_set", { id, secret }),
   secretGet: (id: string) => invoke<string | null>("secret_get", { id }),

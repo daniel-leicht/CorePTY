@@ -284,22 +284,50 @@ fn snapshot_path(app: &AppHandle) -> Result<PathBuf, String> {
     config_file(app, "tabs.json")
 }
 
-#[tauri::command]
-pub fn tabs_snapshot_load(app: AppHandle) -> Result<Option<Value>, String> {
-    let _guard = lock(&SNAPSHOT_LOCK);
-    let path = snapshot_path(&app)?;
-    match fs::read_to_string(&path) {
-        // A damaged file is as good as none: there's nothing to restore.
-        Ok(s) => Ok(serde_json::from_str(&s).ok()),
-        Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e.to_string()),
-    }
+/// The last snapshot of the open tabs.
+#[derive(Serialize)]
+pub struct LoadedSnapshot {
+    snapshot: Value,
+    /// Written by another CorePTY that's still running: another window's
+    /// tabs, not ones to offer at startup.
+    live: bool,
 }
 
 #[tauri::command]
-pub fn tabs_snapshot_save(app: AppHandle, snapshot: Value) -> Result<(), String> {
+pub fn tabs_snapshot_load(app: AppHandle) -> Result<Option<LoadedSnapshot>, String> {
     let _guard = lock(&SNAPSHOT_LOCK);
     let path = snapshot_path(&app)?;
+    let snapshot: Value = match fs::read_to_string(&path) {
+        // A damaged file is as good as none: there's nothing to restore.
+        Ok(s) => match serde_json::from_str(&s) {
+            Ok(value) => value,
+            Err(_) => return Ok(None),
+        },
+        Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.to_string()),
+    };
+    let writer = &snapshot["writer"];
+    let live = match (writer["pid"].as_u64(), writer["started"].as_u64()) {
+        (Some(pid), Some(started)) => u32::try_from(pid).is_ok_and(|pid| {
+            pid != std::process::id() && crate::context::started_at(pid) == Some(started)
+        }),
+        _ => false,
+    };
+    Ok(Some(LoadedSnapshot { snapshot, live }))
+}
+
+#[tauri::command]
+pub fn tabs_snapshot_save(app: AppHandle, mut snapshot: Value) -> Result<(), String> {
+    let _guard = lock(&SNAPSHOT_LOCK);
+    let path = snapshot_path(&app)?;
+    if let Value::Object(fields) = &mut snapshot {
+        let pid = std::process::id();
+        let started = crate::context::started_at(pid).unwrap_or(0);
+        fields.insert(
+            "writer".to_string(),
+            serde_json::json!({ "pid": pid, "started": started }),
+        );
+    }
     let body = serde_json::to_string_pretty(&snapshot).map_err(|e| e.to_string())?;
     atomic_write(&path, body.as_bytes())
 }
