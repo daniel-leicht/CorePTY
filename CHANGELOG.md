@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- Restoring tabs keeps the name of an SSH tab that asks for its password
+  (the tab opens through the login dialog), and the tab that was active stays
+  active afterwards.
+- On macOS, the folder of a shell started inside another shell is found
+  again (each look at the processes starts from a fresh list).
+
 ## 0.5.0 (2026-11-05)
 
 ### New: restore your tabs
