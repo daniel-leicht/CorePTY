@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.5.1 (2026-11-05)
 
 - Restoring tabs keeps the name of an SSH tab that asks for its password
   (the tab opens through the login dialog), and the tab that was active stays
