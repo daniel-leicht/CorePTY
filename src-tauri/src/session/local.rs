@@ -6,6 +6,7 @@
 use std::io::{Read, Write};
 use std::path::Path;
 
+use base64::Engine as _;
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use serde::Deserialize;
 use tauri::{AppHandle, Manager};
@@ -40,6 +41,10 @@ pub struct LocalOptions {
     /// Optional display title override.
     #[serde(default)]
     pub title: Option<String>,
+    /// Have PowerShell report its folder at each prompt (OSC 7); other shells'
+    /// folders can be read from their process. For restoring tabs.
+    #[serde(default)]
+    pub report_cwd: bool,
 }
 
 fn default_cols() -> u16 {
@@ -54,7 +59,10 @@ pub fn spawn(
     manager: &SessionManager,
     opts: LocalOptions,
 ) -> Result<SessionInfo, String> {
-    let (program, args, default_title) = resolve_shell(&opts)?;
+    let (program, mut args, default_title) = resolve_shell(&opts)?;
+    if opts.report_cwd && matches!(opts.shell.as_str(), "powershell" | "pwsh") {
+        args.extend(powershell_cwd_hook());
+    }
 
     let id = opts
         .id
@@ -111,6 +119,7 @@ pub fn spawn(
         .map_err(|e| format!("failed to write to pty: {e}"))?;
     let master = pair.master;
     let mut killer = child.clone_killer();
+    let pid = child.process_id();
 
     let title = opts.title.clone().unwrap_or(default_title);
     let info = SessionInfo {
@@ -120,7 +129,7 @@ pub fn spawn(
         connection_id: None,
     };
     let (tx, mut rx) = unbounded_channel::<SessionInput>();
-    manager.register(info.clone(), tx);
+    manager.register_process(info.clone(), tx, pid);
     emit_status(&app, &id, "connected", None);
 
     // Reader: PTY output -> UI.
@@ -203,6 +212,43 @@ fn resolve_shell(opts: &LocalOptions) -> Result<(String, Vec<String>, String), S
     let (program, args) =
         resolve_program(&opts.shell).ok_or_else(|| format!("unknown shell '{}'", opts.shell))?;
     Ok((program, args, shell_title(&opts.shell).to_string()))
+}
+
+/// PowerShell's location is its own (the process's folder stays where it
+/// started), so it's asked to report it: once the profile has run, the prompt
+/// is wrapped to start with `ESC ] 7 ; file://host/C:/path ESC \`, as fish and
+/// zsh do. What the prompt shows (and the `$?` it sees) is unchanged.
+const POWERSHELL_CWD_HOOK: &str = r#"
+if (-not (Test-Path variable:global:__CorePtyPrompt)) {
+  $global:__CorePtyPrompt = $function:prompt
+  function global:prompt {
+    $ok = $?
+    $osc = ''
+    $loc = $ExecutionContext.SessionState.Path.CurrentLocation
+    if ($loc.Provider.Name -eq 'FileSystem') {
+      $p = $loc.ProviderPath.Replace('%', '%25').Replace('\', '/')
+      if (-not $p.StartsWith('/')) { $p = '/' + $p }
+      $osc = "$([char]27)]7;file://$($env:COMPUTERNAME)$p$([char]27)\"
+    }
+    if (-not $ok) { Write-Error '' -ErrorAction Ignore }
+    $text = (& $global:__CorePtyPrompt) -join ''
+    if ($text -eq '') { $text = 'PS>' }
+    $osc + $text
+  }
+}
+"#;
+
+/// The arguments that run `POWERSHELL_CWD_HOOK` and stay interactive.
+fn powershell_cwd_hook() -> [String; 3] {
+    let utf16: Vec<u8> = POWERSHELL_CWD_HOOK
+        .encode_utf16()
+        .flat_map(u16::to_le_bytes)
+        .collect();
+    [
+        "-NoExit".to_string(),
+        "-EncodedCommand".to_string(),
+        base64::engine::general_purpose::STANDARD.encode(utf16),
+    ]
 }
 
 /// Human-friendly default tab title for a known shell name.
@@ -457,4 +503,26 @@ fn resolve_pwsh() -> String {
 #[cfg(not(windows))]
 fn resolve_bash() -> String {
     resolve_unix("bash").unwrap_or_else(|| "bash".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_powershell_hook_is_passed_as_utf16_base64() {
+        let [no_exit, flag, encoded] = powershell_cwd_hook();
+        assert_eq!(
+            (no_exit.as_str(), flag.as_str()),
+            ("-NoExit", "-EncodedCommand")
+        );
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .unwrap();
+        let units: Vec<u16> = bytes
+            .chunks(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        assert_eq!(String::from_utf16(&units).unwrap(), POWERSHELL_CWD_HOOK);
+    }
 }
