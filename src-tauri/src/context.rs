@@ -12,7 +12,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
@@ -25,18 +24,6 @@ use crate::session::SessionManager;
 const MAX_DEPTH: usize = 4;
 /// A session file is a few hundred bytes; anything much bigger isn't one.
 const MAX_SESSION_FILE: u64 = 64 * 1024;
-
-/// The process list, kept between looks (refreshing one is cheaper than
-/// building it again).
-#[derive(Default, Clone)]
-pub struct Processes(Arc<Mutex<Option<System>>>);
-
-impl Processes {
-    fn with<T>(&self, f: impl FnOnce(&mut System) -> T) -> T {
-        let mut guard = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        f(guard.get_or_insert_with(System::new))
-    }
-}
 
 /// What one tab is doing.
 #[derive(Debug, Serialize)]
@@ -593,15 +580,15 @@ fn running_sessions(sys: &mut System) -> Vec<String> {
 #[tauri::command]
 pub async fn tabs_context(
     manager: State<'_, SessionManager>,
-    processes: State<'_, Processes>,
     ids: Vec<String>,
 ) -> Result<Vec<TabContext>, String> {
     let shells = manager.pids(&ids);
     if shells.is_empty() {
         return Ok(Vec::new());
     }
-    let processes = processes.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || processes.with(|sys| inspect(sys, &shells)))
+    // A fresh list each time (a few ms): one kept between looks can hold a
+    // process's name from before it exec'd into another program.
+    tauri::async_runtime::spawn_blocking(move || inspect(&mut System::new(), &shells))
         .await
         .map_err(|e| e.to_string())
 }
@@ -657,9 +644,8 @@ pub fn host_names() -> Vec<String> {
 /// The ids of the Claude sessions running now, so a restore doesn't open one
 /// a second time.
 #[tauri::command]
-pub async fn claude_running(processes: State<'_, Processes>) -> Result<Vec<String>, String> {
-    let processes = processes.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || processes.with(running_sessions))
+pub async fn claude_running() -> Result<Vec<String>, String> {
+    tauri::async_runtime::spawn_blocking(|| running_sessions(&mut System::new()))
         .await
         .map_err(|e| e.to_string())
 }
@@ -982,10 +968,9 @@ mod tests {
         let mut outer = outer.current_dir(std::env::temp_dir()).spawn().unwrap();
         let expected = if cfg!(windows) { r"C:\Windows" } else { "/" };
         // Until the inner shell has started (a busy machine takes a while).
-        let mut sys = System::new();
         let mut cwd = None;
         for _ in 0..50 {
-            cwd = inspect(&mut sys, &[("t".to_string(), outer.id())])
+            cwd = inspect(&mut System::new(), &[("t".to_string(), outer.id())])
                 .pop()
                 .and_then(|found| found.cwd);
             if cwd.as_deref() == Some(expected) {
