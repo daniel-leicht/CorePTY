@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.4.1 (unreleased)
+## 0.5.0 (2026-11-05)
 
 ### New: restore your tabs
 
