@@ -355,22 +355,27 @@ export class App {
 
   // ---- saved connections --------------------------------------------------
 
-  private async openDialog(existing?: SavedSession, prefill: DialogPrefill = {}): Promise<void> {
+  /** The connection dialog; resolves with the tab it opened (null: saved only, or cancelled). */
+  private async openDialog(
+    existing?: SavedSession,
+    prefill: DialogPrefill = {}
+  ): Promise<TerminalSession | null> {
     const result = await this.dialog.open(existing, prefill);
-    if (!result) return;
+    if (!result) return null;
     const form = result.form;
     if (existing) form.id = existing.id;
     try {
       if (result.action === "save") {
         await this.saveProfile(form, false, existing);
-      } else {
-        // The tab knows its saved connection (Open SFTP, restoring tabs).
-        if (form.name || existing) form.id = await this.saveProfile(form, true, existing);
-        await this.hydrateStoredSecret(form, existing);
-        this.connectForm(form);
+        return null;
       }
+      // The tab knows its saved connection (Open SFTP, restoring tabs).
+      if (form.name || existing) form.id = await this.saveProfile(form, true, existing);
+      await this.hydrateStoredSecret(form, existing);
+      return this.connectForm(form);
     } catch (err) {
       this.toast(`Connection could not be saved: ${err}`, "error");
+      return null;
     }
   }
 
@@ -465,9 +470,9 @@ export class App {
     return s.kind === "ssh" && form.authType === "password" && !form.password ? null : form;
   }
 
-  private connectForm(form: ConnForm): void {
-    if (form.kind === "ssh") void this.newSsh(form);
-    else void this.newTelnet(form);
+  /** Open a tab on this login (it connects in the background). */
+  private connectForm(form: ConnForm): TerminalSession {
+    return this.openRemote(form).session;
   }
 
   // ---- sessions -----------------------------------------------------------
@@ -658,7 +663,7 @@ export class App {
     }
     const wanted = snapshot.tabs[snapshot.active];
     let focus: AppTab | null = null;
-    const askLogin: SavedSession[] = [];
+    const askLogin: { saved: SavedSession; tab: SnapshotTab }[] = [];
     const started: Promise<void>[] = [];
     let elsewhere = 0;
     for (const tab of chosen) {
@@ -686,7 +691,7 @@ export class App {
         if (login === null) {
           // A password to type: asked for after the others are open.
           const saved = facts.saved.find((each) => each.id === tab.savedId);
-          if (saved) askLogin.push(saved);
+          if (saved) askLogin.push({ saved, tab });
           continue;
         }
         const form = login ?? (tab.kind === "telnet" ? telnetForm(tab) : undefined);
@@ -711,7 +716,18 @@ export class App {
       );
     }
     await Promise.all(started);
-    for (const saved of askLogin) await this.openDialog(saved);
+    for (const { saved, tab } of askLogin) {
+      const opened = await this.openDialog(saved);
+      if (!opened) continue;
+      // Its name, as for the others (the dialog opened the tab).
+      if (tab.pinned) {
+        opened.setCustomTitle(tab.pinned);
+        this.snapshots.changed();
+      }
+      if (tab === wanted) focus = opened;
+    }
+    // A tab opened through the dialog took the focus: back to the one that had it.
+    if (askLogin.length && focus && this.tabs.includes(focus)) this.activate(focus);
   }
 
   /** A file manager tab with this PC on the left and the server on the right. */

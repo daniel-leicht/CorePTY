@@ -120,6 +120,8 @@ const restoreSnapshot = {
     },
     { kind: "skipped", label: "PowerShell (Admin)", reason: "runs as Administrator" },
     { kind: "ssh", savedId: "edge-01", label: "edge-01" },
+    // A password to type: asked for after the others are open.
+    { kind: "ssh", savedId: "nas", label: "admin@nas", pinned: "backups" },
     {
       kind: "files",
       label: "Files",
