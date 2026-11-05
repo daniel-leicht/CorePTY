@@ -961,15 +961,17 @@ mod tests {
     /// folder is the tab's.
     #[test]
     fn the_folder_is_the_inner_shells() {
-        let mut outer = if cfg!(windows) {
+        #[cfg(windows)]
+        let mut outer = {
             let mut cmd = std::process::Command::new("cmd");
-            #[cfg(windows)]
             std::os::windows::process::CommandExt::raw_arg(
                 &mut cmd,
                 r#"/c cmd /c "cd /d C:\Windows && ping -n 4 127.0.0.1 > nul""#,
             );
             cmd
-        } else {
+        };
+        #[cfg(not(windows))]
+        let mut outer = {
             let mut cmd = std::process::Command::new("sh");
             cmd.args(["-c", "sh -c 'cd / && sleep 3; true'; true"]);
             cmd
