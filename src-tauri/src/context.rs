@@ -954,8 +954,10 @@ mod tests {
             dunce::canonicalize(cwd).unwrap(),
             dunce::canonicalize(expected).unwrap()
         );
-        // A process that's gone is left out.
-        assert!(inspect(&mut sys, &[("t".to_string(), child.id())]).is_empty());
+        // A process that isn't there is left out. (Not the one just killed:
+        // Windows hands its id to the next process at once, and other tests
+        // start some.) No system uses this id.
+        assert!(inspect(&mut sys, &[("gone".to_string(), u32::MAX)]).is_empty());
     }
 
     /// A shell in a shell (like Git Bash's launcher and bash): the inner one's
@@ -967,22 +969,37 @@ mod tests {
             let mut cmd = std::process::Command::new("cmd");
             std::os::windows::process::CommandExt::raw_arg(
                 &mut cmd,
-                r#"/c cmd /c "cd /d C:\Windows && ping -n 4 127.0.0.1 > nul""#,
+                r#"/c cmd /c "cd /d C:\Windows && ping -n 12 127.0.0.1 > nul""#,
             );
             cmd
         };
         #[cfg(not(windows))]
         let mut outer = {
             let mut cmd = std::process::Command::new("sh");
-            cmd.args(["-c", "sh -c 'cd / && sleep 3; true'; true"]);
+            cmd.args(["-c", "sh -c 'cd / && sleep 10; true'; true"]);
             cmd
         };
         let mut outer = outer.current_dir(std::env::temp_dir()).spawn().unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(1000));
-        let found = inspect(&mut System::new(), &[("t".to_string(), outer.id())]);
+        let expected = if cfg!(windows) { r"C:\Windows" } else { "/" };
+        // Until the inner shell has started (a busy machine takes a while).
+        let mut sys = System::new();
+        let mut cwd = None;
+        for _ in 0..50 {
+            cwd = inspect(&mut sys, &[("t".to_string(), outer.id())])
+                .pop()
+                .and_then(|found| found.cwd);
+            if cwd.as_deref() == Some(expected) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+        // The inner shell too.
+        #[cfg(windows)]
+        let _ = std::process::Command::new("taskkill")
+            .args(["/T", "/F", "/PID", &outer.id().to_string()])
+            .output();
         let _ = outer.kill();
         let _ = outer.wait();
-        let expected = if cfg!(windows) { r"C:\Windows" } else { "/" };
-        assert_eq!(found[0].cwd.as_deref(), Some(expected));
+        assert_eq!(cwd.as_deref(), Some(expected));
     }
 }
