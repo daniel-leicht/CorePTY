@@ -76,6 +76,19 @@ export class SgrDimFilter {
   private dimActive = false;
   private dimReplacementActive = false;
 
+  /**
+   * Drop any carried (incomplete) escape sequence and reset SGR tracking. Call
+   * this at a session boundary (e.g. a reconnect) so a sequence cut off mid-flight
+   * by a disconnect can't be glued onto — and misinterpreted within — the next
+   * session's output.
+   */
+  reset(): void {
+    this.carry = null;
+    this.foregroundIsDefault = true;
+    this.dimActive = false;
+    this.dimReplacementActive = false;
+  }
+
   private rewriteSgr(params: string): string {
     const parts = params.split(";");
     const out: string[] = [];

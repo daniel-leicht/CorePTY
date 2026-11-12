@@ -181,6 +181,7 @@ On macOS, use Command in place of Control for shortcuts that use `Ctrl`.
 | `Ctrl+Shift+E` | Open a local file-manager tab |
 | `Ctrl+Shift+W` | Close the active tab |
 | `Ctrl+Shift+R` | Reconnect the active terminal session |
+| `Ctrl+Shift+K` | Reset the terminal (clear stuck mouse/paste modes) |
 | `Ctrl+Shift+F` | Search the active terminal buffer |
 | `Ctrl+Shift+C` | Copy the current selection |
 | `Ctrl+Shift+V` | Paste through the terminal input handler |

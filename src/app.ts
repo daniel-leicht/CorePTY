@@ -1510,6 +1510,7 @@ export class App {
         if (s.hasSelection()) items.push({ label: "Copy", icon: "copy", action: () => this.copy() });
         items.push({ label: "Paste", icon: "clipboard", action: () => void this.paste() });
         items.push({ label: "Clear buffer", action: () => s.term.clear() });
+        items.push({ label: "Reset terminal", icon: "refresh", action: () => s.resetInputModes() });
         contextMenu(e.clientX, e.clientY, items);
         return;
       }
@@ -1699,6 +1700,9 @@ export class App {
         } else if (ctrl && e.shiftKey && (e.key === "R" || e.key === "r")) {
           e.preventDefault();
           if (this.active instanceof TerminalSession) void this.relaunch(this.active);
+        } else if (ctrl && e.shiftKey && (e.key === "K" || e.key === "k")) {
+          e.preventDefault();
+          if (this.active instanceof TerminalSession) this.active.resetInputModes();
         } else if (ctrl && e.shiftKey && (e.key === "F" || e.key === "f")) {
           e.preventDefault();
           if (this.active instanceof FileManagerTab) this.active.openSearch();

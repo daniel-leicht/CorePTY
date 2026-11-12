@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.5.2 (2026-11-12)
+
+- Reconnecting a terminal no longer leaves mouse reporting stuck on. A program
+  that enabled mouse tracking before the connection dropped (an editor, pager,
+  `htop`, tmux, …) used to leak its mouse-move reports into the reconnected
+  shell's prompt as text (`35;112;33M…`) on every mouse move; a reconnect now
+  clears the lingering mouse / bracketed-paste / focus / alt-screen modes before
+  the fresh shell takes over.
+- New: Reset terminal (right-click menu, or `Ctrl+Shift+K`) clears those same
+  stuck input modes in a live session — a quick recovery when a crashed
+  full-screen program leaves the terminal misbehaving.
+
 ## 0.5.1 (2026-11-05)
 
 - Restoring tabs keeps the name of an SSH tab that asks for its password

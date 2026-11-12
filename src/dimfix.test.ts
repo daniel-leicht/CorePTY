@@ -42,4 +42,22 @@ describe("SgrDimFilter", () => {
     expect(decoder.decode(first)).toBe("");
     expect(decoder.decode(second)).toBe("\u001b[38;2;110;113;121mdim");
   });
+
+  it("reset() discards a sequence carried from a dead session", () => {
+    const instance = new SgrDimFilter();
+    expect(decoder.decode(instance.feed(encoder.encode("\u001b[")))).toBe("");
+    instance.reset();
+    // The carried "ESC[" is gone, so "2m" is now plain text rather than being
+    // glued onto the next session's bytes and misread as a dim SGR.
+    expect(decoder.decode(instance.feed(encoder.encode("2mdim")))).toBe("2mdim");
+  });
+
+  it("reset() clears SGR state carried from a dead session", () => {
+    const instance = new SgrDimFilter();
+    instance.feed(encoder.encode("\u001b[2mdim")); // dim-on-default replacement active
+    instance.reset();
+    // Without the reset this would emit "\u001b[22;39m" to undo a replacement that
+    // belonged to the dead session; after reset SGR 22 passes through untouched.
+    expect(decoder.decode(instance.feed(encoder.encode("\u001b[22mx")))).toBe("\u001b[22mx");
+  });
 });

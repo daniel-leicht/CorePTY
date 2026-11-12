@@ -1,23 +1,16 @@
 <!doctype html>
-<html lang="en" class="theme-dark">
+<html lang="en" class="theme-dark" style="height: 100%; background: #0e0f13; color: #e6e8ef">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>CorePTY</title>
     <!-- Theme web fonts are self-hosted; see src/fonts.css + scripts/bundle-fonts.mjs. -->
-    <style>
-      /* Paint dark immediately to avoid a white flash before CSS loads. */
-      html,
-      body {
-        margin: 0;
-        height: 100%;
-        background: #0e0f13;
-        color: #e6e8ef;
-        overflow: hidden;
-      }
-    </style>
+    <!-- The dark paint lives in inline style attributes (on <html>/<body>) rather
+         than a <style> block: it still beats the white flash before src/styles.css
+         loads, while avoiding a vite build failure (the html-inline-proxy plugin
+         chokes on an inline <style> here). -->
   </head>
-  <body>
+  <body style="margin: 0; height: 100%; overflow: hidden">
     <div id="app"></div>
     <script type="module" src="/src/main.ts"></script>
   </body>

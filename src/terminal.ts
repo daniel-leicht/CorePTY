@@ -16,6 +16,23 @@ import type { AppTab, TabStatusInfo } from "./tab";
 
 export type SessionStatus = "connecting" | "connected" | "exited" | "error";
 
+/**
+ * Clear the "sticky" DEC private input modes a program may have enabled before a
+ * disconnect. We reuse the same xterm instance across a reconnect, so without
+ * this any mouse-tracking / bracketed-paste / focus-reporting / alt-screen state
+ * left on by the old session persists into the fresh remote shell — which never
+ * clears it. The most visible symptom is mouse-motion reports (modes 1002/1003 +
+ * SGR 1006) leaking into the new shell's prompt as text on every mouse move.
+ * Restores the main screen, a visible cursor, and default attributes too, so a
+ * reconnect after a crashed full-screen TUI lands on a clean prompt.
+ */
+const RESET_INPUT_MODES =
+  "\x1b[?1000l\x1b[?1001l\x1b[?1002l\x1b[?1003l\x1b[?1004l" + // mouse tracking + focus
+  "\x1b[?1005l\x1b[?1006l\x1b[?1015l\x1b[?1016l" + // mouse report encodings
+  "\x1b[?2004l" + // bracketed paste
+  "\x1b[?1l\x1b>" + // normal cursor keys + numeric keypad
+  "\x1b[?1049l\x1b[?25h\x1b[0m"; // leave alt screen, show cursor, reset SGR
+
 export class TerminalSession implements AppTab {
   readonly tabType = "terminal" as const;
   info: SessionInfo | null = null;
@@ -338,12 +355,28 @@ export class TerminalSession implements AppTab {
     this.showOverlay("error", message);
   }
 
+  /**
+   * Clear sticky DEC private input modes (see RESET_INPUT_MODES) on the live
+   * terminal. Exposed as a user action ("Reset terminal") so a session left in a
+   * bad state by a crashed full-screen program — e.g. mouse-motion reports
+   * leaking into the prompt on every mouse move — can be recovered without a
+   * reconnect. Writes only to the local xterm; nothing is sent to the shell.
+   */
+  resetInputModes(): void {
+    this.term.write(RESET_INPUT_MODES);
+  }
+
   /** Reset for a reconnect: clear overlay, revive, mark connecting. */
   beginReconnect(): void {
     this.hideOverlay();
     this.info = null;
     this.alive = true;
     this.setStatus("connecting");
+    // Drop any half-received escape sequence and SGR state from the dead session
+    // so a split sequence can't corrupt the reconnected stream, then clear sticky
+    // input modes before the fresh shell takes over.
+    this.dimFilter.reset();
+    this.resetInputModes();
     this.term.write("\r\n\x1b[38;2;124;92;255m↻ reconnecting…\x1b[0m\r\n");
   }
 
